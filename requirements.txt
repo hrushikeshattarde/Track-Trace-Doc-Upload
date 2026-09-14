@@ -1,0 +1,4 @@
+anthropic>=1.0
+pydantic>=2.0
+pymupdf>=1.24
+openai>=1.40        # only for comparing non-Claude models through OpenRouter

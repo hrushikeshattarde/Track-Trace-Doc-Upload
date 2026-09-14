@@ -1,0 +1,28 @@
+# secrets: never commit
+.env
+*.json.key
+gsheets-*.json
+service-account*.json
+
+# local environment and caches
+.venv/
+__pycache__/
+*.pyc
+
+# run output (contains downloaded customer documents)
+out/readiness/attachments/
+
+# data that must not leave this machine: customer documents, load snapshots, survey and run output, internal workbook
+out/
+samples/
+fixtures/
+index/loads.json
+index/customer_requirements_source.xlsx
+index/customer_requirements.json
+index/pod_terminals.json
+compare.md
+*.xlsx
+*.pdf
+*.jpg
+*.jpeg
+*.png
