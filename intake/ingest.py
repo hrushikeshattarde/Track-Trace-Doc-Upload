@@ -41,6 +41,7 @@ class Stats:
     reads_avoided: int = 0
     read_errors: int = 0
     deferred: int = 0
+    spend_capped: bool = False
     cost_usd: float = 0.0
     mode: str = "history"
     cursor_from: str | None = None
@@ -55,13 +56,20 @@ class Stats:
                 f"reads avoided by hash {self.reads_avoided}"
                 + (f", read errors {self.read_errors}" if self.read_errors else "")
                 + (f", {self.deferred} message(s) deferred to the next pass" if self.deferred else "")
+                + (" [SPEND CAP HIT: some documents left unread]" if self.spend_capped else "")
                 + f", spend ${self.cost_usd:.3f}")
 
 
 def sync_once(conn, client: gm.Delegated, *, group: str, reader: Reader | None = None,
               max_messages: int = 500, backfill_days: int = 1, max_parts_per_message: int = 12,
-              verbose: bool = False) -> Stats:
-    """One pass of Loop A. Returns what it did; raises only on an unrecoverable Gmail error."""
+              max_spend_usd: float | None = None, verbose: bool = False) -> Stats:
+    """One pass of Loop A. Returns what it did; raises only on an unrecoverable Gmail error.
+
+    max_spend_usd bounds what one pass can cost. When it is reached the pass keeps ingesting -
+    messages, parts, hashes, routing all continue - but stops calling the reader, so the documents
+    it did not read stay as placeholder rows and are read by a later pass. A cap that dropped the
+    mail instead of deferring the reading would be the --max bug again, in the cost dimension.
+    """
     mailbox = client.subject
     st = Stats()
     cursor = db.get_cursor(conn, mailbox)
@@ -102,7 +110,12 @@ def sync_once(conn, client: gm.Delegated, *, group: str, reader: Reader | None =
     for msg in messages:
         try:
             conn.execute("BEGIN IMMEDIATE")
-            _process(conn, client, msg, group=group, reader=reader, st=st,
+            over = max_spend_usd is not None and st.cost_usd >= max_spend_usd
+            if over and not st.spend_capped:
+                st.spend_capped = True
+                print(f"  spend cap ${max_spend_usd:.2f} reached after {st.reads} read(s); "
+                      f"still ingesting, but no further documents are read this pass")
+            _process(conn, client, msg, group=group, reader=None if over else reader, st=st,
                      max_parts=max_parts_per_message, verbose=verbose)
             conn.execute("COMMIT")
         except Exception:
@@ -293,7 +306,13 @@ def make_reader(model: str) -> Reader:
             extraction, usage = claude_reader.read_document(client, doc, model)
             return extraction.model_dump(), extraction.document_type, model, round(usage.cost_usd, 5)
         finally:
-            tmp.unlink(missing_ok=True)
-            tmp.parent.rmdir()
+            # Best-effort. On Windows PyMuPDF keeps a handle on the file it opened, so the unlink
+            # can raise PermissionError (WinError 32) - and raising it from `finally` would throw
+            # away a read that has already been paid for. The OS clears the temp directory anyway.
+            try:
+                tmp.unlink(missing_ok=True)
+                tmp.parent.rmdir()
+            except OSError:
+                pass
 
     return read

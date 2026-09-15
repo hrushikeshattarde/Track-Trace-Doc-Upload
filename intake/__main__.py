@@ -53,7 +53,8 @@ def cmd_sync(args) -> int:
         reader = ingest.make_reader(args.model)
         print(f"reader enabled: {args.model}. New unique files will be read and billed.")
     st = ingest.sync_once(conn, client, group=args.group, reader=reader, max_messages=args.max,
-                          backfill_days=args.backfill_days, verbose=args.verbose)
+                          backfill_days=args.backfill_days, max_spend_usd=args.max_spend,
+                          verbose=args.verbose)
     print(st.line())
     if st.cursor_to:
         print(f"cursor {st.cursor_from or '(none)'} -> {st.cursor_to}   ({client.calls} Gmail calls)")
@@ -283,6 +284,9 @@ def main() -> int:
                    help="window used on the first run, or after the cursor expires")
     s.add_argument("--read", action="store_true", help="read new unique documents (costs money)")
     s.add_argument("--model", default="claude-opus-5")
+    s.add_argument("--max-spend", type=float, default=None,
+                   help="with --read: stop reading once this pass has spent this much (USD). "
+                        "Ingest continues; unread documents are picked up by a later pass")
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(fn=cmd_sync)
 
