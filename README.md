@@ -251,13 +251,15 @@ re-type them, not to catch them. The readiness job now counts these null texts a
 `(n pic)`) and marks 363 files created within 10 s of one as auto-filed from MMS. `--read-all` reads the email
 attachments of filed loads too, to tell a duplicate from a POD.
 
-**What clears "Waiting for Documents" (OQ-3).** Three loads read on 14 Sep 2026 point at timing, not document type:
-on the cleared load the BOL was filed 34 s *after* the dispatch was marked Delivered and the status flipped the same
-second; on the two stuck loads the files (Bill Of Lading and Driver Supplied BOL alike) were uploaded *before* the
-Delivered mark, and marking Delivered afterwards did not recompute the status. The job tests this on every
-filed-but-Waiting load (file `dateCreated` vs. the Delivered dispatch's `lastUpdated`) and reports the count in the
-headline numbers. If it holds, the intake bot must file the POD after the load is Delivered, or re-trigger the
-status once it is, and BOLs filed at pickup will never clear the status by themselves.
+**What clears "Waiting for Documents": the document TYPE, not the timing.** The prototype's OQ-3 note said the
+opposite - that the status clears only on an upload made after the Delivered mark - inferred from three loads.
+Measured 15 Sep 2026 over 266 loads (every load in the ledger that had either cleared or was stuck), that is
+false: 58% of cleared loads had a filing after the mark against 69% of stuck ones, so the timing separates
+nothing. The type separates them almost perfectly: of 96 cleared loads, 94 carry a type 12 Bill Of Lading and
+only 2 carry nothing but 363; of 170 stuck, 145 have ONLY type 363 "Driver Supplied BOL" - what TransportPro
+itself files a driver's MMS photo as. It puts a document on the load without satisfying it. So most stuck loads
+are not missing paperwork; they need a re-file under a type that counts. `intake/state.py` carries this as
+CLEARING_TYPES and a `wrong_doc_type` load state.
 
 Output: `out\readiness\readiness_<stamp>.md` (work queue + verification checklist), `.csv`, `.json`.
 Read-only: nothing is uploaded and no status is changed.
@@ -345,7 +347,7 @@ is pure judgement and touches nothing: it takes the cached reading of a document
 | Gate | When | What happens |
 |---|---|---|
 | `block` | personal ID, or the reader says it is not freight paperwork | never filed; bytes never written to disk |
-| `hold` | a POD before the load is marked Delivered | waits for the Delivered mark rather than being wasted (OQ-3) |
+| `hold` | retired 15 Sep 2026 | it withheld PODs on the timing theory the measurement above refuted; `classify_type` already refuses to call anything a POD before the consignee |
 | `review` | customer rules not met, contested thread binding, or a routing tier weaker than the subject line | a person decides |
 | `auto` | high confidence, rules satisfied, correctly timed | filed only when auto-filing is on |
 
@@ -377,8 +379,8 @@ side, so the two loops converge on the same ids. Draining 60 of them took 180 ca
 15 `filed_status_pending`, 15 `complete`, 12 `out_of_scope`, 12 `not_yet_due`, 3 `pod_expected`,
 3 `bol_expected`. The queue joins the two ledgers: load 2578532 shows `1/1?` in the docs column -
 one document found by Loop A, not yet read - beside "every filing predates the Delivered mark",
-and load 2567447 is flagged "filed after the Delivered mark yet still Waiting", which does *not*
-fit the OQ-3 pattern and wants a person.
+and load 2567447 is flagged "filed under a clearing type and still Waiting", which does *not*
+fit the document-type explanation and wants a person.
 
 **Measured on the live mailbox, 15 Sep 2026.** First pass: 120 messages, 100% routed by subject,
 185 Gmail calls, $0. Second pass off the cursor: 14 new messages in 20 calls, and 5 attachment
@@ -386,6 +388,34 @@ occurrences collapsed to 1 new unique file — 4 reads avoided that the prototyp
 for. Load 2560078 alone carried 4 documents each sent twice (carrier, then the rep forwarding them
 back): 8 occurrences, 4 unique files. Nothing is uploaded and no status is changed; the pass ends
 by setting each load's `next_check_at`, which is the hand-off to the load loop (not yet built).
+
+## Coverage: scope, and the mail a cursor cannot see
+
+Two rules found by running the service, both the same class of mistake - a rule that sounds right until the
+numbers disagree.
+
+**Scope is the Load Management view.** Loop A creates a ledger row for any 7-digit load number in a subject
+line, which is deliberate so mail is never discarded - but that is custody, not scope. An internal email
+mentioning load 2451872, delivered in June, put a three-month-old load in the work queue. `load.in_view` is now
+set by the reconcile sweep and cleared for anything it no longer returns; the queue, the filing gate and the
+export all scope to it. Two details: the saved filter has three parts and `/load/search` honours only two - the
+service level lives on the stops and is applied client-side (133 loads on 15 Sep) - and only a sweep that
+covered the whole pickup window may evict (`reconcile --authoritative`), because a narrow sweep never looked at
+long-haul freight.
+
+**An incremental cursor is blind to a load's earlier mail.** Loop A asks Gmail what arrived since the cursor:
+right for the steady state, structurally blind to anything older. Measured 15 Sep 2026: 502 of 527 in-view loads
+had no message at all in the ledger, and 8 of 12 spot-checked really did have ratecon mail (load 2545432: 18
+messages, 17 with attachments). `intake backfill` runs one targeted `to:<group> subject:<load>` search per load,
+once, watermarked by `mail_backfilled_at`. First pass over 150 loads pulled in 1,096 messages the incremental
+loop had never seen; de-duplication avoided 250 reads. `status` reports how many in-view loads are still blind.
+
+```powershell
+.venv\Scripts\python.exe -m intake backfill --limit 100        # close the history hole, no model spend
+.venv\Scripts\python.exe -m intake read --loads 2576133,2576217  # read documents ingested but never read
+.venv\Scripts\python.exe -m intake export --loads <ids> --out out
+un.csv   # per-document + per-load sheets
+```
 
 ## Scoring the reader against a person
 
