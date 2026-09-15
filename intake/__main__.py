@@ -298,7 +298,7 @@ def main() -> int:
     s = sub.add_parser("sync", help="one pass of Loop A")
     s.add_argument("--group", default=GROUP)
     s.add_argument("--max", type=int, default=500, help="cap on messages fetched this pass")
-    s.add_argument("--backfill-days", type=int, default=1,
+    s.add_argument("--backfill-days", type=int, default=7,
                    help="window used on the first run, or after the cursor expires")
     s.add_argument("--read", action="store_true", help="read new unique documents (costs money)")
     s.add_argument("--model", default="claude-opus-5")
@@ -310,8 +310,9 @@ def main() -> int:
 
     r = sub.add_parser("reconcile", help="Loop B: give every dashboard load a ledger row")
     r.add_argument("--terminals", default=None, help="comma-separated terminal ids instead of the ticked pods")
-    r.add_argument("--days-back", type=int, default=3,
-                   help="pickup window start; 3 for the hourly pass, ~350 for the nightly audit")
+    r.add_argument("--days-back", type=int, default=7,
+                   help="pickup window start. A week covers long hauls still Dispatched; the nightly "
+                        "audit uses ~350 to catch anything older still sitting in the view")
     r.add_argument("--days-forward", type=int, default=45)
     r.add_argument("--pod-map", default=str(POD_MAP))
     r.add_argument("-v", "--verbose", action="store_true")

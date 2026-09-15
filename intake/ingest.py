@@ -61,7 +61,7 @@ class Stats:
 
 
 def sync_once(conn, client: gm.Delegated, *, group: str, reader: Reader | None = None,
-              max_messages: int = 500, backfill_days: int = 1, max_parts_per_message: int = 12,
+              max_messages: int = 500, backfill_days: int = 7, max_parts_per_message: int = 12,
               max_spend_usd: float | None = None, verbose: bool = False) -> Stats:
     """One pass of Loop A. Returns what it did; raises only on an unrecoverable Gmail error.
 

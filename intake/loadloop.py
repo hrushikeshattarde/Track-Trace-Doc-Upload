@@ -32,10 +32,14 @@ class ReconcileStats:
     created: int = 0
     already: int = 0
     per_terminal: dict[int, int] = field(default_factory=dict)
+    left_view: int = 0
+    wrong_level: int = 0
 
     def line(self) -> str:
-        return (f"reconcile: {self.seen} load(s) across {self.terminals} terminal(s) - "
-                f"{self.created} new to the ledger, {self.already} already there")
+        return (f"reconcile: {self.seen} load(s) in the Load Management view across "
+                f"{self.terminals} terminal(s) - {self.created} new to the ledger, "
+                f"{self.already} already there, {self.left_view} no longer in the view"
+                + (f"; {self.wrong_level} dropped by service level" if self.wrong_level else ""))
 
 
 @dataclass
@@ -78,17 +82,18 @@ def search_window(tpro: TransportPro, params: dict, start: dt.date, end: dt.date
                 + search_window(tpro, params, mid + dt.timedelta(days=1), end, depth + 1))
 
 
-def reconcile(conn, tpro: TransportPro, *, terminals: list[int], days_back: int = 3,
+def reconcile(conn, tpro: TransportPro, *, terminals: list[int], days_back: int = 7,
               days_forward: int = 45, statuses: tuple[str, ...] = ("Dispatched",),
               scope_levels: set[str] | None = None, verbose: bool = False) -> ReconcileStats:
     """Give every load in the dashboard view a ledger row.
 
-    days_back is the knob that separates the hourly pass from the nightly audit: 3 days catches
-    everything newly dispatched, ~350 reproduces the whole view.
+    days_back is the knob that separates the hourly pass from the nightly audit. A week covers
+    long hauls that are still Dispatched with an older pickup date; ~350 reproduces the whole view.
     """
     today = dt.date.today()
     start, end = today - dt.timedelta(days=days_back), today + dt.timedelta(days=days_forward)
     rs = ReconcileStats(terminals=len(terminals))
+    run_start = db.now_iso()          # anything not re-stamped by this sweep has left the view
     for tid in terminals:
         rows: list[dict] = []
         for status in statuses:
@@ -100,17 +105,27 @@ def reconcile(conn, tpro: TransportPro, *, terminals: list[int], days_back: int 
             status = row.get("status") or {}
             if (status.get("loadStatus") or "").lower().startswith("cancel"):
                 continue
+            # The saved filter is terminals + loadStatus + SERVICE LEVEL. /load/search honours the
+            # first two; the service level lives on the stops, so it has to be applied here. Without
+            # it the sweep returns every Flexible / FCFS and Firm Appointment load on the pods too
+            # (179 extra on 14 Sep 2026), and they land in_view as though they were dashboard work.
+            levels = st.service_levels(row)
+            if scope_levels and levels and not (levels & scope_levels):
+                rs.wrong_level += 1
+                continue
             kept += 1
             rs.seen += 1
             existed = conn.execute("SELECT 1 FROM load WHERE load_id=?", (load_id,)).fetchone() is not None
             # due_now on creation only: an existing row keeps the cadence drain() gave it, so
             # reconciling never resets the clock on work already scheduled.
             db.upsert_load(conn, load_id, source="dashboard", due_now=not existed)
+            db.mark_in_view(conn, load_id)
             rs.created += 0 if existed else 1
             rs.already += 1 if existed else 0
         rs.per_terminal[tid] = kept
         if verbose:
             print(f"  terminal {tid}: {kept} load(s) in view")
+    rs.left_view = db.drop_out_of_view(conn, run_start) + db.clear_stale_out_of_view(conn)
     return rs
 
 
@@ -166,5 +181,5 @@ def work_queue(conn, limit: int = 40) -> list[Any]:
              "out_of_scope", "complete")
     cases = " ".join(f"WHEN '{s}' THEN {i}" for i, s in enumerate(order))
     return conn.execute(
-        f"SELECT * FROM load WHERE state IS NOT NULL AND state != 'new' "
+        f"SELECT * FROM load WHERE in_view = 1 AND state IS NOT NULL AND state != 'new' "
         f"ORDER BY CASE state {cases} ELSE 99 END, next_check_at LIMIT ?", (limit,)).fetchall()

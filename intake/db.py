@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 -- Where the Gmail history cursor stands. One row per impersonated mailbox.
@@ -152,7 +152,14 @@ CREATE TABLE IF NOT EXISTS load (
     action         TEXT,          -- why it is in this state, in words a person can work from
     filed_types    TEXT,
     checks         INTEGER NOT NULL DEFAULT 0,
-    last_error     TEXT
+    last_error     TEXT,
+    -- Scope. The Load Management filter decides what gets worked: the 16 ticked pod terminals,
+    -- load status Dispatched, service level Priority / OP8. A row can exist for a load outside
+    -- that view - Loop A creates one for any load number it sees in a subject line, and that is
+    -- deliberate so mail is never discarded - but it is not work. in_view is set by reconcile and
+    -- cleared for anything the sweep no longer returns.
+    in_view        INTEGER NOT NULL DEFAULT 0,
+    view_checked_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS ix_message_thread    ON message (thread_id);
@@ -197,6 +204,11 @@ def migrate(conn: sqlite3.Connection) -> None:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(part)")}
         if "attachment_id" not in cols:
             conn.execute("ALTER TABLE part ADD COLUMN attachment_id TEXT")
+    if have < 5:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(load)")}
+        for name, decl in (("in_view", "INTEGER NOT NULL DEFAULT 0"), ("view_checked_at", "TEXT")):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE load ADD COLUMN {name} {decl}")
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -358,12 +370,40 @@ def defer_load(conn: sqlite3.Connection, load_id: int, error: str, minutes: int 
                  "checks=checks+1 WHERE load_id=?", (error[:300], nxt, now_iso(), load_id))
 
 
-def due_loads(conn: sqlite3.Connection, limit: int = 100) -> list[sqlite3.Row]:
-    """Oldest due first. A backlog delays; it never drops. In Postgres this gets
-    FOR UPDATE SKIP LOCKED so the load loop can scale out."""
-    return conn.execute(
-        "SELECT * FROM load WHERE next_check_at IS NOT NULL AND next_check_at <= ? "
-        "ORDER BY next_check_at LIMIT ?", (now_iso(), limit)).fetchall()
+def due_loads(conn: sqlite3.Connection, limit: int = 100, in_view_only: bool = True) -> list[sqlite3.Row]:
+    """Oldest due first, and only loads the dashboard filter actually shows.
+
+    A backlog delays; it never drops. Scoping to in_view is what keeps aged loads out: a June load
+    whose number happened to appear in a September subject line gets a ledger row (custody), but it
+    is not on the Load Management view and is therefore not work.
+    """
+    sql = "SELECT * FROM load WHERE next_check_at IS NOT NULL AND next_check_at <= ?"
+    if in_view_only:
+        sql += " AND in_view = 1"
+    return conn.execute(sql + " ORDER BY next_check_at LIMIT ?", (now_iso(), limit)).fetchall()
+
+
+def mark_in_view(conn: sqlite3.Connection, load_id: int) -> None:
+    conn.execute("UPDATE load SET in_view=1, view_checked_at=? WHERE load_id=?", (now_iso(), load_id))
+
+
+def clear_stale_out_of_view(conn: sqlite3.Connection) -> int:
+    """A load that has never been in the view but carries a state from an earlier drain reads as
+    work when it is not. Make its row say what it is."""
+    cur = conn.execute(
+        "UPDATE load SET state='not_in_view', next_check_at=NULL "
+        "WHERE in_view=0 AND state IS NOT NULL AND state NOT IN ('not_in_view','new')")
+    return cur.rowcount
+
+
+def drop_out_of_view(conn: sqlite3.Connection, since: str) -> int:
+    """Anything still flagged in_view that this sweep did not return has left the Load Management
+    view - delivered out, cancelled, documents received, or moved off a pod terminal. It keeps its
+    row and its history; it just stops being work."""
+    cur = conn.execute(
+        "UPDATE load SET in_view=0, state='not_in_view', next_check_at=NULL "
+        "WHERE in_view=1 AND (view_checked_at IS NULL OR view_checked_at < ?)", (since,))
+    return cur.rowcount
 
 
 # ------------------------------------------------------------------ unresolved ----

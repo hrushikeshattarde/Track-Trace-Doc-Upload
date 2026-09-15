@@ -51,6 +51,7 @@ CADENCE_MINUTES: dict[str, int | None] = {
     "filed_status_pending": 60,
     "not_yet_due": 360,
     "out_of_scope": 1440,
+    "not_in_view": None,
     "in_review": None,
     "complete": None,
     "error": 60,

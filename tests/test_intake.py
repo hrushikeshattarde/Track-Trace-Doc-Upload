@@ -374,6 +374,7 @@ def test_drain_never_drops_a_load() -> None:
         lid = 2578000 + i
         loads[lid] = {"load": tp_load(), "dispatches": [{"id": i, "status": "At Consignee"}], "files": []}
         db.upsert_load(conn, lid, source="dashboard", due_now=True)
+        db.mark_in_view(conn, lid)          # reconcile is what puts a load in scope
     # One load the API cannot serve this pass.
     fake = FakeTPro(loads, fail={2578003})
 
@@ -406,6 +407,7 @@ def test_drain_reads_evidence_from_the_ledger() -> None:
     ingest.sync_once(conn, FakeGmail(msgs, {"att-e1-0": blob}), group="g", reader=None)
     check("Loop A created the load row", db.counts(conn)["loads"] == 1)
 
+    db.mark_in_view(conn, 2578456)      # a mail-created load is only worked once the sweep sees it
     fake = FakeTPro({2578456: {"load": tp_load(), "dispatches": [{"id": 1, "status": "Loaded"}], "files": []}})
     loadloop.drain(conn, fake, limit=10)
     row = conn.execute("SELECT * FROM load WHERE load_id=2578456").fetchone()
@@ -602,6 +604,7 @@ def test_review_queue() -> None:
     check("the decision is attributed", row["decided_by"] == "frankie" and row["state"] == "approved")
     check("approved items are what --execute would act on", len(review.approved(conn)) == 1)
 
+    # (queue idempotency continues below)
     # A later pass must not reset a decided item back to pending.
     review.enqueue(conn, load_id=p.load_id, sha256=p.sha256, message_id=None, kind=p.kind,
                    reason="re-judged", proposed_type=p.document_type, proposed_comment=p.comment)
@@ -671,6 +674,42 @@ def test_auto_gate_requires_a_real_gap() -> None:
           f"{p.gate}/{p.kind} {p.reason}")
 
 
+def test_scope_is_the_dashboard_view() -> None:
+    """The Load Management filter decides what gets worked, not the mailbox.
+
+    Loop A creates a row for any 7-digit load number it sees in a subject line - deliberately, so
+    mail is never discarded. On 15 Sep 2026 that pulled in load 2451872, delivered in June, because
+    two internal emails mentioned it. It is not on the dashboard, so it is not work.
+    """
+    print("scope: only what the Load Management view shows is work")
+    conn = fresh_db()
+    blob = png(1200, 1600, b"X")
+    msgs = [message("s1", "t1", "RE: Load 2451872 question", when_ms=1_700_000_000_000,
+                    parts=[("doc.png", blob)])]
+    ingest.sync_once(conn, FakeGmail(msgs, {"att-s1-0": blob}), group="g", reader=None)
+    check("Loop A still records the load (custody)", db.counts(conn)["loads"] == 1)
+
+    fake = FakeTPro({2451872: {"load": tp_load(), "dispatches": [{"id": 1, "status": "Delivered"}], "files": []}})
+    ds = loadloop.drain(conn, fake, limit=10)
+    check("but a mail-only load is not drained", ds.checked == 0, ds.line())
+    check("and it is not on the work queue", len(loadloop.work_queue(conn)) == 0)
+
+    # Once a reconcile sees it on the dashboard, it becomes work.
+    db.mark_in_view(conn, 2451872)
+    conn.execute("UPDATE load SET next_check_at=? WHERE load_id=2451872", (db.now_iso(),))
+    ds = loadloop.drain(conn, fake, limit=10)
+    check("once the dashboard shows it, it is worked", ds.checked == 1, ds.line())
+
+    # And when it leaves the view, it stops being work but keeps its row.
+    import time
+    time.sleep(1.1)                       # view_checked_at has second resolution
+    left = db.drop_out_of_view(conn, db.now_iso())
+    check("a load that leaves the view is dropped from scope", left == 1, str(left))
+    check("its row survives", db.counts(conn)["loads"] == 1)
+    row = conn.execute("SELECT * FROM load WHERE load_id=2451872").fetchone()
+    check("and it is never polled again", row["state"] == "not_in_view" and row["next_check_at"] is None)
+
+
 if __name__ == "__main__":
     test_routing()
     test_filters()
@@ -681,6 +720,7 @@ if __name__ == "__main__":
     test_state_machine()
     test_drain_never_drops_a_load()
     test_drain_reads_evidence_from_the_ledger()
+    test_scope_is_the_dashboard_view()
     test_filing_gates()
     test_execute_is_off_unless_asked()
     test_execute_files_once_and_refetches()

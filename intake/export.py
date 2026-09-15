@@ -148,6 +148,9 @@ def _gap(load_state: str | None, proposed: str | None, filed_types: str | None,
     """Does this document supply what the load is actually short of? Returns (fills_gap, note)."""
     needed = {"pod_expected": "Proof of Delivery", "bol_expected": "Bill Of Lading"}.get(load_state or "")
     filed = (filed_types or "").lower()
+    if load_state == "not_in_view":
+        return "no", ("the load is not on the Load Management view - it is outside the dashboard "
+                      "filter, so it is not Track & Trace work")
     if load_state == "out_of_scope":
         return "no", "load is not in the worked service level"
     if load_state == "complete":

@@ -122,7 +122,7 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
     #    short a POD - 140 of the 153 that cleared the gates on the 15 Sep 2026 run.
     load_state = (load_row["state"] if load_row else "") or ""
     needed = {"pod_expected": "Proof of Delivery", "bol_expected": "Bill Of Lading"}.get(load_state)
-    if load_state in ("complete", "out_of_scope", "not_yet_due"):
+    if load_state in ("complete", "out_of_scope", "not_yet_due", "not_in_view"):
         return Proposal(load_id, sha256, REVIEW, review.NOT_NEEDED,
                         f"load is {load_state}: it is not short a document, so filing this adds a "
                         f"duplicate rather than clearing anything",
