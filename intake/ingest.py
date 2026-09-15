@@ -155,7 +155,7 @@ def _process(conn, client: gm.Delegated, msg: dict, *, group: str, reader: Reade
             decision = filters.metadata_decision(p["filename"], p["size"])
             decision = filters.PENDING if decision == filters.KEEP else decision
             db.record_part(conn, message_id, p["part_id"], filename=p["filename"], size=p["size"],
-                           mime=p["mime"], decision=decision)
+                           mime=p["mime"], decision=decision, attachment_id=p["attachment_id"])
             st.parts[decision] += 1
         # Tier 3 would go here: read one pending part and let the matcher try the paper. It is
         # deliberately not wired yet - it is the only tier that costs money, and it needs the load
@@ -203,7 +203,7 @@ def _handle_parts(conn, client: gm.Delegated, msg: dict, parts: list[dict], *,
         decision = filters.metadata_decision(p["filename"], p["size"])
         if decision != filters.KEEP:
             db.record_part(conn, message_id, p["part_id"], filename=p["filename"], size=p["size"],
-                           mime=p["mime"], decision=decision)
+                           mime=p["mime"], decision=decision, attachment_id=p["attachment_id"])
             st.parts[decision] += 1
             continue
 
@@ -212,14 +212,15 @@ def _handle_parts(conn, client: gm.Delegated, msg: dict, parts: list[dict], *,
         decision, dims = filters.geometry_decision(data)
         if decision != filters.KEEP:
             db.record_part(conn, message_id, p["part_id"], filename=p["filename"], size=p["size"],
-                           mime=p["mime"], decision=decision, dims=dims)
+                           mime=p["mime"], decision=decision, dims=dims, attachment_id=p["attachment_id"])
             st.parts[decision] += 1
             continue
 
         digest = hashlib.sha256(data).hexdigest()
         existing = db.get_attachment(conn, digest)
         db.record_part(conn, message_id, p["part_id"], filename=p["filename"], size=p["size"],
-                       mime=p["mime"], decision=filters.KEEP, sha256=digest, dims=dims)
+                       mime=p["mime"], decision=filters.KEEP, sha256=digest, dims=dims,
+                       attachment_id=p["attachment_id"])
         st.parts[filters.KEEP] += 1
         kept += 1
 

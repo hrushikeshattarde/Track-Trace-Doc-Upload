@@ -338,6 +338,39 @@ as queue lag rather than as loads quietly gone.
 .venv\Scripts\python.exe -m intake queue                      # the work queue, most urgent first
 ```
 
+**The review queue and the write path** (`intake/review.py`, `intake/filing.py`). `filing.propose()`
+is pure judgement and touches nothing: it takes the cached reading of a document plus the load's
+*current* state and returns a TransportPro document type, a File History comment, and a gate.
+
+| Gate | When | What happens |
+|---|---|---|
+| `block` | personal ID, or the reader says it is not freight paperwork | never filed; bytes never written to disk |
+| `hold` | a POD before the load is marked Delivered | waits for the Delivered mark rather than being wasted (OQ-3) |
+| `review` | customer rules not met, contested thread binding, or a routing tier weaker than the subject line | a person decides |
+| `auto` | high confidence, rules satisfied, correctly timed | filed only when auto-filing is on |
+
+Shadow mode is the default: without `--auto`, even a clean proposal goes to the queue as `shadow`
+with the filing it would have made, which is how the rollout measures agreement before anything is
+unblocked. `filing.execute()` is the only code in the service that writes to TransportPro, it is a
+dry run unless the caller passes `dry_run=False`, and the CLI only does that for `--execute`.
+
+The upload is `POST /files/upload`, multipart, with `recordType`, `recordId`, `documentType`,
+`comments` and a `file` part - the field names the TPro MCP server's own `tpro_file_upload` uses.
+It is deliberately not retried: a 500 after the document has already been stored would file it
+twice, and the read paths' idempotency does not reach here.
+
+No bytes are stored anywhere. `filing.fetch_bytes()` re-fetches the document from Gmail by
+`(message_id, attachment_id)` at the moment it files it, and refuses if the SHA-256 of what comes
+back differs from what was read and judged.
+
+```powershell
+.venv\Scripts\python.exe -m intake file                 # judge into the review queue; no writes
+.venv\Scripts\python.exe -m intake review               # what is waiting for a person
+.venv\Scripts\python.exe -m intake review approve 12 --by frankie
+.venv\Scripts\python.exe -m intake file --execute       # WRITES: upload what has been approved
+.venv\Scripts\python.exe -m intake file --auto --execute   # WRITES: also file what the gate cleared
+```
+
 **Measured on the live dashboard, 15 Sep 2026.** `reconcile` put 526 loads across the 16 pod
 terminals into the ledger in 32 TransportPro calls; 38 of them were already there from the mail
 side, so the two loops converge on the same ids. Draining 60 of them took 180 calls and produced

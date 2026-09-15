@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 -- Where the Gmail history cursor stands. One row per impersonated mailbox.
@@ -61,9 +61,13 @@ CREATE TABLE IF NOT EXISTS message (
 );
 
 -- One row per attachment occurrence. `decision` records why a part was or was not read.
+-- attachment_id is what makes "store no bytes" workable: the service keeps the hash and the
+-- reading, and re-fetches the document from Gmail by (message_id, attachment_id) at the moment it
+-- files it or a reviewer opens it. Those ids stay valid for the life of the message.
 CREATE TABLE IF NOT EXISTS part (
-    message_id  TEXT NOT NULL,
-    part_id     TEXT NOT NULL,
+    message_id    TEXT NOT NULL,
+    part_id       TEXT NOT NULL,
+    attachment_id TEXT,
     filename    TEXT,
     bytes       INTEGER,
     mime        TEXT,
@@ -98,6 +102,26 @@ CREATE TABLE IF NOT EXISTS filing (
     comment       TEXT,
     filed_at      TEXT,
     PRIMARY KEY (load_id, sha256)
+);
+
+-- Everything the service will not file by itself, with the reason. A reviewer's decision is
+-- recorded here and nowhere else, so "who approved this filing, and when" has one answer.
+-- No bytes: `sha256` plus the part rows are enough to re-fetch the document from Gmail on demand.
+CREATE TABLE IF NOT EXISTS review (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    load_id          INTEGER,
+    sha256           TEXT,
+    message_id       TEXT,
+    kind             TEXT,      -- pii | not_a_document | low_confidence | rules_failed | pod_too_early | conflict | error
+    reason           TEXT,
+    proposed_type    TEXT,      -- the TransportPro document type the service would have used
+    proposed_comment TEXT,
+    state            TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | rejected | filed
+    created_at       TEXT,
+    decided_at       TEXT,
+    decided_by       TEXT,
+    decision_note    TEXT,
+    UNIQUE (load_id, sha256, kind)
 );
 
 -- Mail that could not be routed. Listed, retried, escalated - never dropped.
@@ -169,6 +193,10 @@ def migrate(conn: sqlite3.Connection) -> None:
                            ("checks", "INTEGER NOT NULL DEFAULT 0"), ("last_error", "TEXT")):
             if name not in cols:
                 conn.execute(f"ALTER TABLE load ADD COLUMN {name} {decl}")
+    if have < 4:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(part)")}
+        if "attachment_id" not in cols:
+            conn.execute("ALTER TABLE part ADD COLUMN attachment_id TEXT")
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -239,13 +267,23 @@ def flag_thread_conflict(conn: sqlite3.Connection, thread_id: str) -> None:
 
 def record_part(conn: sqlite3.Connection, message_id: str, part_id: str, *, filename: str | None,
                 size: int | None, mime: str | None, decision: str, sha256: str | None = None,
-                dims: tuple[int, int] | None = None) -> None:
+                dims: tuple[int, int] | None = None, attachment_id: str | None = None) -> None:
     conn.execute(
-        "INSERT OR REPLACE INTO part (message_id, part_id, filename, bytes, mime, width, height, "
-        "sha256, decision, decided_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (message_id, part_id, filename, size, mime, dims[0] if dims else None, dims[1] if dims else None,
-         sha256, decision, now_iso()),
+        "INSERT OR REPLACE INTO part (message_id, part_id, attachment_id, filename, bytes, mime, "
+        "width, height, sha256, decision, decided_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (message_id, part_id, attachment_id, filename, size, mime,
+         dims[0] if dims else None, dims[1] if dims else None, sha256, decision, now_iso()),
     )
+
+
+def source_part(conn: sqlite3.Connection, sha256: str) -> sqlite3.Row | None:
+    """Where to re-fetch a document's bytes from. Any occurrence will do - they are the same
+    bytes by definition - so take the newest, whose message is least likely to have been deleted."""
+    return conn.execute(
+        "SELECT p.message_id, p.attachment_id, p.filename, p.mime, p.bytes, m.load_id "
+        "FROM part p JOIN message m ON m.message_id = p.message_id "
+        "WHERE p.sha256 = ? AND p.attachment_id IS NOT NULL "
+        "ORDER BY m.internal_date DESC LIMIT 1", (sha256,)).fetchone()
 
 
 # ------------------------------------------------------------------ attachments ----

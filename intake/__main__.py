@@ -12,7 +12,13 @@ r"""Command line for the intake service.
   python -m intake loads                     Loop B: check every load whose next check is due
   python -m intake queue                     the work queue, most urgent first
 
-Read-only against Gmail, and nothing here writes to TransportPro.
+  python -m intake file                      judge read documents into the review queue (no writes)
+  python -m intake review                    what is waiting for a person
+  python -m intake review approve 12 --by me
+  python -m intake file --execute            WRITES: upload what has been approved
+
+Read-only against Gmail. The ONLY command that writes to TransportPro is
+`file --execute`; everything else, including plain `file`, is a dry run.
 """
 from __future__ import annotations
 
@@ -23,7 +29,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from intake import db, gmail as gm, ingest, loadloop, tpro as tp  # noqa: E402
+from intake import db, filing, gmail as gm, ingest, loadloop, review, tpro as tp  # noqa: E402
 from pod_intake.localenv import load_local_env  # noqa: E402
 
 DEFAULT_DB = HERE / "out" / "intake.sqlite3"
@@ -150,6 +156,99 @@ def cmd_queue(args) -> int:
     return 0
 
 
+def cmd_propose(args) -> int:
+    """Judge every read document against its load and put the result in the review queue.
+
+    Writes nothing to TransportPro. With --execute it additionally files what a person has already
+    approved (and, with --auto, what the gate cleared by itself).
+    """
+    conn = db.connect(args.db)
+    pairs = filing.candidates(conn, limit=args.limit)
+    if not pairs:
+        print("nothing to judge: no read documents without a filing or a review decision.")
+    gates: dict[str, int] = {}
+    for load_id, sha in pairs:
+        p = filing.propose(conn, load_id, sha, requirements_path=args.requirements, allow_auto=args.auto)
+        gates[p.gate] = gates.get(p.gate, 0) + 1
+        if p.gate != filing.AUTO:
+            review.enqueue(conn, load_id=p.load_id, sha256=p.sha256, message_id=None, kind=p.kind,
+                           reason=p.reason, proposed_type=p.document_type, proposed_comment=p.comment)
+        if args.verbose or p.gate == filing.AUTO:
+            print("  " + p.line())
+    if pairs:
+        print(f"judged {len(pairs)}: " + ", ".join(f"{k} {v}" for k, v in sorted(gates.items())))
+
+    if not args.execute:
+        c = review.counts(conn)
+        print(f"\nreview queue: {c['_pending']} pending, {c['_approved']} approved and waiting to file, "
+              f"{c['_filed']} filed, {c['_rejected']} rejected")
+        if c["_approved"]:
+            print("  run with --execute to file the approved ones (this writes to TransportPro)")
+        return 0
+
+    todo = [(r["id"], int(r["load_id"]), r["sha256"]) for r in review.approved(conn, args.limit)]
+    if args.auto:
+        todo += [(None, lid, sha) for lid, sha in pairs
+                 if filing.propose(conn, lid, sha, requirements_path=args.requirements,
+                                   allow_auto=True).gate == filing.AUTO]
+    if not todo:
+        print("\n--execute: nothing approved to file.")
+        return 0
+
+    print(f"\n*** WRITING TO TRANSPORTPRO: {len(todo)} document(s) will be uploaded to live loads ***")
+    client = tp.from_env()
+    gclient = gm.from_env()
+    filed = failed = 0
+    for review_id, load_id, sha in todo:
+        p = filing.propose(conn, load_id, sha, requirements_path=args.requirements, allow_auto=True)
+        try:
+            out = filing.execute(conn, client, gclient, p, dry_run=False, review_id=review_id)
+        except Exception as e:  # noqa: BLE001 - one upload failing must not strand the rest
+            failed += 1
+            review.enqueue(conn, load_id=load_id, sha256=sha, message_id=None, kind=review.ERROR,
+                           reason=f"upload failed: {type(e).__name__}: {e}"[:250],
+                           proposed_type=p.document_type, proposed_comment=p.comment)
+            print(f"  ! load {load_id} {sha[:12]}: {type(e).__name__}: {e}")
+            continue
+        if out.get("filed"):
+            filed += 1
+            print(f"  + load {load_id} filed as {out['document_type']} (TransportPro file {out.get('tpro_file_id') or '?'})")
+        else:
+            print(f"  - load {load_id} {sha[:12]}: {out.get('why')}")
+    print(f"\nfiled {filed}, failed {failed}")
+    return 0
+
+
+def cmd_review(args) -> int:
+    conn = db.connect(args.db)
+    if args.action in ("approve", "reject"):
+        ok = review.decide(conn, args.id, approve=args.action == "approve", by=args.by, note=args.note)
+        if not ok:
+            print(f"review item {args.id} is not pending (already decided, or no such id).")
+            return 1
+        print(f"item {args.id} {args.action}d by {args.by}."
+              + (" Run 'python -m intake file --execute' to file it." if args.action == "approve" else ""))
+        return 0
+
+    rows = review.pending(conn, limit=args.limit, kind=args.kind)
+    c = review.counts(conn)
+    if not rows:
+        print(f"review queue empty. {c['_approved']} approved, {c['_filed']} filed, {c['_rejected']} rejected.")
+        return 0
+    print(f"{c['_pending']} pending  ({', '.join(f'{k} {v}' for k, v in sorted(c.items()) if not k.startswith('_'))})\n")
+    for r in rows:
+        print(f"  [{r['id']:>4}] {r['kind']:16} load {r['load_id']}  {(r['customer'] or '')[:30]}")
+        print(f"         {r['reason'][:110]}")
+        if r["proposed_type"]:
+            print(f"         would file as: {r['proposed_type']}")
+        print(f"         file {(r['sha256'] or '')[:12]} {(r['filename'] or '')[:40]}")
+    print("\n  approve:  python -m intake review approve <id> --by yourname")
+    print("  reject :  python -m intake review reject  <id> --by yourname --note why")
+    for kind in sorted({r["kind"] for r in rows}):
+        print(f"\n  {kind}: {review.KIND_HELP.get(kind, '')}")
+    return 0
+
+
 def _print_health(conn, full: bool = False) -> None:
     c = db.counts(conn)
     ok = "OK" if c["custody_gap"] == 0 else "BROKEN"
@@ -205,6 +304,25 @@ def main() -> int:
     q = sub.add_parser("queue", help="the work queue, most urgent first")
     q.add_argument("--limit", type=int, default=40)
     q.set_defaults(fn=cmd_queue)
+
+    f = sub.add_parser("file", help="judge read documents; with --execute, file the approved ones")
+    f.add_argument("--limit", type=int, default=200)
+    f.add_argument("--requirements", default=str(HERE / "index" / "customer_requirements.json"))
+    f.add_argument("--auto", action="store_true",
+                   help="allow the auto gate. Without it every proposal goes to review (shadow mode)")
+    f.add_argument("--execute", action="store_true",
+                   help="WRITES TO TRANSPORTPRO: upload what has been approved. Off by default")
+    f.add_argument("-v", "--verbose", action="store_true")
+    f.set_defaults(fn=cmd_propose)
+
+    rv = sub.add_parser("review", help="the review queue")
+    rv.add_argument("action", nargs="?", choices=["list", "approve", "reject"], default="list")
+    rv.add_argument("id", nargs="?", type=int)
+    rv.add_argument("--by", default="", help="who is deciding (recorded against the item)")
+    rv.add_argument("--note", default="")
+    rv.add_argument("--kind", default=None, help="only this kind, e.g. pii, rules_failed, shadow")
+    rv.add_argument("--limit", type=int, default=25)
+    rv.set_defaults(fn=cmd_review)
 
     sub.add_parser("status").set_defaults(fn=cmd_status)
 

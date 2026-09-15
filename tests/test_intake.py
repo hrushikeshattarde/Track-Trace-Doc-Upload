@@ -19,7 +19,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from intake import db, filters, ingest, loadloop, routing, state  # noqa: E402
+from intake import db, filing, filters, ingest, loadloop, review, routing, state  # noqa: E402
 
 PASSED = 0
 
@@ -378,6 +378,190 @@ def test_drain_reads_evidence_from_the_ledger() -> None:
     check("state is bol_expected", row["state"] == "bol_expected", str(row["state"]))
 
 
+# ---------------------------------------------------------------- filing gates ----
+
+def seed_document(conn, *, load_id=2578456, stage="delivered", doc_type="proof_of_delivery",
+                  notes="", filename="POD.png", tier="subject", conflict=0):
+    """One read document on one load, as Loop A + Loop B would have left it."""
+    blob = png(1200, 1600, filename.encode()[:4])
+    msgs = [message("f1", "t1", f"RE: Load {load_id} paperwork", when_ms=1_700_000_000_000,
+                    parts=[(filename, blob)])]
+    ingest.sync_once(conn, FakeGmail(msgs, {"att-f1-0": blob}), group="g", reader=None)
+    sha = conn.execute("SELECT sha256 FROM part WHERE decision='keep'").fetchone()["sha256"]
+    extraction = {
+        "document_type": doc_type, "document_type_confidence": 0.95, "numbers": [],
+        "shipper": {}, "consignee": {},
+        "signatures": {"shipper_signed": False, "driver_signed": True,
+                       "receiver_signed": True, "stamp_present": False},
+        "times": {"source": "none"}, "pages": [], "notes": notes,
+    }
+    db.put_attachment(conn, sha, message_id="f1", filename=filename, size=1000,
+                      extraction=extraction, document_type=doc_type, model="fake", cost_usd=0.046)
+    conn.execute("UPDATE load SET stage=?, state='pod_expected', customer='Acme' WHERE load_id=?",
+                 (stage, load_id))
+    conn.execute("UPDATE message SET routing_tier=? WHERE message_id='f1'", (tier,))
+    conn.execute("UPDATE thread SET conflict_flag=? WHERE thread_id='t1'", (conflict,))
+    return sha
+
+
+def test_filing_gates() -> None:
+    print("filing gates")
+    conn = fresh_db()
+    sha = seed_document(conn, notes="photo of the driver's license", filename="license.jpg")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    check("a driver's licence is blocked", p.gate == filing.BLOCK and p.kind == review.PII, p.reason)
+    check("and no document type is proposed for it", p.document_type is None)
+
+    conn = fresh_db()
+    sha = seed_document(conn, doc_type="other", notes="email signature graphic")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    check("a non-document is blocked", p.gate == filing.BLOCK and p.kind == review.NOT_A_DOCUMENT, p.reason)
+
+    # OQ-3: a POD filed before the Delivered mark leaves the status stuck, so it is held, not filed.
+    conn = fresh_db()
+    sha = seed_document(conn, stage="at consignee")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    check("a POD before the Delivered mark is held", p.gate == filing.HOLD, f"{p.gate} {p.reason}")
+    check("and the hold explains OQ-3", "OQ-3" in p.reason, p.reason)
+
+    conn = fresh_db()
+    sha = seed_document(conn, stage="delivered")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    check("a POD on a delivered load is auto-gated", p.gate == filing.AUTO, f"{p.gate} {p.reason}")
+    check("its type is recomputed, not cached", p.document_type == "Proof of Delivery", str(p.document_type))
+    check("the comment names the load", str(2578456) in (p.comment or ""), str(p.comment))
+
+    # Shadow mode is the default: the same document must NOT be auto-gated without allow_auto.
+    p2 = filing.propose(conn, 2578456, sha, allow_auto=False)
+    check("shadow mode sends even a clean filing to review", p2.gate == filing.REVIEW, p2.gate)
+    check("and says what it would have done", p2.kind == review.SHADOW and "would file" in p2.reason, p2.reason)
+
+    conn = fresh_db()
+    sha = seed_document(conn, stage="delivered", tier="thread")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    check("a weaker routing tier needs a person",
+          p.gate == filing.REVIEW and p.kind == review.LOW_CONFIDENCE, f"{p.gate} {p.kind}")
+
+    conn = fresh_db()
+    sha = seed_document(conn, stage="delivered", conflict=1)
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    check("a contested thread binding needs a person", p.kind == review.CONFLICT, str(p.kind))
+
+    # The stage decides the type: the same bytes on a loaded truck are pickup paperwork.
+    conn = fresh_db()
+    sha = seed_document(conn, stage="loaded")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    check("the same document on a loaded truck files as a BOL",
+          p.document_type == "Bill Of Lading", str(p.document_type))
+
+
+def test_execute_is_off_unless_asked() -> None:
+    print("the write path: dry run is the default")
+    conn = fresh_db()
+    sha = seed_document(conn, stage="delivered")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+
+    class RefuseToBeCalled:
+        def upload_file(self, **kw):
+            raise AssertionError("upload_file must never run during a dry run")
+
+    out = filing.execute(conn, RefuseToBeCalled(), None, p)          # dry_run defaults to True
+    check("execute is a dry run by default", out["dry_run"] and not out["filed"], str(out))
+    check("but it says exactly what it would send",
+          out["would"]["recordType"] == "Loads" and out["would"]["recordId"] == 2578456
+          and out["would"]["documentType"] == "Proof of Delivery", str(out["would"]))
+    check("nothing was recorded as filed", db.counts(conn)["filings"] == 0)
+
+    blocked = filing.propose(conn, 2578456, sha, allow_auto=True)
+    blocked.gate = filing.BLOCK
+    out = filing.execute(conn, RefuseToBeCalled(), None, blocked, dry_run=False)
+    check("a blocked proposal never uploads", not out["filed"] and "block" in out["why"], str(out))
+
+
+def test_execute_files_once_and_refetches() -> None:
+    print("the write path: upload, idempotency, re-fetch")
+    conn = fresh_db()
+    blob = png(1200, 1600, b"POD")
+    msgs = [message("f1", "t1", "RE: Load 2578456 POD", when_ms=1_700_000_000_000, parts=[("POD.png", blob)])]
+    gfake = FakeGmail(msgs, {"att-f1-0": blob})
+    ingest.sync_once(conn, gfake, group="g", reader=None)
+    sha = conn.execute("SELECT sha256 FROM part WHERE decision='keep'").fetchone()["sha256"]
+    db.put_attachment(conn, sha, message_id="f1", filename="POD.png", size=len(blob),
+                      extraction={"document_type": "proof_of_delivery", "document_type_confidence": 0.9,
+                                  "numbers": [], "shipper": {}, "consignee": {},
+                                  "signatures": {"shipper_signed": False, "driver_signed": True,
+                                                 "receiver_signed": True, "stamp_present": False},
+                                  "times": {"source": "none"}, "pages": [], "notes": ""},
+                      document_type="proof_of_delivery", model="fake", cost_usd=0.046)
+    conn.execute("UPDATE load SET stage='delivered', customer='Acme' WHERE load_id=2578456")
+
+    uploads = []
+
+    class FakeTPWriter:
+        def upload_file(self, **kw):
+            uploads.append(kw)
+            return {"id": 987654}
+
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    out = filing.execute(conn, FakeTPWriter(), gfake, p, dry_run=False)
+    check("it filed", out["filed"] and out["tpro_file_id"] == "987654", str(out))
+    check("the bytes were re-fetched from Gmail, not stored", len(gfake.downloads) >= 2, str(gfake.downloads))
+    check("the upload used the documented field names",
+          uploads[0]["record_type"] == "Loads" and uploads[0]["record_id"] == 2578456
+          and uploads[0]["document_type"] == "Proof of Delivery", str(uploads[0]))
+    check("the load is re-checked immediately after filing",
+          conn.execute("SELECT next_check_at FROM load WHERE load_id=2578456").fetchone()[0] is not None)
+
+    out2 = filing.execute(conn, FakeTPWriter(), gfake, p, dry_run=False)
+    check("a second attempt does not double-file",
+          not out2["filed"] and "already filed" in out2["why"], str(out2))
+    check("exactly one upload happened", len(uploads) == 1, str(len(uploads)))
+
+
+def test_refetch_verifies_the_bytes() -> None:
+    print("the write path: the hash is the document's identity")
+    conn = fresh_db()
+    blob = png(1200, 1600, b"POD")
+    msgs = [message("f1", "t1", "RE: Load 2578456 POD", when_ms=1_700_000_000_000, parts=[("POD.png", blob)])]
+    gfake = FakeGmail(msgs, {"att-f1-0": blob})
+    ingest.sync_once(conn, gfake, group="g", reader=None)
+    sha = conn.execute("SELECT sha256 FROM part WHERE decision='keep'").fetchone()["sha256"]
+    # Gmail hands back different bytes than the ones that were read and judged.
+    gfake._blobs["att-f1-0"] = png(1200, 1600, b"DIFF")
+    try:
+        filing.fetch_bytes(conn, gfake, sha)
+    except RuntimeError as e:
+        check("mismatched bytes are refused", "do not match" in str(e), str(e))
+    else:
+        check("mismatched bytes are refused", False)
+
+
+def test_review_queue() -> None:
+    print("review queue")
+    conn = fresh_db()
+    sha = seed_document(conn, stage="at consignee")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    for _ in range(2):
+        review.enqueue(conn, load_id=p.load_id, sha256=p.sha256, message_id=None, kind=p.kind,
+                       reason=p.reason, proposed_type=p.document_type, proposed_comment=p.comment)
+    check("enqueue is idempotent", review.counts(conn)["_pending"] == 1, str(review.counts(conn)))
+
+    item = review.pending(conn)[0]
+    check("the queue carries the proposed filing",
+          item["proposed_type"] == "Proof of Delivery", str(item["proposed_type"]))
+    check("approving records who", review.decide(conn, item["id"], approve=True, by="frankie"))
+    check("a second decision is refused", not review.decide(conn, item["id"], approve=False, by="someone"))
+    row = conn.execute("SELECT * FROM review WHERE id=?", (item["id"],)).fetchone()
+    check("the decision is attributed", row["decided_by"] == "frankie" and row["state"] == "approved")
+    check("approved items are what --execute would act on", len(review.approved(conn)) == 1)
+
+    # A later pass must not reset a decided item back to pending.
+    review.enqueue(conn, load_id=p.load_id, sha256=p.sha256, message_id=None, kind=p.kind,
+                   reason="re-judged", proposed_type=p.document_type, proposed_comment=p.comment)
+    check("re-judging does not reopen a decided item",
+          conn.execute("SELECT state FROM review WHERE id=?", (item["id"],)).fetchone()[0] == "approved")
+
+
 if __name__ == "__main__":
     test_routing()
     test_filters()
@@ -387,4 +571,9 @@ if __name__ == "__main__":
     test_state_machine()
     test_drain_never_drops_a_load()
     test_drain_reads_evidence_from_the_ledger()
+    test_filing_gates()
+    test_execute_is_off_unless_asked()
+    test_execute_files_once_and_refetches()
+    test_refetch_verifies_the_bytes()
+    test_review_queue()
     print(f"\n{PASSED} checks passed")

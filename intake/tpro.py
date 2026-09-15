@@ -189,6 +189,59 @@ class TransportPro:
         return out
 
 
+    # -- the write ---------------------------------------------------------
+    def upload_file(self, *, record_type: str, record_id: int, document_type: str, comments: str,
+                    filename: str, data: bytes, content_type: str = "application/octet-stream") -> dict:
+        """POST /files/upload - the only call in this service that changes TransportPro.
+
+        Field names and shape are taken from the TPro MCP server's own tpro_file_upload, which is
+        proven against the live API: multipart/form-data with recordType, recordId, documentType,
+        comments and a `file` part carrying the filename.
+
+        Deliberately not wrapped in a retry. A 500 after the document has already been stored would
+        file it twice, and the read paths' idempotency does not extend here; a failure is reported
+        so the caller can check File History before trying again.
+        """
+        if self._access is None:
+            self._login()
+        body, content_type_header = _multipart(
+            {"recordType": record_type, "recordId": str(record_id),
+             "documentType": document_type, "comments": comments},
+            file_field="file", filename=filename, data=data, file_content_type=content_type)
+        req = urllib.request.Request(
+            f"{self.base}/files/upload", data=body, method="POST",
+            headers={"Accept": "application/json", "Authorization": f"Bearer {self._access}",
+                     "Content-Type": content_type_header, "Accept-Encoding": "identity"})
+        try:
+            with urllib.request.urlopen(req, timeout=max(self._timeout, 120)) as r:
+                self.calls += 1
+                return json.loads(_body(r) or "{}")
+        except urllib.error.HTTPError as e:
+            raise TProError(e.code, "/files/upload", _body(e)) from None
+
+
+def _multipart(fields: dict[str, str], *, file_field: str, filename: str, data: bytes,
+               file_content_type: str) -> tuple[bytes, str]:
+    """Build a multipart/form-data body. Hand-rolled because this client has no HTTP library
+    beyond urllib, and the boundary has to be chosen here rather than by a framework."""
+    import uuid
+
+    boundary = "----intake" + uuid.uuid4().hex
+    crlf = b"\r\n"
+    out = bytearray()
+    for key, value in fields.items():
+        out += b"--" + boundary.encode() + crlf
+        out += f'Content-Disposition: form-data; name="{key}"'.encode() + crlf + crlf
+        out += str(value).encode("utf-8") + crlf
+    safe = filename.replace('"', "").replace("\r", "").replace("\n", "")
+    out += b"--" + boundary.encode() + crlf
+    out += f'Content-Disposition: form-data; name="{file_field}"; filename="{safe}"'.encode() + crlf
+    out += f"Content-Type: {file_content_type}".encode() + crlf + crlf
+    out += data + crlf
+    out += b"--" + boundary.encode() + b"--" + crlf
+    return bytes(out), f"multipart/form-data; boundary={boundary}"
+
+
 def from_env() -> TransportPro:
     """Build from PAYBOT_TP_* so an existing .env keeps working; a server injects the same three
     names from its secret store with no code change."""
