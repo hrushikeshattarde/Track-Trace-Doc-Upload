@@ -326,10 +326,19 @@ def test_state_machine() -> None:
     check("another service level is out of scope", a["state"] == "out_of_scope", a["state"])
     check("but it is still re-checked daily", a["next_check_at"] is not None)
 
-    # OQ-3: a filing made before the Delivered mark leaves the status stuck.
+    # Measured 15 Sep 2026 over 266 loads: type 363 Driver Supplied BOL does not clear the status;
+    # type 12 does. Timing (the old OQ-3 theory) separates nothing.
+    a = state.assess(1, tp_load(), [{"id": 9, "status": "Delivered", "lastUpdated": "2026-09-15T12:00:00Z"}],
+                     [tp_file(363, when="2026-09-15T09:00:00Z")])
+    check("a load whose only paperwork is Driver Supplied BOL is the wrong-type state",
+          a["state"] == "wrong_doc_type", a["state"])
+    check("and the action says re-filing it properly clears the status",
+          "re-file it as Bill Of Lading" in a["action"], a["action"])
+
     a = state.assess(1, tp_load(), [{"id": 9, "status": "Delivered", "lastUpdated": "2026-09-15T12:00:00Z"}],
                      [tp_file(12, when="2026-09-15T09:00:00Z")])
-    check("the OQ-3 ordering is spelled out", "predates the Delivered mark" in a["action"], a["action"])
+    check("a clearing type filed before the Delivered mark is NOT called wrong-type",
+          a["state"] == "filed_status_pending", a["state"])
 
     check("the POD window is the tightest cadence",
           state.CADENCE_MINUTES["pod_expected"] < state.CADENCE_MINUTES["bol_expected"]
@@ -445,12 +454,20 @@ def test_filing_gates() -> None:
     p = filing.propose(conn, 2578456, sha, allow_auto=True)
     check("a non-document is blocked", p.gate == filing.BLOCK and p.kind == review.NOT_A_DOCUMENT, p.reason)
 
-    # OQ-3: a POD filed before the Delivered mark leaves the status stuck, so it is held, not filed.
+    # A POD at the consignee is no longer withheld. The 15 Sep 2026 measurement refuted the timing
+    # theory that justified holding it, and classify_type already refuses to call anything a POD
+    # before the truck reaches the consignee - which is the rule that actually protects correctness.
     conn = fresh_db()
     sha = seed_document(conn, stage="at consignee")
     p = filing.propose(conn, 2578456, sha, allow_auto=True)
-    check("a POD before the Delivered mark is held", p.gate == filing.HOLD, f"{p.gate} {p.reason}")
-    check("and the hold explains OQ-3", "OQ-3" in p.reason, p.reason)
+    check("a POD at the consignee is no longer held for timing", p.gate != filing.HOLD, f"{p.gate} {p.reason}")
+
+    # The rule that does the protecting: before the consignee, the same page is pickup paperwork.
+    conn = fresh_db()
+    sha = seed_document(conn, stage="loaded")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    check("before the consignee it can never be typed a POD",
+          p.document_type == "Bill Of Lading", str(p.document_type))
 
     conn = fresh_db()
     sha = seed_document(conn, stage="delivered")
@@ -577,6 +594,8 @@ def test_review_queue() -> None:
     item = review.pending(conn)[0]
     check("the queue carries the proposed filing",
           item["proposed_type"] == "Proof of Delivery", str(item["proposed_type"]))
+    check("and a kind, never NULL - a null kind defeats the UNIQUE de-duplication",
+          bool(item["kind"]), str(item["kind"]))
     check("approving records who", review.decide(conn, item["id"], approve=True, by="frankie"))
     check("a second decision is refused", not review.decide(conn, item["id"], approve=False, by="someone"))
     row = conn.execute("SELECT * FROM review WHERE id=?", (item["id"],)).fetchone()

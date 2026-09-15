@@ -16,9 +16,9 @@ The gates, in the order they are checked:
 
   block   personal ID, or the reader says this is not freight paperwork. Never filed, and the
           bytes are never written to disk.
-  hold    a POD before the load is marked Delivered. Filing it there leaves documentStatus stuck at
-          "Waiting for Documents" (measured on 2572128 / 2577037 / 2575004, 14 Sep 2026), so the
-          document waits for the Delivered mark rather than being wasted.
+  hold    reserved. It used to withhold PODs until the Delivered mark on the OQ-3 timing theory,
+          which the 15 Sep 2026 measurement refuted; classify_type already refuses to call anything
+          a POD before the truck reaches the consignee.
   review  the customer's requirements are not met, the thread binding disagreed with the subject,
           or the load was resolved by something weaker than its own subject line.
   auto    high-confidence, rules satisfied, correctly timed. Filed only when auto-filing is on.
@@ -110,12 +110,11 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
             gate, kind = REVIEW, review.RULES_FAILED
             reason = f"customer requirements not met: {verdict_summary[:120]}"
 
-    # 5. OQ-3: a POD filed before the Delivered mark does not clear the status. Hold it instead.
-    if doc_type == "Proof of Delivery" and stage != "delivered":
-        return Proposal(load_id, sha256, HOLD, review.POD_TOO_EARLY,
-                        f"POD ready but the load is {stage or 'not delivered'}; filing now would leave the "
-                        f"status Waiting (OQ-3). Holding until the Delivered mark.",
-                        doc_type, None, filename, notes)
+    # 5. Nothing to hold for timing. This used to withhold any POD until the Delivered mark, on the
+    #    OQ-3 theory that an earlier upload leaves the status stuck. Measured over 266 loads on
+    #    15 Sep 2026 that is false: 58% of cleared loads had a filing after the mark against 69% of
+    #    stuck ones. What decides it is the document TYPE (state.CLEARING_TYPES), and classify_type
+    #    already refuses to call anything a POD before the truck reaches the consignee.
 
     # 6. Does this load actually need this document? Passing every safety gate is not the same as
     #    being work. Without this the auto gate fires on documents for loads that already show
@@ -127,6 +126,12 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
         return Proposal(load_id, sha256, REVIEW, review.NOT_NEEDED,
                         f"load is {load_state}: it is not short a document, so filing this adds a "
                         f"duplicate rather than clearing anything",
+                        doc_type, None, filename, notes)
+    if load_state == "wrong_doc_type":
+        return Proposal(load_id, sha256, REVIEW, review.WRONG_TYPE,
+                        "the load's only paperwork is filed under a type that does not clear "
+                        "Waiting for Documents (usually Driver Supplied BOL); filing this under a "
+                        f"proper {doc_type} is what clears it",
                         doc_type, None, filename, notes)
     if load_state == "filed_status_pending":
         # Only worth re-filing once the load is actually Delivered. Before that there is no

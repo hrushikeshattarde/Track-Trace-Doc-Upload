@@ -24,12 +24,14 @@ POD_TOO_EARLY = "pod_too_early"
 CONFLICT = "conflict"
 LOW_CONFIDENCE = "low_confidence"
 NOT_NEEDED = "not_needed"              # the load is not short this document
+WRONG_TYPE = "wrong_doc_type"        # filed, but under a type that does not clear the status
 REFILE = "refile"                      # filed already, but the status never cleared (OQ-3)
 SHADOW = "shadow"                      # auto-filing is off; this would have been filed
 ERROR = "error"
+UNCLASSIFIED = "unclassified"          # a proposal that reached the queue without a reason set
 
 KIND_ORDER = [PII, NOT_A_DOCUMENT, RULES_FAILED, CONFLICT, POD_TOO_EARLY, LOW_CONFIDENCE,
-              ERROR, SHADOW, REFILE, NOT_NEEDED]
+              ERROR, SHADOW, WRONG_TYPE, REFILE, NOT_NEEDED, UNCLASSIFIED]
 
 KIND_HELP = {
     PII: "personal ID (licence, passport). Never file; delete from the thread if policy says so.",
@@ -40,8 +42,10 @@ KIND_HELP = {
     LOW_CONFIDENCE: "the load was resolved by a weaker signal than the subject line.",
     SHADOW: "auto-filing is off. This is what the service would have filed.",
     NOT_NEEDED: "the load is not short this document - filing it would add a duplicate.",
+    WRONG_TYPE: "the load has paperwork but only under Driver Supplied BOL, which does not clear the status; re-filing it properly does.",
     REFILE: "already filed but the status never cleared; re-filing after the Delivered mark is the OQ-3 fix.",
     ERROR: "the filing attempt failed.",
+    UNCLASSIFIED: "reached the queue without a reason recorded - a bug worth reporting.",
 }
 
 
@@ -61,7 +65,12 @@ def enqueue(conn: sqlite3.Connection, *, load_id: int | None, sha256: str | None
             kind: str, reason: str, proposed_type: str | None = None,
             proposed_comment: str | None = None) -> None:
     """Add a document to the queue. Idempotent on (load, file, kind): re-running the loop must not
-    grow the queue, and a reviewer's decision must not be reset by a later pass."""
+    grow the queue, and a reviewer's decision must not be reset by a later pass.
+
+    `kind` must never be NULL. SQLite counts NULLs as distinct in a UNIQUE constraint, so a null
+    kind silently defeats the de-duplication and every pass adds another copy of the same item.
+    """
+    kind = kind or UNCLASSIFIED
     conn.execute(
         "INSERT INTO review (load_id, sha256, message_id, kind, reason, proposed_type, proposed_comment, "
         "state, created_at) VALUES (?,?,?,?,?,?,?,'pending',?) "

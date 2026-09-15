@@ -11,7 +11,8 @@ at the same rate:
 
     pod_expected          15 min   the money window - detention and deliver-out are decided here
     bol_expected           1 h     customers who gate on "BOL before leaving the shipper"
-    filed_status_pending   1 h     retry once the Delivered mark lands
+    wrong_doc_type         1 h     paperwork is on the load under a type that does not clear it
+    filed_status_pending   1 h     filed under a clearing type and still Waiting: check by hand
     not_yet_due            6 h     no paperwork can exist; only the stage can change
     out_of_scope          24 h     service level does get corrected on a stop
     in_review              never   a person owns it; event-driven
@@ -26,11 +27,26 @@ import re
 BOL_TYPES = {12: "Bill Of Lading", 363: "Driver Supplied BOL"}
 POD_TYPES = {360: "Proof of Delivery", 53: "Delivery Receipt"}
 
+# Which types actually clear "Waiting for Documents". Measured 15 Sep 2026 over 266 loads:
+#
+#   of the 96 that reached Documents Received, 94 carry a type 12 Bill Of Lading and only 2 carry
+#   nothing but 363;
+#   of the 170 still Waiting, 145 have ONLY 363.
+#
+# The same run refutes the timing explanation this project had been working from (PRD OQ-3, "the
+# status clears only on an upload made after the Delivered mark"): 58% of cleared loads had a
+# filing after that mark against 69% of stuck ones, so it separates nothing. The type does.
+# 363 "Driver Supplied BOL" - what TransportPro itself files driver MMS photos as - puts a document
+# on the load without satisfying it.
+CLEARING_TYPES = {12, 360, 53}
+NON_CLEARING_TYPES = {363}
+
 STAGE_ORDER = {"planned": 0, "dispatched": 1, "at shipper": 2, "loaded": 3, "in transit": 3,
                "at consignee": 4, "delivered": 5}
 
 CADENCE_MINUTES: dict[str, int | None] = {
     "pod_expected": 15,
+    "wrong_doc_type": 60,
     "bol_expected": 60,
     "filed_status_pending": 60,
     "not_yet_due": 360,
@@ -130,26 +146,24 @@ def assess(load_id: int, load: dict, dispatches: list[dict], files: list[dict], 
     expects_pod = rank >= STAGE_ORDER["at consignee"]
 
     # When TransportPro marked the load Delivered (proxy: lastUpdated of the Delivered dispatch; the
-    # API exposes no status timestamp). Observed 14 Sep 2026 on 2572128 / 2577037 / 2575004: an upload
-    # made BEFORE this moment leaves documentStatus at "Waiting for Documents" and the later Delivered
-    # mark does not recompute it; an upload made AFTER flips it the same second. PRD OQ-3.
+    # API exposes no status timestamp). Kept for reporting only - the 15 Sep 2026 measurement showed
+    # it does not predict whether the status clears. See CLEARING_TYPES.
     delivered_at = (utc(disp.get("lastUpdated"))
                     if (disp.get("status") or "").lower() == "delivered" and disp.get("lastUpdated") else None)
-    all_filed_before_delivered = bool(filed) and delivered_at is not None and all(
-        (utc(f.get("dateCreated")) or delivered_at) < delivered_at for f in filed)
-
     if docs_received:
         return _row(load_id, load, "complete", stage, "documents received", files)
 
     if filed:
-        why = "filed but status still Waiting"
-        if all_filed_before_delivered:
-            why += (f"; every filing predates the Delivered mark ({delivered_at:%m/%d %H:%M}Z) - the OQ-3 pattern. "
-                    "Re-file after the Delivered mark, or re-trigger the status")
-        elif delivered_at:
-            why += "; filed after the Delivered mark yet still Waiting: does not fit the OQ-3 pattern, check by hand"
-        elif stage != "delivered":
-            why += "; load not yet Delivered, so by the OQ-3 pattern the status clears only on an upload made after it"
+        # The type is what decides this, not the timing - see CLEARING_TYPES above.
+        types = {f.get("fileTypeId") for f in filed}
+        if not (types & CLEARING_TYPES):
+            names = ", ".join(sorted({f.get("fileTypeName") or str(f.get("fileTypeId")) for f in filed}))
+            why = (f"filed only as {names}, which does not clear Waiting for Documents. The paperwork is "
+                   f"on the load; re-file it as Bill Of Lading or Proof of Delivery and the status clears")
+            return _row(load_id, load, "wrong_doc_type", stage, why, files)
+        why = ("filed under a clearing type and still Waiting: does not fit the measured pattern, "
+               "check by hand" + (f"; Delivered mark {delivered_at:%m/%d %H:%M}Z" if delivered_at else
+                                  f"; truck is {stage}, a second document may still be due"))
         return _row(load_id, load, "filed_status_pending", stage, why, files)
 
     if rank < STAGE_ORDER["loaded"]:
