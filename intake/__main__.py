@@ -7,6 +7,11 @@ r"""Command line for the intake service.
   python -m intake unresolved                mail that could not be routed
   python -m intake load 2578456              everything the ledger knows about one load
 
+  python -m intake reconcile                 Loop B: give every dashboard load a ledger row
+  python -m intake reconcile --days-back 350 ... the nightly audit over the whole view
+  python -m intake loads                     Loop B: check every load whose next check is due
+  python -m intake queue                     the work queue, most urgent first
+
 Read-only against Gmail, and nothing here writes to TransportPro.
 """
 from __future__ import annotations
@@ -18,11 +23,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from intake import db, gmail as gm, ingest  # noqa: E402
+from intake import db, gmail as gm, ingest, loadloop, tpro as tp  # noqa: E402
 from pod_intake.localenv import load_local_env  # noqa: E402
 
 DEFAULT_DB = HERE / "out" / "intake.sqlite3"
 GROUP = "ratecon@circledelivers.com"
+POD_MAP = HERE / "index" / "pod_terminals.json"
 
 
 def cmd_init(args) -> int:
@@ -100,6 +106,50 @@ def cmd_load(args) -> int:
     return 0
 
 
+def cmd_reconcile(args) -> int:
+    conn = db.connect(args.db)
+    terminals, levels = loadloop.pod_terminals(args.pod_map)
+    if args.terminals:
+        terminals = [int(x) for x in args.terminals.replace(",", " ").split()]
+    if not terminals:
+        print(f"no terminals: {args.pod_map} is missing or has none ticked. Pass --terminals.")
+        return 1
+    client = tp.from_env()
+    print(f"reconciling {len(terminals)} terminal(s), pickups {args.days_back}d back to {args.days_forward}d ahead"
+          + (f", service level {sorted(levels)}" if levels else ""))
+    rs = loadloop.reconcile(conn, client, terminals=terminals, days_back=args.days_back,
+                            days_forward=args.days_forward, scope_levels=levels, verbose=args.verbose)
+    print(rs.line() + f"   ({client.calls} TransportPro calls)")
+    _print_health(conn)
+    return 0
+
+
+def cmd_loads(args) -> int:
+    conn = db.connect(args.db)
+    _, levels = loadloop.pod_terminals(args.pod_map)
+    client = tp.from_env()
+    ds = loadloop.drain(conn, client, limit=args.limit, scope_levels=levels, verbose=args.verbose)
+    print(ds.line())
+    _print_health(conn)
+    return 0
+
+
+def cmd_queue(args) -> int:
+    conn = db.connect(args.db)
+    rows = loadloop.work_queue(conn, args.limit)
+    if not rows:
+        print("nothing checked yet - run 'python -m intake loads'")
+        return 0
+    print(f"{'load':>9}  {'state':22} {'stage':13} {'docs':5} {'customer':26} action")
+    for r in rows:
+        docs, unread = db.load_doc_evidence(conn, int(r["load_id"]))
+        mark = f"{docs}" + (f"/{unread}?" if unread else "")
+        print(f"{r['load_id']:>9}  {(r['state'] or ''):22} {(r['stage'] or ''):13} {mark:5} "
+              f"{(r['customer'] or '')[:26]:26} {(r['action'] or '')[:70]}")
+    print("\n  docs column: documents in the mail ledger for that load; /N? = not read yet")
+    return 0
+
+
 def _print_health(conn, full: bool = False) -> None:
     c = db.counts(conn)
     ok = "OK" if c["custody_gap"] == 0 else "BROKEN"
@@ -136,6 +186,25 @@ def main() -> int:
     s.add_argument("--model", default="claude-opus-5")
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(fn=cmd_sync)
+
+    r = sub.add_parser("reconcile", help="Loop B: give every dashboard load a ledger row")
+    r.add_argument("--terminals", default=None, help="comma-separated terminal ids instead of the ticked pods")
+    r.add_argument("--days-back", type=int, default=3,
+                   help="pickup window start; 3 for the hourly pass, ~350 for the nightly audit")
+    r.add_argument("--days-forward", type=int, default=45)
+    r.add_argument("--pod-map", default=str(POD_MAP))
+    r.add_argument("-v", "--verbose", action="store_true")
+    r.set_defaults(fn=cmd_reconcile)
+
+    ld = sub.add_parser("loads", help="Loop B: check every load whose next check is due")
+    ld.add_argument("--limit", type=int, default=100)
+    ld.add_argument("--pod-map", default=str(POD_MAP))
+    ld.add_argument("-v", "--verbose", action="store_true")
+    ld.set_defaults(fn=cmd_loads)
+
+    q = sub.add_parser("queue", help="the work queue, most urgent first")
+    q.add_argument("--limit", type=int, default=40)
+    q.set_defaults(fn=cmd_queue)
 
     sub.add_parser("status").set_defaults(fn=cmd_status)
 

@@ -309,6 +309,44 @@ the thread's binding, because reps reuse an old thread for a new load constantly
 sets `thread.conflict_flag` rather than being silently resolved. A subject naming several loads is
 ambiguous, not decisive, and goes to the unresolved list rather than guessing the first one.
 
+**Loop B, the load side** (`intake/loadloop.py`, `intake/state.py`, `intake/tpro.py`). Two jobs with
+different costs. `reconcile` reproduces the Load Management filter through `/load/search` and gives
+every load in the view a ledger row - no `--max`, no truncation. `drain` takes the loads whose
+`next_check_at` has come round, oldest first, reads their state from TransportPro and writes back a
+state and the next due time, so a backlog delays a load but can never lose one. The cadence is
+matched to what each load is waiting for, which is also what keeps the call volume down:
+
+| State | Waiting for | Re-check |
+|---|---|---|
+| `pod_expected` | at consignee / delivered, no POD filed | 15 min |
+| `bol_expected` | loaded, no BOL filed | 1 h |
+| `filed_status_pending` | filed, status still Waiting | 1 h |
+| `not_yet_due` | truck not loaded | 6 h |
+| `out_of_scope` | wrong service level | 24 h |
+| `complete` | nothing | never |
+
+`drain` makes no model calls and no Gmail calls: whether paperwork is sitting in the thread is
+answered from the ledger Loop A already filled (`db.load_doc_evidence`), which is what made
+readiness.py spend one Gmail search for every one of the 539 dashboard loads. A load the API cannot
+serve is deferred with its error and stays in the coverage count, so a systematic failure shows up
+as queue lag rather than as loads quietly gone.
+
+```powershell
+.venv\Scripts\python.exe -m intake reconcile                  # hourly: pickups 3 days back
+.venv\Scripts\python.exe -m intake reconcile --days-back 350  # nightly audit over the whole view
+.venv\Scripts\python.exe -m intake loads --limit 100          # check what is due
+.venv\Scripts\python.exe -m intake queue                      # the work queue, most urgent first
+```
+
+**Measured on the live dashboard, 15 Sep 2026.** `reconcile` put 526 loads across the 16 pod
+terminals into the ledger in 32 TransportPro calls; 38 of them were already there from the mail
+side, so the two loops converge on the same ids. Draining 60 of them took 180 calls and produced
+15 `filed_status_pending`, 15 `complete`, 12 `out_of_scope`, 12 `not_yet_due`, 3 `pod_expected`,
+3 `bol_expected`. The queue joins the two ledgers: load 2578532 shows `1/1?` in the docs column -
+one document found by Loop A, not yet read - beside "every filing predates the Delivered mark",
+and load 2567447 is flagged "filed after the Delivered mark yet still Waiting", which does *not*
+fit the OQ-3 pattern and wants a person.
+
 **Measured on the live mailbox, 15 Sep 2026.** First pass: 120 messages, 100% routed by subject,
 185 Gmail calls, $0. Second pass off the cursor: 14 new messages in 20 calls, and 5 attachment
 occurrences collapsed to 1 new unique file — 4 reads avoided that the prototype would have paid

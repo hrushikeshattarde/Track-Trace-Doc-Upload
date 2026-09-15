@@ -9,6 +9,7 @@ Plain asserts rather than pytest, which is not in the project virtualenv.
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import hashlib
 import struct
 import sys
@@ -18,7 +19,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from intake import db, filters, ingest, routing  # noqa: E402
+from intake import db, filters, ingest, loadloop, routing, state  # noqa: E402
 
 PASSED = 0
 
@@ -248,10 +249,142 @@ def test_one_bad_file_does_not_stop_the_batch() -> None:
     check("both files now carry a reading", db.counts(conn)["files_read"] == 2, str(db.counts(conn)))
 
 
+# ---------------------------------------------------------------- load loop ----
+
+def tp_load(stage_status="Dispatched", doc_status="Waiting for Documents", load_status="Dispatched",
+            levels=("Priority / OP8",), customer="Acme Foods"):
+    return {"status": {"loadStatus": load_status, "documentStatus": doc_status},
+            "assignedTerminal": 1088,
+            "billingInfo": {"customer": {"companyName": customer}},
+            "waypoints": [{"type": "SH", "reference": [{"type": "SERVICE_LEVEL", "value": v} for v in levels]}]}
+
+
+def tp_file(type_id, when="2026-09-15T10:00:00Z", comment=""):
+    return {"fileTypeId": type_id, "fileTypeName": state.BOL_TYPES.get(type_id) or state.POD_TYPES.get(type_id),
+            "dateCreated": when, "comments": comment}
+
+
+def test_state_machine() -> None:
+    print("state machine")
+    a = state.assess(1, tp_load(), [{"id": 9, "status": "Dispatched"}], [])
+    check("planned/dispatched load is not yet due", a["state"] == "not_yet_due", a["state"])
+    due = state.utc(a["next_check_at"]) - dt.datetime.now(dt.timezone.utc)
+    check("its next check is ~6 h out, not minutes", 5.5 * 3600 < due.total_seconds() < 6.5 * 3600,
+          f"{due}")
+
+    a = state.assess(1, tp_load(), [{"id": 9, "status": "Loaded"}], [], ledger_docs=2, ledger_unread=2)
+    check("loaded with nothing filed wants the BOL", a["state"] == "bol_expected", a["state"])
+    check("it names the documents waiting in the thread", "2 document(s)" in a["action"], a["action"])
+
+    a = state.assess(1, tp_load(), [{"id": 9, "status": "At Consignee"}], [])
+    check("at consignee it wants the POD", a["state"] == "pod_expected", a["state"])
+    check("and says nothing is anywhere", "ask the driver" in a["action"], a["action"])
+
+    # Cancelled dispatch first: readiness.py read the wrong status off load 2576660 this way.
+    a = state.assess(1, tp_load(), [{"id": 1, "status": "Canceled"}, {"id": 2, "status": "Delivered"}], [])
+    check("a cancelled dispatch does not decide the stage", a["stage"] == "delivered", a["stage"])
+
+    # Reps file a signed POD under "Bill Of Lading" with the comment "POD" (loads 2577037, 2577850).
+    a = state.assess(1, tp_load(), [{"id": 9, "status": "Delivered"}], [tp_file(12, comment="POD signed")])
+    check("a BOL-typed file commented POD counts as the POD", a["state"] == "filed_status_pending", a["state"])
+
+    a = state.assess(1, tp_load(doc_status="Documents Received"), [{"id": 9, "status": "Delivered"}],
+                     [tp_file(360)])
+    check("documents received is terminal", a["state"] == "complete")
+    check("a complete load is never polled again", a["next_check_at"] is None)
+
+    a = state.assess(1, tp_load(levels=("Flexible / FCFS",)), [{"id": 9, "status": "Loaded"}], [],
+                     scope_levels={"priority / op8"})
+    check("another service level is out of scope", a["state"] == "out_of_scope", a["state"])
+    check("but it is still re-checked daily", a["next_check_at"] is not None)
+
+    # OQ-3: a filing made before the Delivered mark leaves the status stuck.
+    a = state.assess(1, tp_load(), [{"id": 9, "status": "Delivered", "lastUpdated": "2026-09-15T12:00:00Z"}],
+                     [tp_file(12, when="2026-09-15T09:00:00Z")])
+    check("the OQ-3 ordering is spelled out", "predates the Delivered mark" in a["action"], a["action"])
+
+    check("the POD window is the tightest cadence",
+          state.CADENCE_MINUTES["pod_expected"] < state.CADENCE_MINUTES["bol_expected"]
+          < state.CADENCE_MINUTES["not_yet_due"])
+
+
+class FakeTPro:
+    calls = 0
+
+    def __init__(self, loads: dict, fail: set | None = None) -> None:
+        self._loads = loads
+        self._fail = fail or set()
+
+    def load(self, load_id):
+        FakeTPro.calls += 1
+        if load_id in self._fail:
+            from intake.tpro import TProError
+            raise TProError(503, f"/load/{load_id}", "backend unavailable")
+        return self._loads[load_id]["load"]
+
+    def dispatches(self, load_id):
+        return self._loads[load_id].get("dispatches", [])
+
+    def files(self, load_id):
+        return self._loads[load_id].get("files", [])
+
+
+def test_drain_never_drops_a_load() -> None:
+    print("load loop: drain, cadence, deferral")
+    conn = fresh_db()
+    loads = {}
+    for i in range(5):
+        lid = 2578000 + i
+        loads[lid] = {"load": tp_load(), "dispatches": [{"id": i, "status": "At Consignee"}], "files": []}
+        db.upsert_load(conn, lid, source="dashboard", due_now=True)
+    # One load the API cannot serve this pass.
+    fake = FakeTPro(loads, fail={2578003})
+
+    ds = loadloop.drain(conn, fake, limit=100)
+    check("every due load was checked or deferred", ds.checked + ds.errors == 5, ds.line())
+    check("the failing load was deferred, not dropped", ds.errors == 1, ds.line())
+    check("the ledger still holds all five", db.counts(conn)["loads"] == 5)
+    row = conn.execute("SELECT * FROM load WHERE load_id=2578003").fetchone()
+    check("the deferred load keeps a next check", row["next_check_at"] is not None)
+    check("and records why", "503" in (row["last_error"] or ""), str(row["last_error"]))
+
+    # The cadence must have pushed the healthy loads into the future, so a second drain is a no-op.
+    ds2 = loadloop.drain(conn, fake, limit=100)
+    check("checked loads are not re-polled immediately", ds2.checked == 0, ds2.line())
+
+    # The limit delays work; it must never discard it. This is the --max bug the design removes.
+    for lid in loads:
+        conn.execute("UPDATE load SET next_check_at=? WHERE load_id=?", (db.now_iso(), lid))
+    ds3 = loadloop.drain(conn, fake, limit=2)
+    check("a limit checks only some", ds3.checked + ds3.errors == 2, ds3.line())
+    check("the rest stay due, not dropped", db.counts(conn)["loads_overdue"] == 3,
+          str(db.counts(conn)["loads_overdue"]))
+
+
+def test_drain_reads_evidence_from_the_ledger() -> None:
+    print("load loop: evidence comes from the ledger, not Gmail")
+    conn = fresh_db()
+    blob = png(1200, 1600, b"BOL")
+    msgs = [message("e1", "t1", "RE: Load 2578456 BOL", when_ms=1_700_000_000_000, parts=[("BOL.png", blob)])]
+    ingest.sync_once(conn, FakeGmail(msgs, {"att-e1-0": blob}), group="g", reader=None)
+    check("Loop A created the load row", db.counts(conn)["loads"] == 1)
+
+    fake = FakeTPro({2578456: {"load": tp_load(), "dispatches": [{"id": 1, "status": "Loaded"}], "files": []}})
+    loadloop.drain(conn, fake, limit=10)
+    row = conn.execute("SELECT * FROM load WHERE load_id=2578456").fetchone()
+    check("the load loop sees the document Loop A recorded",
+          "1 document(s)" in (row["action"] or ""), str(row["action"]))
+    check("and flags it as unread", "not read yet" in (row["action"] or ""), str(row["action"]))
+    check("state is bol_expected", row["state"] == "bol_expected", str(row["state"]))
+
+
 if __name__ == "__main__":
     test_routing()
     test_filters()
     test_dedup_and_custody()
     test_cursor_written_last()
     test_one_bad_file_does_not_stop_the_batch()
+    test_state_machine()
+    test_drain_never_drops_a_load()
+    test_drain_reads_evidence_from_the_ledger()
     print(f"\n{PASSED} checks passed")

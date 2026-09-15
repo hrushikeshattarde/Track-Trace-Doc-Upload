@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 -- Where the Gmail history cursor stands. One row per impersonated mailbox.
@@ -124,7 +124,11 @@ CREATE TABLE IF NOT EXISTS load (
     next_check_at  TEXT,
     last_checked_at TEXT,
     source         TEXT,          -- dashboard | mail (a document can arrive before the sweep sees the load)
-    created_at     TEXT
+    created_at     TEXT,
+    action         TEXT,          -- why it is in this state, in words a person can work from
+    filed_types    TEXT,
+    checks         INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS ix_message_thread    ON message (thread_id);
@@ -159,6 +163,12 @@ def migrate(conn: sqlite3.Connection) -> None:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(attachment)")}
         if "error" not in cols:
             conn.execute("ALTER TABLE attachment ADD COLUMN error TEXT")
+    if have < 3:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(load)")}
+        for name, decl in (("action", "TEXT"), ("filed_types", "TEXT"),
+                           ("checks", "INTEGER NOT NULL DEFAULT 0"), ("last_error", "TEXT")):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE load ADD COLUMN {name} {decl}")
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -276,6 +286,38 @@ def upsert_load(conn: sqlite3.Connection, load_id: int, *, source: str, due_now:
     )
     if due_now:
         conn.execute("UPDATE load SET next_check_at=? WHERE load_id=?", (now_iso(), load_id))
+
+
+def load_doc_evidence(conn: sqlite3.Connection, load_id: int) -> tuple[int, int]:
+    """(documents in the mail ledger for this load, how many are not read yet).
+
+    Loop A already recorded every document-bearing message, so the load loop answers "is there
+    paperwork in the thread?" from the database instead of a Gmail search per load - which is what
+    made readiness.py cost one search for every one of the 539 dashboard loads.
+    """
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT p.sha256) AS docs, "
+        "       COUNT(DISTINCT CASE WHEN a.extraction_json IS NULL THEN p.sha256 END) AS unread "
+        "FROM message m JOIN part p ON p.message_id = m.message_id AND p.decision = 'keep' "
+        "LEFT JOIN attachment a ON a.sha256 = p.sha256 WHERE m.load_id = ?", (load_id,)).fetchone()
+    return (row["docs"] or 0, row["unread"] or 0)
+
+
+def update_load(conn: sqlite3.Connection, load_id: int, assessment: dict) -> None:
+    conn.execute(
+        "UPDATE load SET state=?, stage=?, action=?, doc_status=?, terminal=?, customer=?, "
+        "service_level=?, filed_types=?, next_check_at=?, last_checked_at=?, checks=checks+1, "
+        "last_error=NULL WHERE load_id=?",
+        (assessment["state"], assessment["stage"], assessment["action"], assessment["doc_status"],
+         assessment["terminal"], assessment["customer"], assessment["service_level"],
+         assessment["filed_types"], assessment["next_check_at"], now_iso(), load_id))
+
+
+def defer_load(conn: sqlite3.Connection, load_id: int, error: str, minutes: int = 60) -> None:
+    """A load that could not be read is pushed out and kept, never dropped."""
+    nxt = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)).isoformat(timespec="seconds")
+    conn.execute("UPDATE load SET state='error', last_error=?, next_check_at=?, last_checked_at=?, "
+                 "checks=checks+1 WHERE load_id=?", (error[:300], nxt, now_iso(), load_id))
 
 
 def due_loads(conn: sqlite3.Connection, limit: int = 100) -> list[sqlite3.Row]:
