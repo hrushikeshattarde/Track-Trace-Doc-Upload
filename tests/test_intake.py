@@ -710,6 +710,80 @@ def test_scope_is_the_dashboard_view() -> None:
     check("and it is never polled again", row["state"] == "not_in_view" and row["next_check_at"] is None)
 
 
+def test_backfill_closes_the_history_hole() -> None:
+    """Loop A only sees mail forward from the cursor.
+
+    A load that joins the dashboard with an email chain already behind it looks like it has no
+    paperwork. Measured 15 Sep 2026: 502 of 527 in-view loads had no message in the ledger, and a
+    spot check found 8 of 12 really did have ratecon mail - load 2545432 had 18 messages, 17 with
+    attachments, none of them ingested.
+    """
+    print("backfill: mail that predates the cursor")
+    bol = png(1200, 1600, b"OLD")
+    old = [message(f"o{i}", "told", "RE: Load 2545432 BOL", when_ms=1_600_000_000_000 + i,
+                   parts=[("BOL.png", bol)]) for i in range(3)]
+    blobs = {f"att-o{i}-0": bol for i in range(3)}
+
+    class CursorOnlyGmail(FakeGmail):
+        """history_since returns nothing: everything here predates the cursor."""
+
+        def history_since(self, start, label_id=None, max_pages=50):
+            return [], "2000"
+
+    conn = fresh_db()
+    fake = CursorOnlyGmail(old, blobs)
+    db.upsert_load(conn, 2545432, source="dashboard")
+    db.mark_in_view(conn, 2545432)
+    conn.execute("UPDATE mailbox_cursor SET history_id='1' WHERE 1=0")
+    db.set_cursor(conn, fake.subject, "1000")
+
+    st = ingest.sync_once(conn, fake, group="g", reader=None)
+    check("the incremental loop sees none of it", st.fetched == 0, st.line())
+    check("so the load looks like it has no paperwork", db.load_doc_evidence(conn, 2545432) == (0, 0))
+    check("and it is listed as needing backfill", db.loads_needing_backfill(conn) == [2545432])
+
+    n = ingest.backfill_load(conn, fake, group="g", load_id=2545432)
+    check("backfill ingests the history", n == 3, str(n))
+    docs, _ = db.load_doc_evidence(conn, 2545432)
+    check("the load now has its document", docs == 1, str(docs))
+    check("de-duplicated across the chain", db.counts(conn)["unique_files"] == 1)
+    check("and it is no longer listed", db.loads_needing_backfill(conn) == [])
+
+    before = fake.calls
+    ingest.backfill_load(conn, fake, group="g", load_id=2545432)
+    check("re-running fetches nothing", fake.calls == before, f"{fake.calls} vs {before}")
+
+
+def test_narrow_sweep_never_evicts() -> None:
+    """A narrow reconcile did not LOOK at long-haul loads, so it cannot conclude they have gone.
+
+    Measured 15 Sep 2026: a 3-day pickup window returned 456 loads where the full window returned
+    527+. Evicting on the narrow sweep drops exactly the aged, still-moving freight this design
+    exists to keep.
+    """
+    print("reconcile: only an authoritative sweep may evict")
+    conn = fresh_db()
+    db.upsert_load(conn, 2500001, source="dashboard")
+    db.mark_in_view(conn, 2500001)          # a long-haul load, picked up weeks ago
+
+    class EmptyTPro:
+        calls = 0
+
+        def search_all_pages(self, params, max_pages=20):
+            return []                        # the narrow window simply does not reach it
+
+    rs = loadloop.reconcile(conn, EmptyTPro(), terminals=[1088], days_back=3, authoritative=False)
+    check("a narrow sweep evicts nothing", rs.left_view == 0, str(rs.left_view))
+    check("the load is still in view",
+          conn.execute("SELECT in_view FROM load WHERE load_id=2500001").fetchone()[0] == 1)
+
+    import time
+    time.sleep(1.1)                          # view_checked_at has second resolution
+    rs = loadloop.reconcile(conn, EmptyTPro(), terminals=[1088], days_back=350, authoritative=True)
+    check("an authoritative sweep does evict", rs.left_view == 1, str(rs.left_view))
+    check("and the row survives", db.counts(conn)["loads"] == 1)
+
+
 if __name__ == "__main__":
     test_routing()
     test_filters()
@@ -721,6 +795,8 @@ if __name__ == "__main__":
     test_drain_never_drops_a_load()
     test_drain_reads_evidence_from_the_ledger()
     test_scope_is_the_dashboard_view()
+    test_backfill_closes_the_history_hole()
+    test_narrow_sweep_never_evicts()
     test_filing_gates()
     test_execute_is_off_unless_asked()
     test_execute_files_once_and_refetches()

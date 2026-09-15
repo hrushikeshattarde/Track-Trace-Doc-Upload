@@ -61,7 +61,7 @@ class Stats:
 
 
 def sync_once(conn, client: gm.Delegated, *, group: str, reader: Reader | None = None,
-              max_messages: int = 500, backfill_days: int = 7, max_parts_per_message: int = 12,
+              max_messages: int = 500, backfill_days: int = 1, max_parts_per_message: int = 12,
               max_spend_usd: float | None = None, verbose: bool = False) -> Stats:
     """One pass of Loop A. Returns what it did; raises only on an unrecoverable Gmail error.
 
@@ -130,6 +130,60 @@ def sync_once(conn, client: gm.Delegated, *, group: str, reader: Reader | None =
     elif st.deferred:
         print(f"  cursor held at {cursor}: {st.deferred} message(s) beyond --max {max_messages} "
               f"are left for the next pass")
+    return st
+
+
+def backfill_load(conn, client: gm.Delegated, *, group: str, load_id: int,
+                  reader: Reader | None = None, st: Stats | None = None,
+                  max_messages: int = 40, verbose: bool = False) -> int:
+    """Ingest the mail history of ONE load, once.
+
+    Loop A is incremental by design: it asks Gmail what arrived since the cursor, which is the right
+    shape for the steady state and blind to everything older. A load that joins the dashboard with
+    an email chain already behind it therefore looks like it has no paperwork at all.
+
+    This closes that hole with a single targeted search per load - the query readiness.py used, but
+    run once in the load's lifetime rather than on every pass. Messages already in the ledger cost
+    nothing (the message_id check short-circuits before any fetch), so it is safe to re-run and safe
+    to interrupt.
+    """
+    st = st or Stats()
+    refs = client.search(f"to:{group} subject:{load_id}", cap=max_messages)
+    fresh = [r for r in refs if not db.message_seen(conn, r["id"])]
+    messages = []
+    for ref in fresh[:max_messages]:
+        messages.append(client.message(ref["id"]))
+        st.fetched += 1
+    st.already_seen += len(refs) - len(fresh)
+    messages.sort(key=lambda m: int(m.get("internalDate") or 0))
+    for msg in messages:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _process(conn, client, msg, group=group, reader=reader, st=st, max_parts=12, verbose=verbose)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    # Stamp only after the work commits, for the same reason the cursor is written last.
+    db.mark_backfilled(conn, load_id)
+    return len(messages)
+
+
+def backfill_pass(conn, client: gm.Delegated, *, group: str, limit: int = 100,
+                  reader: Reader | None = None, max_spend_usd: float | None = None,
+                  verbose: bool = False) -> Stats:
+    """Backfill every in-view load that has never been searched. Bounded, resumable, idempotent."""
+    st = Stats()
+    st.mode = "backfill"
+    todo = db.loads_needing_backfill(conn, limit)
+    for load_id in todo:
+        if max_spend_usd is not None and st.cost_usd >= max_spend_usd and not st.spend_capped:
+            st.spend_capped = True
+            print(f"  spend cap ${max_spend_usd:.2f} reached; still ingesting, no further reads this pass")
+        n = backfill_load(conn, client, group=group, load_id=load_id,
+                          reader=None if st.spend_capped else reader, st=st, verbose=verbose)
+        if verbose and n:
+            print(f"  load {load_id}: {n} message(s) from history")
     return st
 
 

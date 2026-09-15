@@ -8,7 +8,8 @@ r"""Command line for the intake service.
   python -m intake load 2578456              everything the ledger knows about one load
 
   python -m intake reconcile                 Loop B: give every dashboard load a ledger row
-  python -m intake reconcile --days-back 350 ... the nightly audit over the whole view
+  python -m intake reconcile --days-back 350 --authoritative   the nightly audit
+  python -m intake backfill                  one-off mail history for loads new to the view
   python -m intake loads                     Loop B: check every load whose next check is due
   python -m intake queue                     the work queue, most urgent first
 
@@ -126,8 +127,28 @@ def cmd_reconcile(args) -> int:
     print(f"reconciling {len(terminals)} terminal(s), pickups {args.days_back}d back to {args.days_forward}d ahead"
           + (f", service level {sorted(levels)}" if levels else ""))
     rs = loadloop.reconcile(conn, client, terminals=terminals, days_back=args.days_back,
-                            days_forward=args.days_forward, scope_levels=levels, verbose=args.verbose)
+                            days_forward=args.days_forward, scope_levels=levels,
+                            authoritative=args.authoritative, verbose=args.verbose)
     print(rs.line() + f"   ({client.calls} TransportPro calls)")
+    _print_health(conn)
+    return 0
+
+
+def cmd_backfill(args) -> int:
+    """Close the history hole: one targeted Gmail search per in-view load that has never had one."""
+    conn = db.connect(args.db)
+    client = gm.from_env()
+    reader = ingest.make_reader(args.model) if args.read else None
+    todo = db.loads_needing_backfill(conn, args.limit)
+    if not todo:
+        print("every in-view load has had its mail history searched.")
+        return 0
+    print(f"backfilling {len(todo)} load(s)" + (f", reading new documents with {args.model}" if reader else ""))
+    st = ingest.backfill_pass(conn, client, group=args.group, limit=args.limit, reader=reader,
+                              max_spend_usd=args.max_spend, verbose=args.verbose)
+    print(st.line() + f"   ({client.calls} Gmail calls)")
+    c = db.counts(conn)
+    print(f"  {c['in_view_unbackfilled']} in-view load(s) still to backfill")
     _print_health(conn)
     return 0
 
@@ -273,6 +294,8 @@ def _print_health(conn, full: bool = False) -> None:
     ok = "OK" if c["custody_gap"] == 0 else "BROKEN"
     print(f"\ncustody   {ok}: {c['messages_seen']} seen = {c['messages_bound']} bound + "
           f"{c['messages_unresolved']} unresolved + {c['custody_gap']} unaccounted")
+    print(f"mail      {c['in_view'] - c['in_view_unbackfilled']}/{c['in_view']} in-view load(s) have had "
+          f"their mail history searched; {c['in_view_unbackfilled']} still blind")
     print(f"coverage  {c['loads']} load(s) in the ledger, {c['loads_overdue']} due a check"
           + (f", oldest due {c['oldest_overdue_check']}" if c["oldest_overdue_check"] else ""))
     print(f"dedup     {c['attachment_occurrences']} attachment occurrence(s) -> {c['unique_files']} unique file(s); "
@@ -298,7 +321,7 @@ def main() -> int:
     s = sub.add_parser("sync", help="one pass of Loop A")
     s.add_argument("--group", default=GROUP)
     s.add_argument("--max", type=int, default=500, help="cap on messages fetched this pass")
-    s.add_argument("--backfill-days", type=int, default=7,
+    s.add_argument("--backfill-days", type=int, default=1,
                    help="window used on the first run, or after the cursor expires")
     s.add_argument("--read", action="store_true", help="read new unique documents (costs money)")
     s.add_argument("--model", default="claude-opus-5")
@@ -310,13 +333,24 @@ def main() -> int:
 
     r = sub.add_parser("reconcile", help="Loop B: give every dashboard load a ledger row")
     r.add_argument("--terminals", default=None, help="comma-separated terminal ids instead of the ticked pods")
-    r.add_argument("--days-back", type=int, default=7,
-                   help="pickup window start. A week covers long hauls still Dispatched; the nightly "
-                        "audit uses ~350 to catch anything older still sitting in the view")
+    r.add_argument("--days-back", type=int, default=3,
+                   help="pickup window start; 3 for the hourly pass, ~350 for the nightly audit")
     r.add_argument("--days-forward", type=int, default=45)
     r.add_argument("--pod-map", default=str(POD_MAP))
+    r.add_argument("--authoritative", action="store_true",
+                   help="this sweep covered the WHOLE window, so loads it did not return have left "
+                        "the view and may be evicted. Never set it on a narrow sweep")
     r.add_argument("-v", "--verbose", action="store_true")
     r.set_defaults(fn=cmd_reconcile)
+
+    bf = sub.add_parser("backfill", help="one-off mail history for in-view loads never searched")
+    bf.add_argument("--group", default=GROUP)
+    bf.add_argument("--limit", type=int, default=100)
+    bf.add_argument("--read", action="store_true", help="read new documents found (costs money)")
+    bf.add_argument("--model", default="claude-opus-5")
+    bf.add_argument("--max-spend", type=float, default=None)
+    bf.add_argument("-v", "--verbose", action="store_true")
+    bf.set_defaults(fn=cmd_backfill)
 
     ld = sub.add_parser("loads", help="Loop B: check every load whose next check is due")
     ld.add_argument("--limit", type=int, default=100)

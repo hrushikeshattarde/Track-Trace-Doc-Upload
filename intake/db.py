@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 -- Where the Gmail history cursor stands. One row per impersonated mailbox.
@@ -159,7 +159,13 @@ CREATE TABLE IF NOT EXISTS load (
     -- deliberate so mail is never discarded - but it is not work. in_view is set by reconcile and
     -- cleared for anything the sweep no longer returns.
     in_view        INTEGER NOT NULL DEFAULT 0,
-    view_checked_at TEXT
+    view_checked_at TEXT,
+    -- Loop A only ever sees mail forward from the cursor. A load that joins the dashboard with
+    -- email history behind it is invisible to it: measured 15 Sep 2026, 502 of 527 in-view loads
+    -- had no message at all in the ledger, and a spot check found 8 of 12 really did have ratecon
+    -- mail (load 2545432: 18 messages, 17 with attachments). One targeted search per load, once,
+    -- closes that hole; this column is what makes it once.
+    mail_backfilled_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS ix_message_thread    ON message (thread_id);
@@ -209,6 +215,10 @@ def migrate(conn: sqlite3.Connection) -> None:
         for name, decl in (("in_view", "INTEGER NOT NULL DEFAULT 0"), ("view_checked_at", "TEXT")):
             if name not in cols:
                 conn.execute(f"ALTER TABLE load ADD COLUMN {name} {decl}")
+    if have < 6:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(load)")}
+        if "mail_backfilled_at" not in cols:
+            conn.execute("ALTER TABLE load ADD COLUMN mail_backfilled_at TEXT")
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -383,6 +393,19 @@ def due_loads(conn: sqlite3.Connection, limit: int = 100, in_view_only: bool = T
     return conn.execute(sql + " ORDER BY next_check_at LIMIT ?", (now_iso(), limit)).fetchall()
 
 
+def loads_needing_backfill(conn: sqlite3.Connection, limit: int = 200) -> list[int]:
+    """In-view loads whose mail history has never been searched. Oldest rows first so a capped pass
+    makes steady progress instead of re-taking the same head of the list."""
+    rows = conn.execute(
+        "SELECT load_id FROM load WHERE in_view = 1 AND mail_backfilled_at IS NULL "
+        "ORDER BY created_at, load_id LIMIT ?", (limit,)).fetchall()
+    return [int(r["load_id"]) for r in rows]
+
+
+def mark_backfilled(conn: sqlite3.Connection, load_id: int) -> None:
+    conn.execute("UPDATE load SET mail_backfilled_at=? WHERE load_id=?", (now_iso(), load_id))
+
+
 def mark_in_view(conn: sqlite3.Connection, load_id: int) -> None:
     conn.execute("UPDATE load SET in_view=1, view_checked_at=? WHERE load_id=?", (now_iso(), load_id))
 
@@ -460,6 +483,8 @@ def counts(conn: sqlite3.Connection) -> dict[str, Any]:
         "model_spend_usd": round(q("SELECT COALESCE(SUM(cost_usd),0) FROM attachment"), 4),
         "filings": q("SELECT COUNT(*) FROM filing"),
         "oldest_unresolved": oldest_unres,
+        "in_view": q("SELECT COUNT(*) FROM load WHERE in_view=1"),
+        "in_view_unbackfilled": q("SELECT COUNT(*) FROM load WHERE in_view=1 AND mail_backfilled_at IS NULL"),
     }
 
 

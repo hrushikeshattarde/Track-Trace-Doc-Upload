@@ -34,12 +34,14 @@ class ReconcileStats:
     per_terminal: dict[int, int] = field(default_factory=dict)
     left_view: int = 0
     wrong_level: int = 0
+    stale_cleared: int = 0
 
     def line(self) -> str:
         return (f"reconcile: {self.seen} load(s) in the Load Management view across "
                 f"{self.terminals} terminal(s) - {self.created} new to the ledger, "
-                f"{self.already} already there, {self.left_view} no longer in the view"
-                + (f"; {self.wrong_level} dropped by service level" if self.wrong_level else ""))
+                f"{self.already} already there, {self.left_view} evicted from the view"
+                + (f"; {self.wrong_level} dropped by service level" if self.wrong_level else "")
+                + (f"; {self.stale_cleared} stale non-view rows tidied" if self.stale_cleared else ""))
 
 
 @dataclass
@@ -82,13 +84,20 @@ def search_window(tpro: TransportPro, params: dict, start: dt.date, end: dt.date
                 + search_window(tpro, params, mid + dt.timedelta(days=1), end, depth + 1))
 
 
-def reconcile(conn, tpro: TransportPro, *, terminals: list[int], days_back: int = 7,
+def reconcile(conn, tpro: TransportPro, *, terminals: list[int], days_back: int = 3,
               days_forward: int = 45, statuses: tuple[str, ...] = ("Dispatched",),
-              scope_levels: set[str] | None = None, verbose: bool = False) -> ReconcileStats:
+              scope_levels: set[str] | None = None, authoritative: bool = False,
+              verbose: bool = False) -> ReconcileStats:
     """Give every load in the dashboard view a ledger row.
 
-    days_back is the knob that separates the hourly pass from the nightly audit. A week covers
-    long hauls that are still Dispatched with an older pickup date; ~350 reproduces the whole view.
+    days_back is the knob that separates the hourly pass from the nightly audit: a narrow window
+    catches everything newly dispatched cheaply, the full one reproduces the whole view.
+
+    `authoritative` is the safety catch on that. Only a sweep that covered the WHOLE window may
+    conclude a load has left the view - a narrow sweep simply did not look at long-haul loads whose
+    pickup is older than the window, and evicting those would silently drop exactly the aged,
+    still-moving freight this design exists to keep. Measured 15 Sep 2026: a 3-day sweep saw 456
+    loads where the full window saw 527+.
     """
     today = dt.date.today()
     start, end = today - dt.timedelta(days=days_back), today + dt.timedelta(days=days_forward)
@@ -125,7 +134,9 @@ def reconcile(conn, tpro: TransportPro, *, terminals: list[int], days_back: int 
         rs.per_terminal[tid] = kept
         if verbose:
             print(f"  terminal {tid}: {kept} load(s) in view")
-    rs.left_view = db.drop_out_of_view(conn, run_start) + db.clear_stale_out_of_view(conn)
+    rs.stale_cleared = db.clear_stale_out_of_view(conn)
+    if authoritative:
+        rs.left_view = db.drop_out_of_view(conn, run_start)
     return rs
 
 
