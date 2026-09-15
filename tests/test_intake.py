@@ -174,6 +174,34 @@ def test_dedup_and_custody() -> None:
     check("custody still balances after replay", db.counts(conn)["custody_gap"] == 0)
 
 
+def test_max_defers_it_does_not_drop() -> None:
+    print("ingest: a cap on work is not a cap on coverage")
+    blob = png(1200, 1600, b"X")
+    msgs = [message(f"c{i}", f"t{i}", f"RE: Load 257800{i} paperwork", when_ms=1_700_000_000_000 + i,
+                    parts=[(f"doc{i}.png", blob)]) for i in range(5)]
+    blobs = {f"att-c{i}-0": blob for i in range(5)}
+    conn = fresh_db()
+    fake = FakeGmail(msgs, blobs)
+
+    st = ingest.sync_once(conn, fake, group="g", reader=None, max_messages=2)
+    check("only the capped number is processed", st.fetched == 2, st.line())
+    check("the rest are counted as deferred", st.deferred == 3, st.line())
+    # The whole point: advancing the cursor here would skip those three forever, and custody could
+    # not catch it because they would never get a message row.
+    check("the cursor is HELD while work is outstanding", db.get_cursor(conn, fake.subject) is None,
+          str(db.get_cursor(conn, fake.subject)))
+
+    st = ingest.sync_once(conn, fake, group="g", reader=None, max_messages=2)
+    check("the next pass takes the NEXT two, not the same two", st.fetched == 2, st.line())
+    check("the done ones are counted but do not consume the budget", st.already_seen == 2, st.line())
+
+    st = ingest.sync_once(conn, fake, group="g", reader=None, max_messages=2)
+    check("the last one lands", st.fetched == 1 and st.deferred == 0, st.line())
+    check("only now does the cursor advance", db.get_cursor(conn, fake.subject) is not None)
+    check("all five are in the ledger", db.counts(conn)["messages_seen"] == 5)
+    check("custody balances", db.counts(conn)["custody_gap"] == 0)
+
+
 def test_cursor_written_last() -> None:
     print("ingest: cursor safety")
     blob = png(1200, 1600, b"X")
@@ -566,6 +594,7 @@ if __name__ == "__main__":
     test_routing()
     test_filters()
     test_dedup_and_custody()
+    test_max_defers_it_does_not_drop()
     test_cursor_written_last()
     test_one_bad_file_does_not_stop_the_batch()
     test_state_machine()

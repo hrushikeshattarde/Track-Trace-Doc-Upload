@@ -40,6 +40,7 @@ class Stats:
     reads: int = 0
     reads_avoided: int = 0
     read_errors: int = 0
+    deferred: int = 0
     cost_usd: float = 0.0
     mode: str = "history"
     cursor_from: str | None = None
@@ -53,6 +54,7 @@ class Stats:
                 f"downloads {self.downloads}, new files {self.new_files}, reads {self.reads}, "
                 f"reads avoided by hash {self.reads_avoided}"
                 + (f", read errors {self.read_errors}" if self.read_errors else "")
+                + (f", {self.deferred} message(s) deferred to the next pass" if self.deferred else "")
                 + f", spend ${self.cost_usd:.3f}")
 
 
@@ -79,12 +81,18 @@ def sync_once(conn, client: gm.Delegated, *, group: str, reader: Reader | None =
         refs, new_cursor = _full_sync_refs(client, group, backfill_days)
         st.mode = f"full-sync (first run, {backfill_days}d)"
 
-    refs = refs[:max_messages]
+    # A cap on work per pass must never be a cap on coverage. If more arrived than this pass will
+    # take, the cursor is HELD: the rest are picked up next pass, and the already-seen check below
+    # makes redoing the processed ones free (no Gmail call, no download, no read). Advancing the
+    # cursor here instead would skip them permanently, and the custody count could not catch it
+    # because they would never get a message row - the same failure as readiness.py's --max.
+    # The cap applies to NEW work, not to the listing. Slicing the raw refs would keep re-taking
+    # the same already-processed head of the list and never make progress.
+    fresh = [r for r in refs if not db.message_seen(conn, r["id"])]
+    st.already_seen = len(refs) - len(fresh)
+    st.deferred = max(0, len(fresh) - max_messages)
     messages = []
-    for ref in refs:
-        if db.message_seen(conn, ref["id"]):
-            st.already_seen += 1
-            continue
+    for ref in fresh[:max_messages]:
         messages.append(client.message(ref["id"]))
         st.fetched += 1
     # internalDate, never arrival order: history pagination and retries deliver replies out of order,
@@ -101,10 +109,14 @@ def sync_once(conn, client: gm.Delegated, *, group: str, reader: Reader | None =
             conn.execute("ROLLBACK")
             raise
 
-    # Only now. If we crashed above, the cursor is untouched and the next run redoes the batch for free.
-    if new_cursor:
+    # Only now, and only if this pass took everything it was offered. If we crashed above, or left
+    # messages behind, the cursor is untouched and the next run picks them up.
+    if new_cursor and not st.deferred:
         db.set_cursor(conn, mailbox, new_cursor, mode="full" if "full" in st.mode else "history")
         st.cursor_to = new_cursor
+    elif st.deferred:
+        print(f"  cursor held at {cursor}: {st.deferred} message(s) beyond --max {max_messages} "
+              f"are left for the next pass")
     return st
 
 
