@@ -72,7 +72,17 @@ def load_document(path: str | Path, max_edge: int = MAX_EDGE_PX) -> Document:
     ceiling; raise it to test whether a model's digit errors on long numbers come from resolution."""
     path = Path(path)
     raw = path.read_bytes()
-    doc = pymupdf.open(path)                      # PDFs and images alike
+    if path.suffix.lower() in (".heic", ".heif") or raw[4:12] in (b"ftypheic", b"ftypheix", b"ftypmif1", b"ftypmsf1"):
+        # iPhone photos arrive as HEIC (load 2579013, 15 Sep 2026); PyMuPDF cannot open them, Pillow can with pillow-heif.
+        import io
+        from PIL import Image
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+        buf = io.BytesIO()
+        Image.open(io.BytesIO(raw)).convert("RGB").save(buf, format="JPEG", quality=92)
+        doc = pymupdf.open(stream=buf.getvalue(), filetype="jpg")
+    else:
+        doc = pymupdf.open(path)                  # PDFs and images alike
     meta = doc.metadata or {}
     out = Document(path=path, sha256=hashlib.sha256(raw).hexdigest(), producer=(meta.get("producer") or meta.get("creator") or "").strip())
     for i, page in enumerate(doc, start=1):
