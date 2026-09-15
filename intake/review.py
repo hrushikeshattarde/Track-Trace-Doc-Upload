@@ -23,10 +23,13 @@ RULES_FAILED = "rules_failed"
 POD_TOO_EARLY = "pod_too_early"
 CONFLICT = "conflict"
 LOW_CONFIDENCE = "low_confidence"
+NOT_NEEDED = "not_needed"              # the load is not short this document
+REFILE = "refile"                      # filed already, but the status never cleared (OQ-3)
 SHADOW = "shadow"                      # auto-filing is off; this would have been filed
 ERROR = "error"
 
-KIND_ORDER = [PII, NOT_A_DOCUMENT, RULES_FAILED, CONFLICT, POD_TOO_EARLY, LOW_CONFIDENCE, ERROR, SHADOW]
+KIND_ORDER = [PII, NOT_A_DOCUMENT, RULES_FAILED, CONFLICT, POD_TOO_EARLY, LOW_CONFIDENCE,
+              ERROR, SHADOW, REFILE, NOT_NEEDED]
 
 KIND_HELP = {
     PII: "personal ID (licence, passport). Never file; delete from the thread if policy says so.",
@@ -36,6 +39,8 @@ KIND_HELP = {
     CONFLICT: "the thread's load binding and the message's own subject disagree.",
     LOW_CONFIDENCE: "the load was resolved by a weaker signal than the subject line.",
     SHADOW: "auto-filing is off. This is what the service would have filed.",
+    NOT_NEEDED: "the load is not short this document - filing it would add a duplicate.",
+    REFILE: "already filed but the status never cleared; re-filing after the Delivered mark is the OQ-3 fix.",
     ERROR: "the filing attempt failed.",
 }
 

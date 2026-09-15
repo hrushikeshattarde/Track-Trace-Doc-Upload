@@ -590,6 +590,58 @@ def test_review_queue() -> None:
           conn.execute("SELECT state FROM review WHERE id=?", (item["id"],)).fetchone()[0] == "approved")
 
 
+def test_auto_gate_requires_a_real_gap() -> None:
+    """The gate must ask 'does this load need this?', not only 'is this safe to file?'.
+
+    On the 15 Sep 2026 run 153 documents cleared every safety gate, and 140 of them were not work:
+    41 on loads already showing Documents Received, 18 out of scope, 7 not yet loaded, and the rest
+    the wrong type for what the load was short. --auto --execute would have uploaded all of them.
+    """
+    print("filing gates: the load must actually be short the document")
+
+    # A clean, corroborated POD on a load that is already complete is a duplicate, not work.
+    conn = fresh_db()
+    sha = seed_document(conn, stage="delivered")
+    conn.execute("UPDATE load SET state='complete' WHERE load_id=2578456")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    check("a document for a complete load never auto-files",
+          p.gate == filing.REVIEW and p.kind == review.NOT_NEEDED, f"{p.gate}/{p.kind}")
+    check("and the reason says it would be a duplicate", "duplicate" in p.reason, p.reason)
+
+    for state in ("out_of_scope", "not_yet_due"):
+        conn = fresh_db()
+        sha = seed_document(conn, stage="delivered")
+        conn.execute("UPDATE load SET state=? WHERE load_id=2578456", (state,))
+        p = filing.propose(conn, 2578456, sha, allow_auto=True)
+        check(f"a document for a {state} load never auto-files",
+              p.gate == filing.REVIEW and p.kind == review.NOT_NEEDED, f"{p.gate}/{p.kind}")
+
+    # Filed already but the status never cleared: re-filing is the OQ-3 fix, and a person's call.
+    conn = fresh_db()
+    sha = seed_document(conn, stage="delivered")
+    conn.execute("UPDATE load SET state='filed_status_pending' WHERE load_id=2578456")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    check("a filed-but-stuck load goes to a person, not the auto gate",
+          p.gate == filing.REVIEW and p.kind == review.REFILE, f"{p.gate}/{p.kind}")
+    check("and the reason names OQ-3", "OQ-3" in p.reason, p.reason)
+
+    # Right document, wrong gap: the load wants a POD and this reads as a BOL.
+    conn = fresh_db()
+    sha = seed_document(conn, stage="loaded", doc_type="bill_of_lading")
+    conn.execute("UPDATE load SET state='pod_expected' WHERE load_id=2578456")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    check("a BOL does not satisfy a load that is short a POD",
+          p.gate == filing.REVIEW and p.kind == review.NOT_NEEDED, f"{p.gate}/{p.kind}")
+
+    # And the case that SHOULD still pass: the load is short exactly this.
+    conn = fresh_db()
+    sha = seed_document(conn, stage="loaded", doc_type="bill_of_lading")
+    conn.execute("UPDATE load SET state='bol_expected' WHERE load_id=2578456")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    check("a BOL for a load short a BOL still auto-gates", p.gate == filing.AUTO,
+          f"{p.gate}/{p.kind} {p.reason}")
+
+
 if __name__ == "__main__":
     test_routing()
     test_filters()
@@ -604,5 +656,6 @@ if __name__ == "__main__":
     test_execute_is_off_unless_asked()
     test_execute_files_once_and_refetches()
     test_refetch_verifies_the_bytes()
+    test_auto_gate_requires_a_real_gap()
     test_review_queue()
     print(f"\n{PASSED} checks passed")

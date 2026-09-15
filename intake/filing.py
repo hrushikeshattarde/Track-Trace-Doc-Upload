@@ -117,7 +117,28 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
                         f"status Waiting (OQ-3). Holding until the Delivered mark.",
                         doc_type, None, filename, notes)
 
-    # 6. How the document reached this load. Anything weaker than the message's own subject line,
+    # 6. Does this load actually need this document? Passing every safety gate is not the same as
+    #    being work. Without this the auto gate fires on documents for loads that already show
+    #    Documents Received, loads outside the worked service level, and BOLs for loads that are
+    #    short a POD - 140 of the 153 that cleared the gates on the 15 Sep 2026 run.
+    load_state = (load_row["state"] if load_row else "") or ""
+    needed = {"pod_expected": "Proof of Delivery", "bol_expected": "Bill Of Lading"}.get(load_state)
+    if load_state in ("complete", "out_of_scope", "not_yet_due"):
+        return Proposal(load_id, sha256, REVIEW, review.NOT_NEEDED,
+                        f"load is {load_state}: it is not short a document, so filing this adds a "
+                        f"duplicate rather than clearing anything",
+                        doc_type, None, filename, notes)
+    if load_state == "filed_status_pending":
+        return Proposal(load_id, sha256, REVIEW, review.REFILE,
+                        "something is already filed but documentStatus is still Waiting; re-filing "
+                        "after the Delivered mark is the OQ-3 fix, and that is a person's call",
+                        doc_type, None, filename, notes)
+    if needed and doc_type != needed:
+        return Proposal(load_id, sha256, REVIEW, review.NOT_NEEDED,
+                        f"the load is short a {needed} and this reads as a {doc_type}",
+                        doc_type, None, filename, notes)
+
+    # 7. How the document reached this load. Anything weaker than the message's own subject line,
     #    or a thread whose binding was contradicted, is a person's call.
     routing, conflicted = _routing_of(conn, load_id, sha256)
     if conflicted:
