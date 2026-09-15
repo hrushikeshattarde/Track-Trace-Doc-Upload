@@ -16,6 +16,7 @@ r"""Command line for the intake service.
   python -m intake review                    what is waiting for a person
   python -m intake review approve 12 --by me
   python -m intake file --execute            WRITES: upload what has been approved
+  python -m intake export --out queue.csv    the review queue as a sheet, with the evidence
 
 Read-only against Gmail. The ONLY command that writes to TransportPro is
 `file --execute`; everything else, including plain `file`, is a dry run.
@@ -29,7 +30,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from intake import db, filing, gmail as gm, ingest, loadloop, review, tpro as tp  # noqa: E402
+from intake import db, export, filing, gmail as gm, ingest, loadloop, review, tpro as tp  # noqa: E402
 from pod_intake.localenv import load_local_env  # noqa: E402
 
 DEFAULT_DB = HERE / "out" / "intake.sqlite3"
@@ -250,6 +251,23 @@ def cmd_review(args) -> int:
     return 0
 
 
+def cmd_export(args) -> int:
+    conn = db.connect(args.db)
+    client = tp.from_env()
+    rows = export.build_rows(conn, client, limit=args.limit, verbose=args.verbose)
+    out = export.write_csv(rows, Path(args.out))
+    by = {}
+    for r in rows:
+        by[r["ready"]] = by.get(r["ready"], 0) + 1
+    print(f"{len(rows)} row(s) -> {out}   ({client.calls} TransportPro calls)")
+    for k, n in sorted(by.items(), key=lambda kv: -kv[1]):
+        print(f"  {k:22} {n}")
+    print("")
+    print("  'ready' means every automatic gate passed and the page corroborates the load.")
+    print("  It does NOT mean a person has looked at the image - that is the eyeballed_by column.")
+    return 0
+
+
 def _print_health(conn, full: bool = False) -> None:
     c = db.counts(conn)
     ok = "OK" if c["custody_gap"] == 0 else "BROKEN"
@@ -327,6 +345,12 @@ def main() -> int:
     rv.add_argument("--kind", default=None, help="only this kind, e.g. pii, rules_failed, shadow")
     rv.add_argument("--limit", type=int, default=25)
     rv.set_defaults(fn=cmd_review)
+
+    ex = sub.add_parser("export", help="the review queue as a CSV, with the evidence for each row")
+    ex.add_argument("--out", default=str(HERE / "out" / "review_queue.csv"))
+    ex.add_argument("--limit", type=int, default=500)
+    ex.add_argument("-v", "--verbose", action="store_true")
+    ex.set_defaults(fn=cmd_export)
 
     sub.add_parser("status").set_defaults(fn=cmd_status)
 
