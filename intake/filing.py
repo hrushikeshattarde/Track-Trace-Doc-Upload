@@ -129,9 +129,18 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
                         f"duplicate rather than clearing anything",
                         doc_type, None, filename, notes)
     if load_state == "filed_status_pending":
+        # Only worth re-filing once the load is actually Delivered. Before that there is no
+        # Delivered mark to be after, so "Waiting for Documents" is simply what an in-transit load
+        # with a BOL on it looks like - not a fault, and nothing to act on.
+        if stage != "delivered":
+            return Proposal(load_id, sha256, REVIEW, review.NOT_NEEDED,
+                            f"already filed and the truck is {stage or 'still in transit'}: "
+                            f"Waiting for Documents is expected until it delivers, so there is "
+                            f"nothing to re-file yet",
+                            doc_type, None, filename, notes)
         return Proposal(load_id, sha256, REVIEW, review.REFILE,
-                        "something is already filed but documentStatus is still Waiting; re-filing "
-                        "after the Delivered mark is the OQ-3 fix, and that is a person's call",
+                        "filed, Delivered, and documentStatus is still Waiting: re-filing after the "
+                        "Delivered mark is the OQ-3 fix, and that is a person's call",
                         doc_type, None, filename, notes)
     if needed and doc_type != needed:
         return Proposal(load_id, sha256, REVIEW, review.NOT_NEEDED,

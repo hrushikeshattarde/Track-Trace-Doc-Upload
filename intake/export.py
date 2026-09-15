@@ -113,7 +113,11 @@ def build_rows(conn, tpro, *, limit: int = 500, verbose: bool = False) -> list[d
                    "complete": "none", "not_yet_due": "not due yet",
                    "out_of_scope": "out of scope"}.get(it["load_state"] or "", it["load_state"] or "")
 
-        fills, gap_note = _gap(it["load_state"], it["proposed_type"], it["filed_types"])
+        fills, gap_note = _gap(it["load_state"], it["proposed_type"], it["filed_types"],
+                               stage, delivered_at)
+        dup = _looks_already_filed(it, bol + pod, conn)
+        if dup:
+            gap_note += "; " + dup
         ready, why = _verdict(it, ex, sig, n_match, stage, delivered_at, bol, pod, fills, gap_note)
         rows.append({
             "review_id": it["id"], "load_id": load_id, "customer": it["customer"] or "",
@@ -139,7 +143,8 @@ def build_rows(conn, tpro, *, limit: int = 500, verbose: bool = False) -> list[d
     return rows
 
 
-def _gap(load_state: str | None, proposed: str | None, filed_types: str | None) -> tuple[str, str]:
+def _gap(load_state: str | None, proposed: str | None, filed_types: str | None,
+         stage: str = "", delivered_at: str | None = None) -> tuple[str, str]:
     """Does this document supply what the load is actually short of? Returns (fills_gap, note)."""
     needed = {"pod_expected": "Proof of Delivery", "bol_expected": "Bill Of Lading"}.get(load_state or "")
     filed = (filed_types or "").lower()
@@ -150,13 +155,38 @@ def _gap(load_state: str | None, proposed: str | None, filed_types: str | None) 
     if load_state == "not_yet_due":
         return "no", "truck has not loaded yet"
     if load_state == "filed_status_pending":
-        return "re-file", ("something is filed but the status is still Waiting; re-filing after the "
+        if not delivered_at:
+            return "no", (f"already filed and the truck is {stage or 'still in transit'}; "
+                          "Waiting for Documents is expected until it delivers, so nothing to do yet")
+        return "re-file", ("filed, Delivered, and the status is still Waiting; re-filing after the "
                            "Delivered mark is the OQ-3 fix")
     if needed and proposed == needed:
         return "yes", f"the load is short a {needed} and this is one"
     if needed:
         return "no", f"the load needs a {needed}, this is a {proposed}"
     return "no", "the load is not short a document"
+
+
+def _looks_already_filed(it, filed: list[dict], conn) -> str:
+    """Did someone file this very document by hand shortly after it arrived?
+
+    A rep who files an emailed BOL leaves a File History entry minutes after the message. When that
+    is what happened, the queued copy is a duplicate of what is already on the load, not a second
+    document - worth saying plainly so nobody files it twice.
+    """
+    row = conn.execute(
+        "SELECT MIN(m.internal_date) AS t FROM part p JOIN message m ON m.message_id = p.message_id "
+        "WHERE p.sha256 = ? AND m.load_id = ?", (it["sha256"], it["load_id"])).fetchone()
+    emailed = st.utc(row["t"] if row else None)
+    if not emailed:
+        return ""
+    for f in filed:
+        when = st.utc(f.get("dateCreated"))
+        if when and 0 <= (when - emailed).total_seconds() <= 7200:
+            mins = round((when - emailed).total_seconds() / 60)
+            return (f"a {f.get('fileTypeName')} was filed {mins} min after this email arrived, so this "
+                    "is very likely the same document already on the load")
+    return ""
 
 
 def _strength(n: int) -> str:

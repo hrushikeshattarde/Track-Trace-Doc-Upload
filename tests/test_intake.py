@@ -625,6 +625,16 @@ def test_auto_gate_requires_a_real_gap() -> None:
           p.gate == filing.REVIEW and p.kind == review.REFILE, f"{p.gate}/{p.kind}")
     check("and the reason names OQ-3", "OQ-3" in p.reason, p.reason)
 
+    # Filed but stuck AND still in transit: there is no Delivered mark to re-file after, so
+    # "Waiting for Documents" is simply what an in-transit load with a BOL looks like.
+    conn = fresh_db()
+    sha = seed_document(conn, stage="loaded", doc_type="bill_of_lading")
+    conn.execute("UPDATE load SET state='filed_status_pending' WHERE load_id=2578456")
+    p = filing.propose(conn, 2578456, sha, allow_auto=True)
+    check("filed-but-stuck while in transit is not a re-file",
+          p.kind == review.NOT_NEEDED, f"{p.gate}/{p.kind}")
+    check("and it says the status is expected", "expected until it delivers" in p.reason, p.reason)
+
     # Right document, wrong gap: the load wants a POD and this reads as a BOL.
     conn = fresh_db()
     sha = seed_document(conn, stage="loaded", doc_type="bill_of_lading")
