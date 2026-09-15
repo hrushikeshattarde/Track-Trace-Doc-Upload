@@ -205,6 +205,9 @@ same false positives. The job now (1) keeps one copy per image, (2) drops small 
 size, and (3) treats a reader result of `other` / `unknown` as "not a freight document" rather than filing it as a
 Bill Of Lading. The intake bot needs the same three steps before a message counts as a document.
 
+**iPhone photos.** Carriers also send HEIC files (load 2579013, 15 Sep 2026: three of them, and the run's only reader
+error). PyMuPDF cannot open HEIC; the normaliser now converts it to JPEG with pillow-heif before rendering.
+
 **Paperwork that is neither BOL nor POD.** Load 2558742 (14 Sep 2026, Spindrift, McAllen TX to Winston-Salem NC,
 frozen yuzu juice) came with a Citrojugo Certificate of Analysis and a packing list, which the reader dismissed as
 "not a freight document". TransportPro's document-type list (145 types) has "Shipping Documents" (369) for exactly
@@ -258,6 +261,60 @@ status once it is, and BOLs filed at pickup will never clear the status by thems
 
 Output: `out\readiness\readiness_<stamp>.md` (work queue + verification checklist), `.csv`, `.json`.
 Read-only: nothing is uploaded and no status is changed.
+
+## The intake service (`intake/`)
+
+The prototype recomputes the world on every run, so anything a run does not reach is not deferred,
+it is forgotten: `readiness.py` caps the load set at `--max 150` against a 539-load dashboard (and
+`sorted(..., reverse=True)` keeps the *newest* 150, so the oldest and most stuck are the ones never
+checked), and its attachment de-duplication lives in a Python set scoped to one load in one run.
+`intake/` replaces both with state that survives a restart.
+
+```
+intake/db.py       the ledger: cursor, thread, message, part, attachment, filing, unresolved, load
+intake/gmail.py    delegated Gmail with a history cursor; self-contained (no payment-bot path)
+intake/filters.py  the free filters: size, rate-con filename, pixel geometry
+intake/routing.py  message -> load in tiers: subject, thread binding, paper, unresolved list
+intake/ingest.py   Loop A: one pass over everything that arrived since the cursor
+tests/test_intake.py   offline checks; no network, no model, no credentials
+```
+
+```powershell
+.venv\Scripts\python.exe tests\test_intake.py                 # 34 checks, offline
+.venv\Scripts\python.exe -m intake init
+.venv\Scripts\python.exe -m intake sync                       # Loop A, no model spend
+.venv\Scripts\python.exe -m intake sync --read --model claude-opus-5
+.venv\Scripts\python.exe -m intake status
+.venv\Scripts\python.exe -m intake unresolved
+.venv\Scripts\python.exe -m intake load 2560078
+```
+
+**Two rules carry the design.** `part` is one row per *occurrence* and `attachment` one row per
+*unique SHA-256*, so the ledger proves the de-duplication worked instead of hoping it did. And
+`attachment.extraction_json` caches what is on the paper, which is a function of the bytes alone;
+the TransportPro document type is never cached, because `classify_type` depends on the dispatch
+stage, the delivery appointment and the time the file was emailed, all of which move. Cache the
+reading, recompute the filing.
+
+**The cursor is written after the batch, never before.** A cursor advanced early is silent data
+loss and the one failure nothing else catches. Replay is free instead: the `message_id` primary key
+and `UNIQUE(load_id, sha256)` make a redone batch a no-op, which is also what makes at-least-once
+Pub/Sub delivery safe. On a first run, or after the cursor outlives Gmail's ~1-week history
+retention (`CursorTooOld`), it falls back to a `newer_than:Nd` search and re-seeds from
+`getProfile` — reading the profile *before* the search, so anything arriving between the two calls
+still lands after the new cursor.
+
+**Thread bindings are evidence, not truth.** A load number in a message's own subject always beats
+the thread's binding, because reps reuse an old thread for a new load constantly; the disagreement
+sets `thread.conflict_flag` rather than being silently resolved. A subject naming several loads is
+ambiguous, not decisive, and goes to the unresolved list rather than guessing the first one.
+
+**Measured on the live mailbox, 15 Sep 2026.** First pass: 120 messages, 100% routed by subject,
+185 Gmail calls, $0. Second pass off the cursor: 14 new messages in 20 calls, and 5 attachment
+occurrences collapsed to 1 new unique file — 4 reads avoided that the prototype would have paid
+for. Load 2560078 alone carried 4 documents each sent twice (carrier, then the rep forwarding them
+back): 8 occurrences, 4 unique files. Nothing is uploaded and no status is changed; the pass ends
+by setting each load's `next_check_at`, which is the hand-off to the load loop (not yet built).
 
 ## Scoring the reader against a person
 
