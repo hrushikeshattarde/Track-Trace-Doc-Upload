@@ -22,7 +22,30 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+
+# Backoff for a failed read, by attempt. After the last one the file is left alone and reported as
+# a permanent failure: a .MOV or a corrupt part fails identically every time, and retrying it on a
+# schedule forever is spend with no chance of a different answer.
+READ_RETRY_MINUTES = (15, 60, 360, 1440)
+
+# Failures that will fail again in exactly the same way: a container PyMuPDF cannot open (a .MOV
+# from a driver's phone), a truncated or empty part, a re-fetch whose bytes are not this document.
+# Anything else - a 429/529, a timeout, an overloaded API - is transient and comes back.
+PERMANENT_READ_ERRORS = ("filedataerror", "emptyfileerror", "unsupportedformat", "filenotfounderror",
+                         "cannot open", "unsupported", "no pages", "do not match")
+
+
+def permanent_error_text(text: str | None) -> bool:
+    """Whether a recorded read failure is worth another attempt.
+
+    Classified from the stored text rather than the live exception so that one rule covers both the
+    read path and a migration over rows written before any of this existed. Wrong in the safe
+    direction: an unrecognised error is treated as transient, which costs a few retries, where
+    calling a transient failure permanent strands the document for good.
+    """
+    t = (text or "").lower()
+    return any(sig in t for sig in PERMANENT_READ_ERRORS)
 
 SCHEMA = """
 -- Where the Gmail history cursor stands. One row per impersonated mailbox.
@@ -90,7 +113,12 @@ CREATE TABLE IF NOT EXISTS attachment (
     model                 TEXT,
     cost_usd              REAL,
     read_at               TEXT,
-    error                 TEXT    -- set when the read failed; the next pass retries this file only
+    error                 TEXT,   -- set when the read failed
+    -- Retry state for a failed read. A transient failure (a 429/529, a timeout) must come back on
+    -- its own; a format the reader can never open must not, or every pass pays to fail again.
+    -- An error with next_read_at NULL is the permanent case: visible in `status`, never retried.
+    read_attempts         INTEGER NOT NULL DEFAULT 0,
+    next_read_at          TEXT
 );
 
 -- Idempotent filing. The UNIQUE key is the guard against double-filing, not a code path.
@@ -219,6 +247,23 @@ def migrate(conn: sqlite3.Connection) -> None:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(load)")}
         if "mail_backfilled_at" not in cols:
             conn.execute("ALTER TABLE load ADD COLUMN mail_backfilled_at TEXT")
+    if have < 7:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(attachment)")}
+        for name, decl in (("read_attempts", "INTEGER NOT NULL DEFAULT 0"), ("next_read_at", "TEXT")):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE attachment ADD COLUMN {name} {decl}")
+        # Rows that failed before these columns existed were unreachable: unread_attachments
+        # excluded every error and nothing else looked. Give the transient ones their retries back,
+        # starting now, and mark the hopeless ones hopeless so read_blocked() reads them correctly
+        # rather than paying once more to fail the same way.
+        for sha, err in conn.execute("SELECT sha256, error FROM attachment WHERE error IS NOT NULL "
+                                     "AND extraction_json IS NULL AND read_attempts = 0").fetchall():
+            if permanent_error_text(err):
+                conn.execute("UPDATE attachment SET read_attempts=? WHERE sha256=?",
+                             (len(READ_RETRY_MINUTES), sha))
+            else:
+                conn.execute("UPDATE attachment SET next_read_at=?, read_attempts=1 WHERE sha256=?",
+                             (now_iso(), sha))
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -228,6 +273,12 @@ def migrate(conn: sqlite3.Connection) -> None:
 def get_cursor(conn: sqlite3.Connection, mailbox: str) -> str | None:
     row = conn.execute("SELECT history_id FROM mailbox_cursor WHERE mailbox=?", (mailbox,)).fetchone()
     return row["history_id"] if row else None
+
+
+def get_cursor_row(conn: sqlite3.Connection, mailbox: str) -> sqlite3.Row | None:
+    """The whole cursor row. synced_at is what sizes the window when the cursor has expired: the
+    outage is (now - synced_at), and a fixed window smaller than that is silent data loss."""
+    return conn.execute("SELECT * FROM mailbox_cursor WHERE mailbox=?", (mailbox,)).fetchone()
 
 
 def set_cursor(conn: sqlite3.Connection, mailbox: str, history_id: str, mode: str = "history") -> None:
@@ -310,27 +361,88 @@ def source_part(conn: sqlite3.Connection, sha256: str) -> sqlite3.Row | None:
 
 # ------------------------------------------------------------------ attachments ----
 
+def unread_attachments(conn: sqlite3.Connection, *, load_ids: list[int] | None = None,
+                       in_view_only: bool = True, limit: int = 100) -> list[sqlite3.Row]:
+    """Documents in the ledger that have never been read.
+
+    A pass run without --read stores the hash, the geometry and the filter decision but no
+    extraction, and Loop A never revisits a message it has already processed - so those files would
+    stay unread forever. This is what lets reading be turned on after the fact, or pointed at a
+    chosen set of loads.
+
+    A file whose last read FAILED is included once its backoff has come round. Excluding every
+    error unconditionally meant a timeout or an overloaded API stranded a document as permanently
+    as a corrupt one, with the only recovery being the same bytes turning up in a later message.
+    The permanent case is still excluded, and it is the one with next_read_at NULL.
+    """
+    sql = ("SELECT DISTINCT a.sha256, a.filename, a.bytes, m.load_id FROM attachment a "
+           "JOIN part p ON p.sha256 = a.sha256 AND p.decision = 'keep' "
+           "JOIN message m ON m.message_id = p.message_id "
+           "JOIN load l ON l.load_id = m.load_id "
+           "WHERE a.extraction_json IS NULL "
+           "  AND (a.error IS NULL OR (a.next_read_at IS NOT NULL AND a.next_read_at <= ?))")
+    params: list = [now_iso()]
+    if in_view_only:
+        sql += " AND l.in_view = 1"
+    if load_ids:
+        sql += " AND m.load_id IN (" + ",".join("?" * len(load_ids)) + ")"
+        params += list(load_ids)
+    sql += " ORDER BY m.load_id, a.bytes DESC LIMIT ?"
+    params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
 def get_attachment(conn: sqlite3.Connection, sha256: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM attachment WHERE sha256=?", (sha256,)).fetchone()
 
 
+def read_blocked(row: sqlite3.Row | None) -> bool:
+    """True when this file has failed in a way, or often enough, that nothing will read it again.
+
+    Callers check this before spending: an unread row that is merely waiting out its backoff is not
+    blocked, and a row that has already been read is not a failure at all.
+    """
+    if row is None or row["extraction_json"] is not None:
+        return False
+    return bool(row["error"]) and row["next_read_at"] is None and (row["read_attempts"] or 0) > 0
+
+
 def put_attachment(conn: sqlite3.Connection, sha256: str, *, message_id: str, filename: str | None,
                    size: int, extraction: dict | None, document_type: str | None,
-                   model: str | None, cost_usd: float | None, error: str | None = None) -> None:
-    """Write the reading of one unique file.
+                   model: str | None, cost_usd: float | None, error: str | None = None,
+                   permanent: bool = False) -> None:
+    """Write the reading of one unique file, or the failure to read it.
 
-    The WHERE clause is the whole retry story: a successful read overwrites a placeholder (seen but
-    not read) or a failed one, and a row that already carries an extraction is never overwritten -
-    so a replayed batch can never pay for the same bytes twice.
+    The WHERE clause is the first half of the retry story: a successful read overwrites a
+    placeholder (seen but not read) or a failed one, and a row that already carries an extraction is
+    never overwritten - so a replayed batch can never pay for the same bytes twice.
+
+    The second half is next_read_at. A failure schedules its own retry on the READ_RETRY_MINUTES
+    backoff and stops scheduling once the attempts run out or the caller says the failure is
+    permanent; a success clears the whole thing. Without this a single transient error left the
+    document stranded, because unread_attachments could not see it and Loop A never revisits a
+    message it has processed.
     """
+    prior = conn.execute("SELECT read_attempts, extraction_json FROM attachment WHERE sha256=?",
+                         (sha256,)).fetchone()
+    if prior is not None and prior["extraction_json"] is not None:
+        return                                  # already read: never overwritten, never paid for twice
+    attempts, next_read_at = 0, None
+    if error:
+        attempts = (prior["read_attempts"] if prior else 0) + 1
+        if not permanent and attempts <= len(READ_RETRY_MINUTES):
+            next_read_at = (dt.datetime.now(dt.timezone.utc)
+                            + dt.timedelta(minutes=READ_RETRY_MINUTES[attempts - 1])).isoformat(timespec="seconds")
     conn.execute(
         "INSERT INTO attachment (sha256, first_seen_message_id, filename, bytes, extraction_json, "
-        "document_type, model, cost_usd, read_at, error) VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "document_type, model, cost_usd, read_at, error, read_attempts, next_read_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(sha256) DO UPDATE SET extraction_json=excluded.extraction_json, "
         "document_type=excluded.document_type, model=excluded.model, cost_usd=excluded.cost_usd, "
-        "read_at=excluded.read_at, error=excluded.error WHERE attachment.extraction_json IS NULL",
+        "read_at=excluded.read_at, error=excluded.error, read_attempts=excluded.read_attempts, "
+        "next_read_at=excluded.next_read_at WHERE attachment.extraction_json IS NULL",
         (sha256, message_id, filename, size, json.dumps(extraction) if extraction is not None else None,
-         document_type, model, cost_usd, now_iso(), error),
+         document_type, model, cost_usd, now_iso(), error, attempts, next_read_at),
     )
 
 
@@ -363,6 +475,60 @@ def load_doc_evidence(conn: sqlite3.Connection, load_id: int) -> tuple[int, int]
     return (row["docs"] or 0, row["unread"] or 0)
 
 
+# Filter decisions that could, in principle, have hidden a real document. rate_confirmation is not
+# one of them: it matches TransportPro's own generated <fileId>_<typeId>.pdf naming, never a driver's
+# photo. too_small and signature_or_logo are judgement calls made on size and shape alone.
+RECOVERABLE_DECISIONS = ("too_small", "signature_or_logo")
+
+# Both of the functions below count DISTINCT files, never part rows. A dropped part has no SHA-256 -
+# it was rejected before the download that would have produced one - so its identity is
+# (filename, bytes), which is as close to the hash as the part header gets. It matters: measured
+# 16 Sep 2026, load 2575905 carried 216 dropped part rows and 7 distinct files, the remainder being
+# one signature block re-quoted through every reply. Counting occurrences would have reported that
+# load as 216 lost documents.
+_DISTINCT_FILE = "COALESCE(p.filename,'') || '/' || COALESCE(p.bytes,0)"
+
+
+def load_dropped_evidence(conn: sqlite3.Connection, load_id: int) -> int:
+    """Distinct attachments on this load's mail that the free filters rejected before any download.
+
+    Those decisions are final - nothing re-examines a processed message - so a BOL photographed at
+    low resolution, or cropped wide, is discarded silently. There is no way to tell from the part
+    header which of them that might be: measured over this ledger, `image.png` is the commonest
+    filename among the files the filters KEPT as well as among the ones they dropped, so any
+    filename rule here would be a guess dressed as a measurement. The count is reported and a person
+    decides; `intake reconsider` is what acts on it.
+    """
+    row = conn.execute(
+        f"SELECT COUNT(DISTINCT {_DISTINCT_FILE}) FROM part p "
+        "JOIN message m ON m.message_id = p.message_id "
+        "WHERE m.load_id = ? AND p.decision IN (" + ",".join("?" * len(RECOVERABLE_DECISIONS)) + ")",
+        (load_id, *RECOVERABLE_DECISIONS)).fetchone()
+    return row[0] or 0
+
+
+def dropped_parts(conn: sqlite3.Connection, load_id: int, recoverable_only: bool = True) -> list[sqlite3.Row]:
+    """One row per distinct dropped file, with what is needed to re-fetch it from Gmail.
+
+    The bare columns beside MAX(m.internal_date) are SQLite's documented guarantee that they come
+    from the row that max matched - so each file is re-fetched from its NEWEST message, the one
+    least likely to have been deleted, exactly as source_part() does for kept files. This is the
+    third dialect-specific statement in the module; Postgres would write it as DISTINCT ON.
+    """
+    sql = ("SELECT p.message_id, p.part_id, p.attachment_id, p.filename, p.bytes, p.mime, "
+           "       p.width, p.height, p.decision, m.load_id, COUNT(*) AS occurrences, "
+           "       MAX(m.internal_date) AS newest "
+           "FROM part p JOIN message m ON m.message_id = p.message_id "
+           "WHERE m.load_id = ? AND p.attachment_id IS NOT NULL AND p.sha256 IS NULL ")
+    params: list = [load_id]
+    if recoverable_only:
+        sql += "AND p.decision IN (" + ",".join("?" * len(RECOVERABLE_DECISIONS)) + ") "
+        params += list(RECOVERABLE_DECISIONS)
+    else:
+        sql += "AND p.decision != 'keep' "
+    return conn.execute(sql + f"GROUP BY {_DISTINCT_FILE} ORDER BY p.bytes DESC", params).fetchall()
+
+
 def update_load(conn: sqlite3.Connection, load_id: int, assessment: dict) -> None:
     conn.execute(
         "UPDATE load SET state=?, stage=?, action=?, doc_status=?, terminal=?, customer=?, "
@@ -393,13 +559,48 @@ def due_loads(conn: sqlite3.Connection, limit: int = 100, in_view_only: bool = T
     return conn.execute(sql + " ORDER BY next_check_at LIMIT ?", (now_iso(), limit)).fetchall()
 
 
-def loads_needing_backfill(conn: sqlite3.Connection, limit: int = 200) -> list[int]:
+# States where a load is still short the paperwork, so a second look at the mailbox can find
+# something. A complete load has nothing to recover and must not be re-searched.
+WAITING_STATES = ("pod_expected", "bol_expected", "wrong_doc_type", "filed_status_pending", "new")
+
+
+def loads_needing_backfill(conn: sqlite3.Connection, limit: int = 200,
+                           restale_hours: int | None = None) -> list[int]:
     """In-view loads whose mail history has never been searched. Oldest rows first so a capped pass
-    makes steady progress instead of re-taking the same head of the list."""
-    rows = conn.execute(
-        "SELECT load_id FROM load WHERE in_view = 1 AND mail_backfilled_at IS NULL "
-        "ORDER BY created_at, load_id LIMIT ?", (limit,)).fetchall()
-    return [int(r["load_id"]) for r in rows]
+    makes steady progress instead of re-taking the same head of the list.
+
+    restale_hours additionally re-takes loads that HAVE been backfilled, are still short paperwork,
+    and were last searched longer ago than that. Backfill was written as a once-per-lifetime repair
+    and that is right for the steady state - but it is also the only thing in the service that can
+    find a document Loop A never saw. Loop A is blind to anything that fell in a cursor gap, and
+    Loop B never calls Gmail at all, so without a re-search that document is lost for good.
+    Never-searched loads still sort first: a load with no mail history at all is the worse hole.
+    """
+    sql = "SELECT load_id FROM load WHERE in_view = 1 AND (mail_backfilled_at IS NULL"
+    params: list = []
+    if restale_hours:
+        cutoff = (dt.datetime.now(dt.timezone.utc)
+                  - dt.timedelta(hours=restale_hours)).isoformat(timespec="seconds")
+        sql += (" OR (mail_backfilled_at < ? AND state IN ("
+                + ",".join("?" * len(WAITING_STATES)) + "))")
+        params += [cutoff, *WAITING_STATES]
+    sql += ") ORDER BY mail_backfilled_at IS NOT NULL, created_at, load_id LIMIT ?"
+    params.append(limit)
+    return [int(r["load_id"]) for r in conn.execute(sql, params).fetchall()]
+
+
+def flag_history_gap(conn: sqlite3.Connection) -> int:
+    """Loop A lost a window of mail; re-open the per-load backfill for anything it could matter to.
+
+    When the history cursor outlives Gmail's retention, the messages in the gap never come back
+    through the cursor - it is re-seeded past them - and no other code path looks backwards. Clearing
+    the backfill stamp makes the next backfill pass re-search those loads by subject, which is the
+    one query that can still find them. Loads already complete or out of view are left alone.
+    """
+    cur = conn.execute(
+        "UPDATE load SET mail_backfilled_at=NULL WHERE in_view=1 AND mail_backfilled_at IS NOT NULL "
+        "AND (state IS NULL OR state IN (" + ",".join("?" * len(WAITING_STATES)) + "))", WAITING_STATES)
+    return cur.rowcount
 
 
 def mark_backfilled(conn: sqlite3.Connection, load_id: int) -> None:
@@ -462,6 +663,8 @@ def counts(conn: sqlite3.Connection) -> dict[str, Any]:
     unique_files = q("SELECT COUNT(*) FROM attachment")
     files_read = q("SELECT COUNT(*) FROM attachment WHERE extraction_json IS NOT NULL")
     read_failures = q("SELECT COUNT(*) FROM attachment WHERE error IS NOT NULL AND extraction_json IS NULL")
+    read_retrying = q("SELECT COUNT(*) FROM attachment WHERE error IS NOT NULL AND extraction_json IS NULL "
+                      "AND next_read_at IS NOT NULL")
     oldest_unres = q("SELECT MIN(created_at) FROM unresolved") or None
     overdue = q("SELECT MIN(next_check_at) FROM load WHERE next_check_at <= ?", now_iso()) or None
     return {
@@ -479,6 +682,13 @@ def counts(conn: sqlite3.Connection) -> dict[str, Any]:
         "files_read": files_read,
         "files_unread": unique_files - files_read - read_failures,
         "read_failures": read_failures,
+        "read_failures_retrying": read_retrying,          # waiting out a backoff; they come back
+        "read_failures_permanent": read_failures - read_retrying,   # nothing will read these again
+        "dropped_recoverable": q(
+            f"SELECT COUNT(DISTINCT {_DISTINCT_FILE}) FROM part p "
+            "JOIN message m ON m.message_id = p.message_id JOIN load l ON l.load_id = m.load_id "
+            "WHERE l.in_view = 1 AND p.decision IN "
+            "(" + ",".join("?" * len(RECOVERABLE_DECISIONS)) + ")", *RECOVERABLE_DECISIONS),
         "reads_avoided": max(0, occurrences - unique_files),
         "model_spend_usd": round(q("SELECT COALESCE(SUM(cost_usd),0) FROM attachment"), 4),
         "filings": q("SELECT COUNT(*) FROM filing"),

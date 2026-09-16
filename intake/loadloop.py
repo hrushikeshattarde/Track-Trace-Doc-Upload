@@ -159,8 +159,9 @@ def drain(conn, tpro: TransportPro, *, limit: int = 100, scope_levels: set[str] 
             print(f"  ! load {load_id}: {e}")
             continue
         docs, unread = db.load_doc_evidence(conn, load_id)
-        assessment = st.assess(load_id, load, dispatches, files,
-                               ledger_docs=docs, ledger_unread=unread, scope_levels=scope_levels)
+        dropped = db.load_dropped_evidence(conn, load_id)
+        assessment = st.assess(load_id, load, dispatches, files, ledger_docs=docs, ledger_unread=unread,
+                               ledger_dropped=dropped, scope_levels=scope_levels)
         db.update_load(conn, load_id, assessment)
         ds.checked += 1
         ds.states[assessment["state"]] = ds.states.get(assessment["state"], 0) + 1

@@ -121,12 +121,20 @@ def next_check_at(state: str, now: dt.datetime | None = None) -> str | None:
 
 
 def assess(load_id: int, load: dict, dispatches: list[dict], files: list[dict], *,
-           ledger_docs: int = 0, ledger_unread: int = 0, scope_levels: set[str] | None = None) -> dict:
+           ledger_docs: int = 0, ledger_unread: int = 0, ledger_dropped: int = 0,
+           scope_levels: set[str] | None = None) -> dict:
     """One load's state, the reason, and when to look again.
 
     ledger_docs / ledger_unread come from the intake ledger rather than a Gmail search: Loop A has
     already recorded every document-bearing message for this load, so this loop spends no Gmail
     calls at all.
+
+    ledger_dropped is the distinct attachments the free filters rejected on size or shape. It only
+    ever appears in the reason, never in the state, and only when nothing else is in the ledger for
+    this load: the filters are right nearly always, and a thread full of email signatures must not
+    read as a load with paperwork. But when a load is short its POD and the ONLY thing in the
+    mailbox is something a size threshold threw away, that is what the person working the queue
+    needs to be told - and on live data that is 4 of 761 in-view loads, not a banner on every row.
     """
     status = load.get("status") or {}
     found_levels = service_levels(load)
@@ -173,8 +181,17 @@ def assess(load_id: int, load: dict, dispatches: list[dict], files: list[dict], 
     state = "pod_expected" if expects_pod else "bol_expected"
     want = "POD" if expects_pod else "BOL"
     if ledger_docs:
+        # Deliberately silent about ledger_dropped here. The load already has paperwork to work
+        # from, so its dropped attachments are almost certainly the signature blocks they usually
+        # are, and saying so on every such load is noise: measured 16 Sep 2026, that is 9 in-view
+        # loads, against the 4 where nothing else is in the ledger and the count is worth acting on.
         unread = f", {ledger_unread} not read yet" if ledger_unread else ""
         why = f"{want} expected; {ledger_docs} document(s) in the ratecon thread{unread} and nothing filed"
+    elif ledger_dropped:
+        why = (f"{want} expected; nothing filed and no document in the mail ledger, but "
+               f"{ledger_dropped} attachment(s) in the thread were dropped by the size/shape "
+               f"filters - a small or badly cropped photo of the paperwork looks like this. "
+               f"intake reconsider --loads {load_id}")
     else:
         why = f"{want} expected; nothing filed and nothing in the mail ledger - ask the driver or carrier"
     return _row(load_id, load, state, stage, why, files)

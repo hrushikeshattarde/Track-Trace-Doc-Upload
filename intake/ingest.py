@@ -26,6 +26,14 @@ from . import db, filters, gmail as gm, routing
 # A reader takes (bytes, filename) and returns (extraction dict, document_type, model, cost_usd).
 Reader = Callable[[bytes, str], "tuple[dict, str, str, float]"]
 
+# Gmail keeps history for about a week. When the cursor is older than that the gap has to be covered
+# by a search window, and the window has to be at least as wide as the outage.
+HISTORY_RETENTION_DAYS = 8
+MAX_FULL_SYNC_DAYS = 30          # past this the per-load backfill is the right tool, not a wide search
+
+# Which failures are worth retrying lives in db.permanent_error_text: it has to classify a stored
+# error string as well as a live exception, so there is one rule and not two that drift.
+
 
 @dataclass
 class Stats:
@@ -46,6 +54,7 @@ class Stats:
     mode: str = "history"
     cursor_from: str | None = None
     cursor_to: str | None = None
+    reopened_for_backfill: int = 0
 
     def line(self) -> str:
         dropped = ", ".join(f"{k} {v}" for k, v in self.parts.most_common() if k != filters.KEEP) or "none"
@@ -58,6 +67,34 @@ class Stats:
                 + (f", {self.deferred} message(s) deferred to the next pass" if self.deferred else "")
                 + (" [SPEND CAP HIT: some documents left unread]" if self.spend_capped else "")
                 + f", spend ${self.cost_usd:.3f}")
+
+
+def permanent_read_error(exc: Exception) -> bool:
+    """Whether this failure is worth a second attempt. Classified from exactly the text that gets
+    recorded, so a row's stored error and the live decision can never disagree."""
+    return db.permanent_error_text(f"{type(exc).__name__}: {exc}")
+
+
+def _outage_days(conn, mailbox: str, floor_days: int) -> int:
+    """How far back a cursor-expiry sync has to look.
+
+    The window is the outage itself - from when the cursor was last written - plus a day of margin,
+    not a fixed --backfill-days. A 1-day window after a 3-day outage re-seeds the cursor past days 2
+    and 3, and Loop A is incremental forever after, so nothing ever looks at them again. Reading too
+    much is free here: every message it re-lists is already in the ledger and skipped before any
+    fetch. Reading too little is silent loss.
+    """
+    row = db.get_cursor_row(conn, mailbox)
+    synced = None
+    if row and row["synced_at"]:
+        try:
+            synced = dt.datetime.fromisoformat(str(row["synced_at"]).replace("Z", "+00:00"))
+        except ValueError:
+            synced = None
+    if synced is None:
+        return max(floor_days, HISTORY_RETENTION_DAYS)
+    gap = (dt.datetime.now(dt.timezone.utc) - synced).days + 1
+    return max(floor_days, min(gap, MAX_FULL_SYNC_DAYS))
 
 
 def sync_once(conn, client: gm.Delegated, *, group: str, reader: Reader | None = None,
@@ -81,10 +118,22 @@ def sync_once(conn, client: gm.Delegated, *, group: str, reader: Reader | None =
             refs, new_cursor = client.history_since(cursor)
         except gm.CursorTooOld:
             # Gmail keeps history for about a week; the usual cause is the service being down over
-            # a long weekend. Re-read a window, then re-seed from the mailbox's own historyId.
-            print(f"  cursor {cursor} is older than Gmail's history retention: falling back to a {backfill_days}-day full sync")
-            refs, new_cursor = _full_sync_refs(client, group, backfill_days)
-            st.mode = "full-sync (cursor expired)"
+            # a long weekend. Re-read a window that covers the whole outage, then re-seed from the
+            # mailbox's own historyId.
+            days = _outage_days(conn, mailbox, backfill_days)
+            print(f"  cursor {cursor} is older than Gmail's history retention: "
+                  f"falling back to a {days}-day full sync")
+            refs, new_cursor = _full_sync_refs(client, group, days)
+            st.mode = f"full-sync (cursor expired, {days}d)"
+            # A search window is not a history stream. `to:group newer_than:Nd` misses anything the
+            # query does not match, and the cursor is about to be re-seeded past all of it, so this
+            # is the last chance to look. Re-open the per-load backfill for every in-view load still
+            # short paperwork: its targeted subject search is the only thing that can still find it.
+            reopened = db.flag_history_gap(conn)
+            st.reopened_for_backfill = reopened
+            if reopened:
+                print(f"  {reopened} in-view load(s) flagged for re-backfill - "
+                      f"run 'python -m intake backfill' to close the gap")
     else:
         refs, new_cursor = _full_sync_refs(client, group, backfill_days)
         st.mode = f"full-sync (first run, {backfill_days}d)"
@@ -169,13 +218,75 @@ def backfill_load(conn, client: gm.Delegated, *, group: str, load_id: int,
     return len(messages)
 
 
+def read_pending(conn, client: gm.Delegated, *, reader: Reader, load_ids: list[int] | None = None,
+                 in_view_only: bool = True, limit: int = 100, max_spend_usd: float | None = None,
+                 verbose: bool = False) -> Stats:
+    """Read documents already in the ledger that have never been read.
+
+    The bytes are re-fetched from Gmail by (message_id, attachment_id) - the service stores no
+    document bytes - and the hash is verified before the reading is trusted, so a re-fetch that
+    returns something else can never be filed under this document's identity.
+    """
+    st = Stats()
+    st.mode = "read-pending"
+    for row in db.unread_attachments(conn, load_ids=load_ids, in_view_only=in_view_only, limit=limit):
+        if max_spend_usd is not None and st.cost_usd >= max_spend_usd:
+            if not st.spend_capped:
+                st.spend_capped = True
+                print(f"  spend cap ${max_spend_usd:.2f} reached after {st.reads} read(s); stopping")
+            break
+        sha = row["sha256"]
+        try:
+            from . import filing
+            data, name = filing.fetch_bytes(conn, client, sha)
+        except Exception as e:  # noqa: BLE001 - a message deleted from the mailbox, or a hash mismatch
+            # A hash mismatch is permanent: the bytes behind that attachment id are not this
+            # document any more, and re-fetching keeps returning the same wrong thing. A network
+            # failure is not, and gets its retries.
+            perm = permanent_read_error(e)
+            db.put_attachment(conn, sha, message_id="", filename=row["filename"], size=row["bytes"] or 0,
+                              extraction=None, document_type=None, model=None, cost_usd=None,
+                              error=f"re-fetch failed: {type(e).__name__}: {e}"[:300], permanent=perm)
+            st.read_errors += 1
+            print(f"  ! {sha[:12]}: {type(e).__name__}: {e}")
+            continue
+        st.downloads += 1
+        try:
+            extraction, doc_type, model, cost = reader(data, name)
+        except Exception as e:  # noqa: BLE001
+            st.read_errors += 1
+            perm = permanent_read_error(e)
+            db.put_attachment(conn, sha, message_id="", filename=row["filename"], size=len(data),
+                              extraction=None, document_type=None, model=None, cost_usd=None,
+                              error=f"{type(e).__name__}: {e}"[:300], permanent=perm)
+            print(f"  ! {name}: reader failed{', not retryable' if perm else ', will retry'} "
+                  f"- {type(e).__name__}: {e}")
+            continue
+        db.put_attachment(conn, sha, message_id="", filename=row["filename"], size=len(data),
+                          extraction=extraction, document_type=doc_type, model=model, cost_usd=cost)
+        st.reads += 1
+        st.cost_usd += cost or 0.0
+        # The load's paperwork picture just changed; look at it now rather than on its old cadence.
+        conn.execute("UPDATE load SET next_check_at=? WHERE load_id=?", (db.now_iso(), row["load_id"]))
+        if verbose:
+            print(f"  load {row['load_id']}  {name[:34]:36} -> {doc_type} (${cost:.4f})")
+    return st
+
+
 def backfill_pass(conn, client: gm.Delegated, *, group: str, limit: int = 100,
                   reader: Reader | None = None, max_spend_usd: float | None = None,
+                  load_ids: list[int] | None = None, restale_hours: int | None = None,
                   verbose: bool = False) -> Stats:
-    """Backfill every in-view load that has never been searched. Bounded, resumable, idempotent."""
+    """Backfill in-view loads that have never been searched. Bounded, resumable, idempotent.
+
+    load_ids targets a chosen set instead of taking the next N - useful for working one pod, or one
+    batch, without pulling the whole queue forward. restale_hours additionally re-takes loads that
+    are still short paperwork and were last searched a while ago, which is the safety net under a
+    cursor gap: Loop A cannot look backwards and Loop B never calls Gmail.
+    """
     st = Stats()
-    st.mode = "backfill"
-    todo = db.loads_needing_backfill(conn, limit)
+    st.mode = "backfill" if not restale_hours else f"backfill (re-stale {restale_hours}h)"
+    todo = load_ids if load_ids else db.loads_needing_backfill(conn, limit, restale_hours=restale_hours)
     for load_id in todo:
         if max_spend_usd is not None and st.cost_usd >= max_spend_usd and not st.spend_capped:
             st.spend_capped = True
@@ -185,6 +296,92 @@ def backfill_pass(conn, client: gm.Delegated, *, group: str, limit: int = 100,
         if verbose and n:
             print(f"  load {load_id}: {n} message(s) from history")
     return st
+
+
+def reconsider_parts(conn, client: gm.Delegated, *, load_ids: list[int], reader: Reader | None = None,
+                     max_spend_usd: float | None = None, limit: int = 50, verbose: bool = False) -> Stats:
+    """Take a second look at attachments the free filters threw away, for named loads only.
+
+    The filters in filters.py are judgement calls made on a filename and an image header: under
+    40 KB, under 300 px on a side, wider than 2.2:1. They were tuned against real traffic and they
+    are right the overwhelming majority of the time - load 2573804's thread held 111 image parts and
+    not one document. But the decision is made once and nothing re-examines a processed message, so
+    when they are wrong - a BOL photographed badly, a page cropped to a strip, a scan saved small -
+    the document is gone with no trace in the work queue.
+
+    This is the way back. It is deliberately not automatic and not a pass: a human names the loads,
+    having seen the dropped count on the load or in the queue, and accepts the spend. The bytes are
+    fetched by (message_id, attachment_id), hashed, and the part is re-recorded as kept, so from
+    there on the document is an ordinary ledger document - de-duplicated, filed, reviewed the same
+    way as any other.
+    """
+    st = Stats()
+    st.mode = "reconsider"
+    for load_id in load_ids:
+        for row in db.dropped_parts(conn, load_id)[:limit]:
+            if max_spend_usd is not None and st.cost_usd >= max_spend_usd and not st.spend_capped:
+                st.spend_capped = True
+                print(f"  spend cap ${max_spend_usd:.2f} reached; recovering without reading")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                _reconsider_one(conn, client, row, reader=None if st.spend_capped else reader,
+                                st=st, verbose=verbose)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        # Whatever came back changes the load's paperwork picture; look at it now, not on its cadence.
+        conn.execute("UPDATE load SET next_check_at=? WHERE load_id=?", (db.now_iso(), load_id))
+    return st
+
+
+def _reconsider_one(conn, client: gm.Delegated, row, *, reader: Reader | None, st: Stats,
+                    verbose: bool) -> None:
+    data = client.attachment_bytes(row["message_id"], row["attachment_id"])
+    st.downloads += 1
+    digest = hashlib.sha256(data).hexdigest()
+    _, dims = filters.geometry_decision(data)
+    # Recorded as kept with the geometry that had it dropped, so the ledger still shows what the
+    # filter saw and who overrode it.
+    db.record_part(conn, row["message_id"], row["part_id"], filename=row["filename"], size=row["bytes"],
+                   mime=row["mime"], decision=filters.KEEP, sha256=digest, dims=dims,
+                   attachment_id=row["attachment_id"])
+    st.parts[filters.KEEP] += 1
+    existing = db.get_attachment(conn, digest)
+    if existing is not None and existing["extraction_json"] is not None:
+        st.reads_avoided += 1
+        if verbose:
+            print(f"  = {row['filename']} already read as {existing['document_type']}")
+        return
+    if db.read_blocked(existing):
+        if verbose:
+            print(f"  x {row['filename']} unreadable: {(existing['error'] or '')[:60]}")
+        return
+    if existing is None:
+        st.new_files += 1
+    if reader is None:
+        if existing is None:
+            db.put_attachment(conn, digest, message_id=row["message_id"], filename=row["filename"],
+                              size=len(data), extraction=None, document_type=None, model=None, cost_usd=None)
+        print(f"  + load {row['load_id']}  {(row['filename'] or '')[:36]:38} "
+              f"{(row['bytes'] or 0) // 1024:5} KB {dims or ''}  recovered, not read")
+        return
+    try:
+        extraction, doc_type, model, cost = reader(data, row["filename"] or digest[:12])
+    except Exception as e:  # noqa: BLE001 - one unreadable file must not abort the batch
+        st.read_errors += 1
+        perm = permanent_read_error(e)
+        db.put_attachment(conn, digest, message_id=row["message_id"], filename=row["filename"],
+                          size=len(data), extraction=None, document_type=None, model=None, cost_usd=None,
+                          error=f"{type(e).__name__}: {e}"[:300], permanent=perm)
+        print(f"  ! {row['filename']}: reader failed - {type(e).__name__}: {e}")
+        return
+    db.put_attachment(conn, digest, message_id=row["message_id"], filename=row["filename"],
+                      size=len(data), extraction=extraction, document_type=doc_type, model=model, cost_usd=cost)
+    st.reads += 1
+    st.cost_usd += cost or 0.0
+    print(f"  + load {row['load_id']}  {(row['filename'] or '')[:36]:38} "
+          f"was {row['decision']} -> {doc_type} (${cost:.4f})")
 
 
 def _full_sync_refs(client: gm.Delegated, group: str, days: int) -> tuple[list[dict], str]:
@@ -310,11 +507,20 @@ def _handle_parts(conn, client: gm.Delegated, msg: dict, parts: list[dict], *,
                 print(f"    = {p['filename']} {digest[:12]} already read as {existing['document_type']}")
             continue
 
+        if db.read_blocked(existing):
+            # Failed in a way nothing will read differently. Recorded once; not paid for again.
+            if verbose:
+                print(f"    x {p['filename']} {digest[:12]} unreadable: {(existing['error'] or '')[:60]}")
+            continue
+
         if existing is None:
             st.new_files += 1
         if reader is None:
-            db.put_attachment(conn, digest, message_id=message_id, filename=p["filename"],
-                              size=len(data), extraction=None, document_type=None, model=None, cost_usd=None)
+            # Only ever create the placeholder. Rewriting an existing row here would reset the
+            # failure and its attempt count every time a reply re-quoted the same bytes.
+            if existing is None:
+                db.put_attachment(conn, digest, message_id=message_id, filename=p["filename"],
+                                  size=len(data), extraction=None, document_type=None, model=None, cost_usd=None)
             continue
 
         try:
@@ -324,10 +530,12 @@ def _handle_parts(conn, client: gm.Delegated, msg: dict, parts: list[dict], *,
             # transient API error. Record the failure against the hash so the next pass retries this
             # file and only this file, and carry on with the rest of the message.
             st.read_errors += 1
+            perm = permanent_read_error(e)
             db.put_attachment(conn, digest, message_id=message_id, filename=p["filename"], size=len(data),
                               extraction=None, document_type=None, model=None, cost_usd=None,
-                              error=f"{type(e).__name__}: {e}"[:300])
-            print(f"    ! {p['filename'] or digest[:12]}: reader failed, left for the next pass - {type(e).__name__}: {e}")
+                              error=f"{type(e).__name__}: {e}"[:300], permanent=perm)
+            print(f"    ! {p['filename'] or digest[:12]}: reader failed"
+                  f"{', not retryable' if perm else ', will retry'} - {type(e).__name__}: {e}")
             continue
         db.put_attachment(conn, digest, message_id=message_id, filename=p["filename"], size=len(data),
                           extraction=extraction, document_type=doc_type, model=model, cost_usd=cost)

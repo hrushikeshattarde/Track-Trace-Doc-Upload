@@ -10,6 +10,9 @@ r"""Command line for the intake service.
   python -m intake reconcile                 Loop B: give every dashboard load a ledger row
   python -m intake reconcile --days-back 350 --authoritative   the nightly audit
   python -m intake backfill                  one-off mail history for loads new to the view
+  python -m intake backfill --restale 24     ... and re-search loads still short paperwork
+  python -m intake reconsider --loads 1,2    re-take attachments the free filters dropped
+  python -m intake read --loads 1,2,3         read documents already ingested but never read
   python -m intake loads                     Loop B: check every load whose next check is due
   python -m intake queue                     the work queue, most urgent first
 
@@ -112,6 +115,13 @@ def cmd_load(args) -> int:
         dup = f" (appeared {f['seen']}x in the thread)" if f["seen"] > 1 else ""
         typ = f["document_type"] or "not read yet"
         print(f"  {f['sha256'][:12]}  {(f['filename'] or '')[:40]:42} {f['bytes'] // 1024:5} KB  {typ}{dup}")
+    dropped = db.dropped_parts(conn, lid)
+    if dropped:
+        print(f"\n{len(dropped)} attachment(s) the free filters dropped before any download:")
+        for d in dropped:
+            dims = f"{d['width']}x{d['height']}" if d["width"] else ""
+            print(f"  {(d['filename'] or '')[:40]:42} {(d['bytes'] or 0) // 1024:5} KB  {dims:11} {d['decision']}")
+        print(f"  -> python -m intake reconsider --loads {lid}   (add --read to have them read)")
     return 0
 
 
@@ -139,16 +149,69 @@ def cmd_backfill(args) -> int:
     conn = db.connect(args.db)
     client = gm.from_env()
     reader = ingest.make_reader(args.model) if args.read else None
-    todo = db.loads_needing_backfill(conn, args.limit)
+    todo = ([int(x) for x in args.loads.replace(",", " ").split()] if args.loads
+            else db.loads_needing_backfill(conn, args.limit, restale_hours=args.restale))
     if not todo:
-        print("every in-view load has had its mail history searched.")
+        print("every in-view load has had its mail history searched."
+              + ("" if args.restale else "  (--restale N re-searches loads still short paperwork)"))
         return 0
-    print(f"backfilling {len(todo)} load(s)" + (f", reading new documents with {args.model}" if reader else ""))
+    print(f"backfilling {len(todo)} load(s)"
+          + (f", re-searching anything not looked at for {args.restale}h" if args.restale else "")
+          + (f", reading new documents with {args.model}" if reader else ""))
     st = ingest.backfill_pass(conn, client, group=args.group, limit=args.limit, reader=reader,
-                              max_spend_usd=args.max_spend, verbose=args.verbose)
+                              max_spend_usd=args.max_spend, load_ids=todo,
+                              restale_hours=args.restale, verbose=args.verbose)
     print(st.line() + f"   ({client.calls} Gmail calls)")
     c = db.counts(conn)
     print(f"  {c['in_view_unbackfilled']} in-view load(s) still to backfill")
+    _print_health(conn)
+    return 0
+
+
+def cmd_reconsider(args) -> int:
+    """Re-take the attachments the free filters dropped, for loads a person has named.
+
+    Not a pass and not automatic: the filters are right nearly always, and reconsidering everything
+    would pay to read hundreds of email signatures. It exists because the decision is otherwise
+    final - nothing re-examines a processed message - so a badly photographed BOL is discarded with
+    no trace in the work queue.
+    """
+    conn = db.connect(args.db)
+    loads = [int(x) for x in args.loads.replace(",", " ").split()]
+    rows = [r for lid in loads for r in db.dropped_parts(conn, lid)]
+    if not rows:
+        print(f"nothing to reconsider on load(s) {', '.join(str(x) for x in loads)}: "
+              f"no attachment was dropped by the size/shape filters.")
+        return 0
+    print(f"{len(rows)} dropped attachment(s) across {len(loads)} load(s):")
+    for r in rows:
+        dims = f"{r['width']}x{r['height']}" if r["width"] else ""
+        print(f"  load {r['load_id']}  {(r['filename'] or '')[:36]:38} {(r['bytes'] or 0) // 1024:5} KB "
+              f"{dims:11} dropped as {r['decision']}")
+    reader = ingest.make_reader(args.model) if args.read else None
+    if not reader:
+        print("\n  recovering without reading. Add --read to have the model read them (costs money).")
+    st = ingest.reconsider_parts(conn, gm.from_env(), load_ids=loads, reader=reader,
+                                 max_spend_usd=args.max_spend, limit=args.limit, verbose=True)
+    print(f"\nrecovered {st.parts['keep']}, read {st.reads}, errors {st.read_errors}, "
+          f"spend ${st.cost_usd:.3f}")
+    _print_health(conn)
+    return 0
+
+
+def cmd_read(args) -> int:
+    conn = db.connect(args.db)
+    loads = [int(x) for x in args.loads.replace(",", " ").split()] if args.loads else None
+    pend = db.unread_attachments(conn, load_ids=loads, in_view_only=not args.any_load, limit=args.limit)
+    if not pend:
+        print("nothing to read: every document in scope already has an extraction.")
+        return 0
+    print(f"{len(pend)} document(s) to read with {args.model}. This costs money.")
+    st = ingest.read_pending(conn, gm.from_env(), reader=ingest.make_reader(args.model),
+                             load_ids=loads, in_view_only=not args.any_load, limit=args.limit,
+                             max_spend_usd=args.max_spend, verbose=True)
+    print("")
+    print(f"read {st.reads}, errors {st.read_errors}, spend ${st.cost_usd:.3f}")
     _print_health(conn)
     return 0
 
@@ -169,13 +232,15 @@ def cmd_queue(args) -> int:
     if not rows:
         print("nothing checked yet - run 'python -m intake loads'")
         return 0
-    print(f"{'load':>9}  {'state':22} {'stage':13} {'docs':5} {'customer':26} action")
+    print(f"{'load':>9}  {'state':22} {'stage':13} {'docs':7} {'customer':26} action")
     for r in rows:
         docs, unread = db.load_doc_evidence(conn, int(r["load_id"]))
-        mark = f"{docs}" + (f"/{unread}?" if unread else "")
-        print(f"{r['load_id']:>9}  {(r['state'] or ''):22} {(r['stage'] or ''):13} {mark:5} "
+        dropped = db.load_dropped_evidence(conn, int(r["load_id"]))
+        mark = f"{docs}" + (f"/{unread}?" if unread else "") + (f" -{dropped}" if dropped else "")
+        print(f"{r['load_id']:>9}  {(r['state'] or ''):22} {(r['stage'] or ''):13} {mark:7} "
               f"{(r['customer'] or '')[:26]:26} {(r['action'] or '')[:70]}")
-    print("\n  docs column: documents in the mail ledger for that load; /N? = not read yet")
+    print("\n  docs column: documents in the mail ledger for that load; /N? = not read yet;")
+    print("               -N = attachments the size/shape filters dropped (intake reconsider)")
     return 0
 
 
@@ -306,6 +371,12 @@ def _print_health(conn, full: bool = False) -> None:
     print(f"dedup     {c['attachment_occurrences']} attachment occurrence(s) -> {c['unique_files']} unique file(s); "
           f"{c['reads_avoided']} read(s) avoided")
     print(f"spend     ${c['model_spend_usd']:.3f} across {c['unique_files']} file(s)")
+    if c["read_failures"]:
+        print(f"failures  {c['read_failures_retrying']} read(s) waiting on a retry, "
+              f"{c['read_failures_permanent']} that nothing will read again")
+    if c["dropped_recoverable"]:
+        print(f"dropped   {c['dropped_recoverable']} attachment(s) on in-view loads rejected by the "
+              f"size/shape filters (see 'intake queue', recover with 'intake reconsider')")
     if c["threads_conflicted"]:
         print(f"conflicts {c['threads_conflicted']} thread(s) where a reply named a different load")
     if full:
@@ -327,7 +398,8 @@ def main() -> int:
     s.add_argument("--group", default=GROUP)
     s.add_argument("--max", type=int, default=500, help="cap on messages fetched this pass")
     s.add_argument("--backfill-days", type=int, default=1,
-                   help="window used on the first run, or after the cursor expires")
+                   help="window used on the first run. After a cursor expiry it is only a FLOOR: "
+                        "the window is widened to cover the whole outage")
     s.add_argument("--read", action="store_true", help="read new unique documents (costs money)")
     s.add_argument("--model", default="claude-opus-5")
     s.add_argument("--max-spend", type=float, default=None,
@@ -351,11 +423,33 @@ def main() -> int:
     bf = sub.add_parser("backfill", help="one-off mail history for in-view loads never searched")
     bf.add_argument("--group", default=GROUP)
     bf.add_argument("--limit", type=int, default=100)
+    bf.add_argument("--loads", default=None, help="comma-separated load numbers instead of the next N")
     bf.add_argument("--read", action="store_true", help="read new documents found (costs money)")
     bf.add_argument("--model", default="claude-opus-5")
     bf.add_argument("--max-spend", type=float, default=None)
+    bf.add_argument("--restale", type=int, default=None, metavar="HOURS",
+                    help="also re-search in-view loads that are still short paperwork and have not "
+                         "been searched for this many hours. The safety net under a cursor gap: "
+                         "Loop A cannot look backwards and Loop B never calls Gmail")
     bf.add_argument("-v", "--verbose", action="store_true")
     bf.set_defaults(fn=cmd_backfill)
+
+    rc = sub.add_parser("reconsider", help="re-take attachments the free filters dropped, by load")
+    rc.add_argument("--loads", required=True, help="comma-separated load numbers. Required: this is "
+                                                   "a deliberate override, never a sweep")
+    rc.add_argument("--read", action="store_true", help="read what is recovered (costs money)")
+    rc.add_argument("--model", default="claude-opus-5")
+    rc.add_argument("--max-spend", type=float, default=None)
+    rc.add_argument("--limit", type=int, default=50, help="cap per load")
+    rc.set_defaults(fn=cmd_reconsider)
+
+    rd = sub.add_parser("read", help="read documents already ingested but never read")
+    rd.add_argument("--loads", default=None, help="comma-separated load numbers; default all in-view")
+    rd.add_argument("--any-load", action="store_true", help="include loads outside the dashboard view")
+    rd.add_argument("--limit", type=int, default=50)
+    rd.add_argument("--model", default="claude-opus-5")
+    rd.add_argument("--max-spend", type=float, default=None)
+    rd.set_defaults(fn=cmd_read)
 
     ld = sub.add_parser("loads", help="Loop B: check every load whose next check is due")
     ld.add_argument("--limit", type=int, default=100)
