@@ -78,12 +78,19 @@ def _corroborate(extraction: dict, index: dict[str, str]) -> tuple[int, list[str
     return len(hits), hits
 
 
-def build_rows(conn, tpro, *, limit: int = 500, verbose: bool = False) -> list[dict]:
-    items = conn.execute(
-        "SELECT r.*, a.extraction_json, a.filename, a.bytes, a.document_type, "
-        "       l.customer, l.stage, l.state AS load_state, l.doc_status, l.terminal, l.filed_types "
-        "FROM review r LEFT JOIN attachment a USING (sha256) LEFT JOIN load l USING (load_id) "
-        "WHERE r.state='pending' ORDER BY r.load_id LIMIT ?", (limit,)).fetchall()
+def build_rows(conn, tpro, *, limit: int = 500, load_ids: list[int] | None = None,
+               verbose: bool = False) -> list[dict]:
+    sql = ("SELECT r.*, a.extraction_json, a.filename, a.bytes, a.document_type, "
+           "       l.customer, l.stage, l.state AS load_state, l.doc_status, l.terminal, l.filed_types "
+           "FROM review r LEFT JOIN attachment a USING (sha256) LEFT JOIN load l USING (load_id) "
+           "WHERE r.state='pending'")
+    params: list = []
+    if load_ids:
+        sql += " AND r.load_id IN (" + ",".join("?" * len(load_ids)) + ")"
+        params += list(load_ids)
+    sql += " ORDER BY r.load_id LIMIT ?"
+    params.append(limit)
+    items = conn.execute(sql, params).fetchall()
 
     cache: dict[int, tuple[dict, list[dict], list[dict]]] = {}
     rows: list[dict] = []
@@ -278,6 +285,80 @@ def write_csv(rows: list[dict], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8-sig") as fh:   # BOM so Excel opens UTF-8 correctly
         w = csv.DictWriter(fh, fieldnames=COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    return path
+
+
+# ------------------------------------------------------------------ per-load summary ----
+
+LOAD_COLUMNS = [
+    "load_id", "customer", "pod_terminal", "stage", "load_status", "doc_status",
+    "short_of", "filed_in_tpro", "mail_messages", "documents_in_mail",
+    "bols_in_mail", "pods_in_mail", "photos_in_mail", "other_in_mail",
+    "would_file_now", "would_file_type", "would_file_from",
+    "blocked_pii", "blocked_not_a_document", "model_spend_usd", "action",
+]
+
+SHORT_OF = {
+    "pod_expected": "POD",
+    "bol_expected": "BOL",
+    "wrong_doc_type": "nothing - paperwork is filed under a type that does not clear the status",
+    "filed_status_pending": "unclear - filed under a clearing type and still Waiting",
+    "complete": "nothing - documents received",
+    "not_yet_due": "nothing yet - truck has not loaded",
+    "not_in_view": "not on the dashboard",
+    "out_of_scope": "not in the worked service level",
+}
+
+
+def load_summary(conn, load_ids: list[int]) -> list[dict]:
+    """One row per load: what it is short, what the mail held, and what would file."""
+    out = []
+    for lid in load_ids:
+        l = conn.execute("SELECT * FROM load WHERE load_id=?", (lid,)).fetchone()
+        if l is None:
+            continue
+        types = dict(conn.execute(
+            "SELECT a.document_type, COUNT(*) FROM attachment a "
+            "JOIN part p ON p.sha256=a.sha256 AND p.decision='keep' "
+            "JOIN message m ON m.message_id=p.message_id "
+            "WHERE m.load_id=? AND a.extraction_json IS NOT NULL GROUP BY 1", (lid,)).fetchall())
+        msgs = conn.execute("SELECT COUNT(*) FROM message WHERE load_id=?", (lid,)).fetchone()[0]
+        spend = conn.execute(
+            "SELECT ROUND(SUM(c),3) FROM (SELECT DISTINCT a.sha256, a.cost_usd c FROM attachment a "
+            "JOIN part p ON p.sha256=a.sha256 JOIN message m ON m.message_id=p.message_id "
+            "WHERE m.load_id=? AND a.cost_usd IS NOT NULL)", (lid,)).fetchone()[0] or 0.0
+        shadow = conn.execute(
+            "SELECT r.proposed_type, a.filename FROM review r LEFT JOIN attachment a USING (sha256) "
+            "WHERE r.state='pending' AND r.kind='shadow' AND r.load_id=?", (lid,)).fetchall()
+        kinds = dict(conn.execute(
+            "SELECT kind, COUNT(*) FROM review WHERE state='pending' AND load_id=? GROUP BY 1", (lid,)).fetchall())
+        out.append({
+            "load_id": lid, "customer": l["customer"] or "", "pod_terminal": l["terminal"] or "",
+            "stage": l["stage"] or "", "load_status": "", "doc_status": l["doc_status"] or "",
+            "short_of": SHORT_OF.get(l["state"] or "", l["state"] or ""),
+            "filed_in_tpro": l["filed_types"] or "nothing",
+            "mail_messages": msgs, "documents_in_mail": sum(types.values()),
+            "bols_in_mail": types.get("bill_of_lading", 0), "pods_in_mail": types.get("proof_of_delivery", 0),
+            "photos_in_mail": types.get("photo", 0),
+            "other_in_mail": types.get("other", 0) + types.get("unknown", 0),
+            "would_file_now": len(shadow),
+            "would_file_type": "; ".join(sorted({r["proposed_type"] or "" for r in shadow})),
+            "would_file_from": "; ".join((r["filename"] or "")[:40] for r in shadow)[:160],
+            "blocked_pii": kinds.get("pii", 0),
+            "blocked_not_a_document": kinds.get("not_a_document", 0),
+            "model_spend_usd": spend, "action": l["action"] or "",
+        })
+    order = {"POD": 0, "BOL": 1}
+    out.sort(key=lambda r: (order.get(r["short_of"], 5), -r["would_file_now"], r["load_id"]))
+    return out
+
+
+def write_load_summary(rows: list[dict], path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.DictWriter(fh, fieldnames=LOAD_COLUMNS, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
     return path

@@ -275,8 +275,13 @@ def cmd_review(args) -> int:
 def cmd_export(args) -> int:
     conn = db.connect(args.db)
     client = tp.from_env()
-    rows = export.build_rows(conn, client, limit=args.limit, verbose=args.verbose)
+    loads = [int(x) for x in args.loads.replace(",", " ").split()] if args.loads else None
+    rows = export.build_rows(conn, client, limit=args.limit, load_ids=loads, verbose=args.verbose)
     out = export.write_csv(rows, Path(args.out))
+    if loads:
+        summary = export.write_load_summary(export.load_summary(conn, loads),
+                                            Path(args.out).with_name(Path(args.out).stem + "_by_load.csv"))
+        print(f"per-load summary -> {summary}")
     by = {}
     for r in rows:
         by[r["ready"]] = by.get(r["ready"], 0) + 1
@@ -384,6 +389,8 @@ def main() -> int:
     ex = sub.add_parser("export", help="the review queue as a CSV, with the evidence for each row")
     ex.add_argument("--out", default=str(HERE / "out" / "review_queue.csv"))
     ex.add_argument("--limit", type=int, default=500)
+    ex.add_argument("--loads", default=None,
+                    help="comma-separated load numbers; also writes a one-row-per-load summary")
     ex.add_argument("-v", "--verbose", action="store_true")
     ex.set_defaults(fn=cmd_export)
 
