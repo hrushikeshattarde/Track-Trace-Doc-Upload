@@ -24,6 +24,7 @@ POD_TOO_EARLY = "pod_too_early"
 CONFLICT = "conflict"
 LOW_CONFIDENCE = "low_confidence"
 NOT_NEEDED = "not_needed"              # the load is not short this document
+NOT_ASSESSED = "not_assessed"          # nobody has checked yet what the load is short
 WRONG_TYPE = "wrong_doc_type"        # filed, but under a type that does not clear the status
 REFILE = "refile"                      # filed already, but the status never cleared (OQ-3)
 SHADOW = "shadow"                      # auto-filing is off; this would have been filed
@@ -31,7 +32,7 @@ ERROR = "error"
 UNCLASSIFIED = "unclassified"          # a proposal that reached the queue without a reason set
 
 KIND_ORDER = [PII, NOT_A_DOCUMENT, RULES_FAILED, CONFLICT, POD_TOO_EARLY, LOW_CONFIDENCE,
-              ERROR, SHADOW, WRONG_TYPE, REFILE, NOT_NEEDED, UNCLASSIFIED]
+              ERROR, SHADOW, WRONG_TYPE, REFILE, NOT_ASSESSED, NOT_NEEDED, UNCLASSIFIED]
 
 KIND_HELP = {
     PII: "personal ID (licence, passport). Never file; delete from the thread if policy says so.",
@@ -42,6 +43,8 @@ KIND_HELP = {
     LOW_CONFIDENCE: "the load was resolved by a weaker signal than the subject line.",
     SHADOW: "auto-filing is off. This is what the service would have filed.",
     NOT_NEEDED: "the load is not short this document - filing it would add a duplicate.",
+    NOT_ASSESSED: "the load has not been checked against TransportPro yet, so what it is short is unknown. "
+                  "Run 'python -m intake loads' and judge again; these usually clear themselves.",
     WRONG_TYPE: "the load has paperwork but only under Driver Supplied BOL, which does not clear the status; re-filing it properly does.",
     REFILE: "already filed but the status never cleared; re-filing after the Delivered mark is the OQ-3 fix.",
     ERROR: "the filing attempt failed.",
@@ -78,6 +81,16 @@ def enqueue(conn: sqlite3.Connection, *, load_id: int | None, sha256: str | None
         "proposed_type=excluded.proposed_type, proposed_comment=excluded.proposed_comment "
         "WHERE review.state = 'pending'",
         (load_id, sha256, message_id, kind, reason, proposed_type, proposed_comment, db.now_iso()))
+    # propose() returns exactly ONE answer for a document, so a pending row under any OTHER kind is
+    # not a second open question - it is the answer from a previous run, left behind because the
+    # UNIQUE key is per kind. Without this a document accumulates a row for every answer it has ever
+    # had: a re-judge of the 240-row queue on 17 Sep 2026 grew it to 293, and 21 of the leftovers
+    # still read "would file as ..." for loads that had since become unassessed, which `execute`
+    # would have honoured on approval because it refuses only BLOCK and HOLD.
+    # PENDING only, and `IS` rather than `=` so a row with no sha256 is matched rather than skipped:
+    # nothing a person has approved, rejected or filed is ever touched.
+    conn.execute("DELETE FROM review WHERE load_id IS ? AND sha256 IS ? AND kind != ? AND state='pending'",
+                 (load_id, sha256, kind))
 
 
 def pending(conn: sqlite3.Connection, limit: int = 50, kind: str | None = None) -> list[sqlite3.Row]:

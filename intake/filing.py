@@ -122,6 +122,22 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
     #    short a POD - 140 of the 153 that cleared the gates on the 15 Sep 2026 run.
     load_state = (load_row["state"] if load_row else "") or ""
     needed = {"pod_expected": "Proof of Delivery", "bol_expected": "Bill Of Lading"}.get(load_state)
+    #    A load drain has not reached yet answers none of that. "new" is what upsert_load inserts and
+    #    what every load created from the mail side carries until Loop B checks it, and "error" is a
+    #    load TransportPro could not be read for; both mean the same thing here - nothing is KNOWN
+    #    about what this load is short. Before this branch they matched no case above and `needed`
+    #    was None, so they fell through every test in this step and reached the auto gate: the one
+    #    state the needs-check does not cover was the commonest one in the ledger (408 of the in-view
+    #    loads on 17 Sep 2026). Not knowing is a reason to ask a person, never a reason to file.
+    #    Only downgrade a proposal that is otherwise clean - a failed requirements check above is a
+    #    more specific finding and keeps the queue entry it earned.
+    if load_state in ("", "new", "error") and gate == AUTO:
+        return Proposal(load_id, sha256, REVIEW, review.NOT_ASSESSED,
+                        f"the load has not been checked against TransportPro yet"
+                        + (f" (state {load_state})" if load_state else " and has no ledger row")
+                        + f", so whether it is short a {doc_type} is unknown. Run "
+                        f"'python -m intake loads' and judge again",
+                        doc_type, None, filename, notes)
     if load_state in ("complete", "out_of_scope", "not_yet_due", "not_in_view"):
         return Proposal(load_id, sha256, REVIEW, review.NOT_NEEDED,
                         f"load is {load_state}: it is not short a document, so filing this adds a "
@@ -202,7 +218,20 @@ def _routing_of(conn, load_id: int, sha256: str) -> tuple[str | None, bool]:
 
 def candidates(conn: sqlite3.Connection, limit: int = 200) -> list[tuple[int, str]]:
     """(load, file) pairs that have been read, belong to a load, and are not filed or already
-    decided. This is the work list `intake file` walks."""
+    decided. This is the work list `intake file` walks.
+
+    A PENDING review row does not exclude a document. Pending is an open question, not a decision,
+    and the answer moves underneath it: the load gets drained, delivers, completes, changes what it
+    is short. Skipping those meant the queue froze the reason it was written with - 21 rows still
+    read "would file as ..." for loads that have since become unassessed - and `execute` only
+    refuses BLOCK and HOLD, so approving a stale row still filed on it. Re-judging is free (no
+    model, no network), `enqueue` updates a pending row in place rather than adding another, and
+    its ON CONFLICT clause already refuses to touch a row a person has decided.
+
+    Every other state is a decision and is left alone - including `approved`, which used to be
+    re-taken here. That gained nothing: `file --execute` re-proposes each approved item at the
+    moment it files it, so the only effect was a competing pending row beside the approval.
+    """
     rows = conn.execute(
         "SELECT DISTINCT m.load_id, p.sha256 FROM part p "
         "JOIN message m ON m.message_id = p.message_id "
@@ -210,7 +239,7 @@ def candidates(conn: sqlite3.Connection, limit: int = 200) -> list[tuple[int, st
         "WHERE p.decision='keep' AND m.load_id IS NOT NULL AND a.extraction_json IS NOT NULL "
         "  AND NOT EXISTS (SELECT 1 FROM filing f WHERE f.load_id=m.load_id AND f.sha256=p.sha256) "
         "  AND NOT EXISTS (SELECT 1 FROM review r WHERE r.load_id=m.load_id AND r.sha256=p.sha256 "
-        "                  AND r.state IN ('pending','rejected','filed')) "
+        "                  AND r.state IN ('approved','rejected','filed')) "
         "LIMIT ?", (limit,)).fetchall()
     return [(int(r["load_id"]), r["sha256"]) for r in rows]
 
