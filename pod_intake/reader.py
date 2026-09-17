@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import anthropic
 
 from .normalize import Document
-from .schema import Adjudication, Extraction
+from .schema import Adjudication, Extraction, reader_json_schema
 
 # Anthropic list prices per million tokens (input, output). Cache reads are billed at ~0.1x input,
 # cache writes at ~1.25x input. Source: claude-api skill reference, 24 Jun 2026. Verify before budgeting.
@@ -33,6 +33,7 @@ Rules:
 - Dates: give the date only, without a time of day, in the format written on the page.
 - A sheet is a proof of delivery only if a receiver has signed or stamped it (a name, date, "Received", or in/out times at the consignee). Otherwise it is a bill of lading. Signature lines that are blank are not signed. Report each signature line separately (shipper, driver, receiver) and set stamp_present when an inked or printed receiving stamp appears anywhere on the page.
 - If the file carries typed text such as "check in 06:00 / check out 12:00", treat it as an app stamp and report those times with source app_stamp.
+- In/out times: say WHICH STOP they belong to in times.at_stop. Use "consignee" when they were recorded at the delivery stop, "shipper" when they were recorded at pickup, and "unknown" when the page does not make it clear (a bare handwritten time in a margin with nothing naming the stop). This is what decides whether the times are evidence of delivery: a departure time written at the shipper is not, however much it looks like one written at the consignee. Read the stop from the section of the form the times sit in, the address printed beside them, or a header such as "SHIPPER" / "CONSIGNEE" / "RECEIVED AT". If the page carries in/out times for BOTH stops, report the CONSIGNEE pair in check_in / check_out, set at_stop "consignee", and give the pickup times in notes.
 - Describe legibility honestly. Glare, blur, skew, and cut-off edges belong in notes.
 - If several different documents are in one file, classify each page in pages[] and set document_type to the primary one.
 - If the image is not a freight document at all (an email signature, a company logo or letterhead, a certification badge strip, a screenshot of a chat or a web page, a selfie), set document_type to "other", say what it is in notes, and leave numbers, parties and signatures empty. Use "unknown" only for a freight document you cannot read. Never describe such an image in prose: still return the JSON object. A photo or phone screenshot OF a freight document, even one page of several and even with handwritten remarks on it, is that document, never "other" (load 2576409: a screenshot of delivery-order page 2 was wrongly called other).
@@ -92,7 +93,7 @@ def _page_blocks(doc: Document) -> list[dict]:
 
 def _output_format(schema_model) -> dict:
     """Same JSON-schema format the SDK's messages.parse() builds, so the Anthropic API enforces the schema."""
-    schema = schema_model.model_json_schema()
+    schema = reader_json_schema(schema_model)
     try:  # the SDK's transform adds the strictness the API expects; private helper, so degrade gracefully
         from anthropic.lib._parse._transform import transform_schema
         schema = transform_schema(schema)
@@ -123,7 +124,7 @@ def _structured_call(client: anthropic.Anthropic, model: str, system: str, conte
     """
     system_blocks = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
     messages = [{"role": "user", "content": content}]
-    schema_hint = {"type": "text", "text": "Respond with ONLY a JSON object that validates against this JSON schema. No prose, no code fences.\n" + json.dumps(schema_model.model_json_schema())}
+    schema_hint = {"type": "text", "text": "Respond with ONLY a JSON object that validates against this JSON schema. No prose, no code fences.\n" + json.dumps(reader_json_schema(schema_model))}
     output_config: dict = {"format": _output_format(schema_model)}
     if effort and "haiku" not in model.lower():
         output_config["effort"] = effort
@@ -151,7 +152,7 @@ def _structured_call(client: anthropic.Anthropic, model: str, system: str, conte
         retry_hint = {"type": "text", "text": "Your previous answer was prose. Respond with ONLY the JSON object for this schema, no prose, no code fences. "
                       "If the image is not a freight document (a logo, an email signature, a screenshot of something else), "
                       "set document_type to \"other\", explain in notes, and leave the lists empty. "
-                      + json.dumps(schema_model.model_json_schema())}
+                      + json.dumps(reader_json_schema(schema_model))}
         response2 = client.messages.create(model=model, max_tokens=8000, system=system_blocks,
                                            messages=[{"role": "user", "content": content + [retry_hint]}])
         _check_stop(response2)

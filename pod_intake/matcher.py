@@ -184,23 +184,45 @@ def classify_type(ex: Extraction, load: dict | None) -> tuple[str, str]:
                  "carrier_invoice": "Carrier Invoice", "rate_confirmation": "Rate Confirmation", "photo": "Photo",
                  "shipping_document": "Shipping Documents"}   # TransportPro type 369: packing lists, CofAs, customs paperwork
         return names[ex.document_type], f"reader classified {ex.document_type}"
-    signed = ex.signatures.receiver_signed or bool(ex.times.check_out)
+    # In/out times are evidence of delivery only when they were recorded at the delivery stop.
+    # Before Times.at_stop existed the reader could not say which stop they came from, and a
+    # departure written at the SHIPPER read exactly like one written at the consignee: measured
+    # 17 Sep 2026 over the 239 documents in the ledger, 10 of 84 bills of lading carried a check-out
+    # time and no receiver signature, one of them a file named "Circle BOL NC-KY.pdf" with a
+    # handwritten 2:10 pm that is almost certainly a pickup departure. Only an explicit "shipper"
+    # withdraws the evidence - "unknown" is what every extraction read before this field existed
+    # reports, and it has to keep meaning exactly what it meant then.
+    delivery_times = bool(ex.times.check_out) and ex.times.at_stop != "shipper"
+    signed = ex.signatures.receiver_signed or delivery_times
+    if ex.signatures.receiver_signed:
+        evidence = "receiver signature"
+    elif delivery_times:
+        evidence = ("in/out times recorded at the consignee" if ex.times.at_stop == "consignee"
+                    else "in/out times, though the page does not say which stop")
+    else:
+        evidence = ""
+    # Worth saying out loud wherever it changes the answer: it is the one case where the page holds
+    # a time and the service is deliberately not counting it.
+    pickup_times = ("; the in/out times on the page were recorded at the shipper"
+                    if ex.times.check_out and ex.times.at_stop == "shipper" else "")
     stage = (load or {}).get("dispatch_status", "")
     if stage in ("Planned", "Dispatched", "At Shipper", "Loaded", "In Transit"):
         # The truck has not reached the consignee: a signed form here is the shipper's or the CFS's release, signed by the
         # driver (load 2576409: a Menzies "CFS DELIVERY" receipt read as a POD). If the dispatch status is simply stale,
         # the rep advances it and the next pass re-types the file.
-        why = f"signed before the truck reached the consignee (dispatch {stage}): pickup paperwork, not a POD" if signed else f"dispatch {stage}; pickup copy"
+        why = (f"{evidence} before the truck reached the consignee (dispatch {stage}): pickup paperwork, not a POD"
+               if signed else f"dispatch {stage}; pickup copy{pickup_times}")
         if ex.document_type == "proof_of_delivery":
             why += "; reader called it a POD, overruled by the trip stage"
         return "Bill Of Lading", why
     if signed and stage in ("Delivered", "At Consignee", ""):
-        return "Proof of Delivery", "receiver signature or in/out times present" + (f"; dispatch {stage}" if stage else "")
+        return "Proof of Delivery", f"{evidence} present" + (f"; dispatch {stage}" if stage else "")
     if signed:
-        return "Proof of Delivery", f"receiver signed although dispatch shows {stage}; reviewer should confirm"
+        return "Proof of Delivery", f"{evidence} although dispatch shows {stage}; reviewer should confirm"
     if stage in ("Delivered", "At Consignee"):
-        return "Bill Of Lading", f"no receiver signature although dispatch is {stage}; likely the pickup copy"
-    return "Bill Of Lading", "no receiver signature; pickup copy"
+        return "Bill Of Lading", (f"no receiver signature although dispatch is {stage}; "
+                                  f"likely the pickup copy{pickup_times}")
+    return "Bill Of Lading", f"no receiver signature; pickup copy{pickup_times}"
 
 
 def filing_comment(doc_type: str, load_id: int, channel: str, when: datetime, decision: str, signals: list[Signal]) -> str:

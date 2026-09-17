@@ -75,7 +75,7 @@ def main() -> int:
         lines.append(row("Numbers extracted", [str(len(d["extraction"]["numbers"])) for d in docs]))
         lines.append(row("Handwritten flagged", [str(sum(1 for n in d["extraction"]["numbers"] if n["handwritten"])) for d in docs]))
         lines.append(row("Receiver signed / name", [f"{d['extraction']['signatures']['receiver_signed']} / {d['extraction']['signatures'].get('receiver_name') or '-'}" for d in docs]))
-        lines.append(row("In / out times", [f"{d['extraction']['times'].get('check_in') or '-'} / {d['extraction']['times'].get('check_out') or '-'} ({d['extraction']['times']['source']})" for d in docs]))
+        lines.append(row("In / out times", [f"{d['extraction']['times'].get('check_in') or '-'} / {d['extraction']['times'].get('check_out') or '-'} ({d['extraction']['times']['source']}, at the {d['extraction']['times'].get('at_stop', 'unknown')})" for d in docs]))
         lines.append(row("Legibility (page 1)", [f"{d['extraction']['pages'][0]['legibility']:.2f}" if d["extraction"]["pages"] else "-" for d in docs]))
         lines.append(row("Tokens in / out / cached", ["{:,} / {:,} / {:,}".format(*tokens_of(d)) for d in docs]))
         lines.append(row("Estimated cost", [f"${d['estimated_cost_usd']:.4f}" for d in docs]))

@@ -17,7 +17,7 @@ from openai import OpenAI
 
 from .normalize import Document
 from .reader import ADJUDICATOR_SYSTEM, READER_SYSTEM, _extract_json
-from .schema import Adjudication, Extraction
+from .schema import Adjudication, Extraction, reader_json_schema
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
@@ -65,7 +65,7 @@ def _usage(model: str, completion) -> OpenAIUsage:
 
 def _structured_call(client: OpenAI, model: str, system: str, parts: list[dict], schema_model, effort: str | None = None):
     """JSON-mode call with the schema in the prompt, validated with Pydantic. Works across OpenRouter models."""
-    schema_text = json.dumps(schema_model.model_json_schema())
+    schema_text = json.dumps(reader_json_schema(schema_model))
     messages = [
         {"role": "system", "content": system + "\n\nRespond with ONLY a JSON object that validates against this JSON schema. No prose, no code fences.\n" + schema_text},
         {"role": "user", "content": parts},

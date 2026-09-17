@@ -304,8 +304,16 @@ def check_document(ex: Extraction, filed_type: str, rules: dict | None, load: di
 
     # in/out times
     if rules.get("in_out_times_required") and is_pod:
-        ok = bool(ex.times.check_in and ex.times.check_out)
-        add("in_out_times", "pass" if ok else "fail", "in/out times " + (f"{ex.times.check_in} / {ex.times.check_out} ({ex.times.source})" if ok else "missing on POD"))
+        # A customer that requires in/out times wants the consignee's. Pickup times satisfy nothing,
+        # and before at_stop existed they were indistinguishable. As in classify_type, only an
+        # explicit "shipper" fails: "unknown" keeps the behaviour every earlier extraction was judged by.
+        at_shipper = ex.times.at_stop == "shipper"
+        both = bool(ex.times.check_in and ex.times.check_out)
+        ok = both and not at_shipper
+        where = f", at the {ex.times.at_stop}" if ex.times.at_stop != "unknown" else ""
+        shown = f"{ex.times.check_in} / {ex.times.check_out} ({ex.times.source}{where})"
+        why = shown if ok else (f"{shown} - recorded at the shipper, not the consignee" if both else "missing on POD")
+        add("in_out_times", "pass" if ok else "fail", "in/out times " + why)
 
     # address / customer on paper matches the load
     if rules.get("address_match_required"):

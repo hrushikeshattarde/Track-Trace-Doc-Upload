@@ -205,7 +205,7 @@ def report_match(name: str, ex: Extraction, index: LoadIndex, args, adjudicate_f
     print(f"   reader type: {ex.document_type} ({ex.document_type_confidence:.2f}); filed as: {doc_type} [{type_reason}]")
     print(f"   numbers: " + ", ".join(f"{n.label}={n.value}{'*' if n.handwritten else ''}" for n in ex.numbers[:8]) + (" ..." if len(ex.numbers) > 8 else ""))
     print(f"   shipper: {ex.shipper.name} ({ex.shipper.city}) -> consignee: {ex.consignee.name} ({ex.consignee.city})")
-    print(f"   receiver signed: {ex.signatures.receiver_signed} {ex.signatures.receiver_name or ''} {ex.signatures.receiver_date or ''} | times: {ex.times.check_in} / {ex.times.check_out} ({ex.times.source})")
+    print(f"   receiver signed: {ex.signatures.receiver_signed} {ex.signatures.receiver_name or ''} {ex.signatures.receiver_date or ''} | times: {ex.times.check_in} / {ex.times.check_out} ({ex.times.source}, at the {ex.times.at_stop} stop)")
     for c in cands[:3]:
         print(f"   candidate {c.load_id}: score {c.score:.1f} ({c.strong} strong, {c.medium} medium)")
         for s in c.signals:
