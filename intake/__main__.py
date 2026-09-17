@@ -374,6 +374,10 @@ def _print_health(conn, full: bool = False) -> None:
     if c["read_failures"]:
         print(f"failures  {c['read_failures_retrying']} read(s) waiting on a retry, "
               f"{c['read_failures_permanent']} that nothing will read again")
+    if c["read_failures_paused"]:
+        print(f"paused    {c['read_failures_paused']} read(s) held because the READER was "
+              f"unavailable - no credit, quota or key. No retries are being spent; they resume "
+              f"as soon as it works")
     if c["dropped_recoverable"]:
         print(f"dropped   {c['dropped_recoverable']} attachment(s) on in-view loads rejected by the "
               f"size/shape filters (see 'intake queue', recover with 'intake reconsider')")

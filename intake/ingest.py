@@ -31,6 +31,11 @@ Reader = Callable[[bytes, str], "tuple[dict, str, str, float]"]
 HISTORY_RETENTION_DAYS = 8
 MAX_FULL_SYNC_DAYS = 30          # past this the per-load backfill is the right tool, not a wide search
 
+# How many service-side failures in a row end a read pass. Three is enough to tell "this one file
+# upset the API" from "the account has no credit", and small enough that a paused service costs
+# three Gmail downloads rather than a hundred.
+SERVICE_FAILURE_LIMIT = 3
+
 # Which failures are worth retrying lives in db.permanent_error_text: it has to classify a stored
 # error string as well as a live exception, so there is one rule and not two that drift.
 
@@ -229,7 +234,15 @@ def read_pending(conn, client: gm.Delegated, *, reader: Reader, load_ids: list[i
     """
     st = Stats()
     st.mode = "read-pending"
+    service_failures = 0
     for row in db.unread_attachments(conn, load_ids=load_ids, in_view_only=in_view_only, limit=limit):
+        if service_failures >= SERVICE_FAILURE_LIMIT:
+            # Nothing is wrong with the documents and nothing will be right with the next one
+            # either. Walking the rest of the list to collect the same answer wastes a Gmail
+            # download per row and buries the actual problem under repeats of itself.
+            print(f"  stopping: {service_failures} consecutive service-side failures (no credit, "
+                  f"quota or key). The remaining documents are untouched and keep their retries")
+            break
         if max_spend_usd is not None and st.cost_usd >= max_spend_usd:
             if not st.spend_capped:
                 st.spend_capped = True
@@ -259,12 +272,19 @@ def read_pending(conn, client: gm.Delegated, *, reader: Reader, load_ids: list[i
             db.put_attachment(conn, sha, message_id="", filename=row["filename"], size=len(data),
                               extraction=None, document_type=None, model=None, cost_usd=None,
                               error=f"{type(e).__name__}: {e}"[:300], permanent=perm)
-            print(f"  ! {name}: reader failed{', not retryable' if perm else ', will retry'} "
-                  f"- {type(e).__name__}: {e}")
+            if db.paused_error_text(f"{type(e).__name__}: {e}"):
+                service_failures += 1
+                print(f"  ! {name}: the reader is unavailable, not the file - {type(e).__name__}: "
+                      f"{str(e)[:120]}")
+            else:
+                service_failures = 0
+                print(f"  ! {name}: reader failed{', not retryable' if perm else ', will retry'} "
+                      f"- {type(e).__name__}: {e}")
             continue
         db.put_attachment(conn, sha, message_id="", filename=row["filename"], size=len(data),
                           extraction=extraction, document_type=doc_type, model=model, cost_usd=cost)
         st.reads += 1
+        service_failures = 0
         st.cost_usd += cost or 0.0
         # The load's paperwork picture just changed; look at it now rather than on its old cadence.
         conn.execute("UPDATE load SET next_check_at=? WHERE load_id=?", (db.now_iso(), row["load_id"]))

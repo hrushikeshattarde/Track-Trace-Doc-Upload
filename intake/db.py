@@ -22,18 +22,44 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Backoff for a failed read, by attempt. After the last one the file is left alone and reported as
 # a permanent failure: a .MOV or a corrupt part fails identically every time, and retrying it on a
 # schedule forever is spend with no chance of a different answer.
 READ_RETRY_MINUTES = (15, 60, 360, 1440)
 
+# How long to wait before trying again when the failure was not the document's fault at all.
+READ_PAUSE_MINUTES = 60
+
 # Failures that will fail again in exactly the same way: a container PyMuPDF cannot open (a .MOV
 # from a driver's phone), a truncated or empty part, a re-fetch whose bytes are not this document.
 # Anything else - a 429/529, a timeout, an overloaded API - is transient and comes back.
 PERMANENT_READ_ERRORS = ("filedataerror", "emptyfileerror", "unsupportedformat", "filenotfounderror",
                          "cannot open", "unsupported", "no pages", "do not match")
+
+
+# Failures that say nothing about this document, because the reader cannot read ANY document right
+# now: no credit, an exhausted quota, a rejected key. These must not spend the retry budget. On
+# 17 Sep 2026 thirty-seven documents failed with HTTP 402 billing_error, and on the ordinary backoff
+# all four of their attempts would have run out within 31 hours and marked every one of them
+# permanently unreadable - for a reason that had nothing to do with the paper and would have been
+# fixed by topping up an account. They are rescheduled instead, indefinitely, and counted separately
+# in `status` so a service that has been paused for days cannot look like one that is working.
+PAUSED_READ_ERRORS = ("billing", "quota", "insufficient", "payment required", "code: 402",
+                      "code: 401", "code: 403", "authentication_error", "permission_error",
+                      "invalid_api_key", "invalid x-api-key", "credit balance")
+
+
+def paused_error_text(text: str | None) -> bool:
+    """Whether this failure is the service's to fix rather than the document's.
+
+    Checked BEFORE permanent_error_text: a 402 is never a verdict on the file. The signatures are
+    deliberately worded rather than bare status numbers, so a document whose name happens to contain
+    "402" cannot be mistaken for a billing failure.
+    """
+    t = (text or "").lower()
+    return any(sig in t for sig in PAUSED_READ_ERRORS)
 
 
 def permanent_error_text(text: str | None) -> bool:
@@ -264,6 +290,15 @@ def migrate(conn: sqlite3.Connection) -> None:
             else:
                 conn.execute("UPDATE attachment SET next_read_at=?, read_attempts=1 WHERE sha256=?",
                              (now_iso(), sha))
+    if have < 8:
+        # Rows already failed with a service-side error had an attempt charged to them under the
+        # v7 rules. Give it back and make them due: nothing about them was ever the document's
+        # fault, and they were within hours of being condemned for it.
+        for sha, err in conn.execute("SELECT sha256, error FROM attachment WHERE error IS NOT NULL "
+                                     "AND extraction_json IS NULL").fetchall():
+            if paused_error_text(err):
+                conn.execute("UPDATE attachment SET read_attempts=0, next_read_at=? WHERE sha256=?",
+                             (now_iso(), sha))
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -428,11 +463,16 @@ def put_attachment(conn: sqlite3.Connection, sha256: str, *, message_id: str, fi
     if prior is not None and prior["extraction_json"] is not None:
         return                                  # already read: never overwritten, never paid for twice
     attempts, next_read_at = 0, None
-    if error:
+    now = dt.datetime.now(dt.timezone.utc)
+    if error and paused_error_text(error):
+        # The service cannot read anything right now. Hold the document where it is - same attempt
+        # count, a fixed wait - so that an outage of any length costs it nothing.
+        attempts = (prior["read_attempts"] if prior else 0) or 0
+        next_read_at = (now + dt.timedelta(minutes=READ_PAUSE_MINUTES)).isoformat(timespec="seconds")
+    elif error:
         attempts = (prior["read_attempts"] if prior else 0) + 1
         if not permanent and attempts <= len(READ_RETRY_MINUTES):
-            next_read_at = (dt.datetime.now(dt.timezone.utc)
-                            + dt.timedelta(minutes=READ_RETRY_MINUTES[attempts - 1])).isoformat(timespec="seconds")
+            next_read_at = (now + dt.timedelta(minutes=READ_RETRY_MINUTES[attempts - 1])).isoformat(timespec="seconds")
     conn.execute(
         "INSERT INTO attachment (sha256, first_seen_message_id, filename, bytes, extraction_json, "
         "document_type, model, cost_usd, read_at, error, read_attempts, next_read_at) "
@@ -665,6 +705,9 @@ def counts(conn: sqlite3.Connection) -> dict[str, Any]:
     read_failures = q("SELECT COUNT(*) FROM attachment WHERE error IS NOT NULL AND extraction_json IS NULL")
     read_retrying = q("SELECT COUNT(*) FROM attachment WHERE error IS NOT NULL AND extraction_json IS NULL "
                       "AND next_read_at IS NOT NULL")
+    read_paused = len([1 for r in conn.execute(
+        "SELECT error FROM attachment WHERE error IS NOT NULL AND extraction_json IS NULL "
+        "AND next_read_at IS NOT NULL") if paused_error_text(r[0])])
     oldest_unres = q("SELECT MIN(created_at) FROM unresolved") or None
     overdue = q("SELECT MIN(next_check_at) FROM load WHERE next_check_at <= ?", now_iso()) or None
     return {
@@ -682,7 +725,8 @@ def counts(conn: sqlite3.Connection) -> dict[str, Any]:
         "files_read": files_read,
         "files_unread": unique_files - files_read - read_failures,
         "read_failures": read_failures,
-        "read_failures_retrying": read_retrying,          # waiting out a backoff; they come back
+        "read_failures_retrying": read_retrying - read_paused,   # waiting out a backoff; they come back
+        "read_failures_paused": read_paused,              # the SERVICE failed, not the file: no budget spent
         "read_failures_permanent": read_failures - read_retrying,   # nothing will read these again
         "dropped_recoverable": q(
             f"SELECT COUNT(DISTINCT {_DISTINCT_FILE}) FROM part p "
