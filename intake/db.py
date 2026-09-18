@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 
 # Backoff for a failed read, by attempt. After the last one the file is left alone and reported as
 # a permanent failure: a .MOV or a corrupt part fails identically every time, and retrying it on a
@@ -32,11 +32,17 @@ READ_RETRY_MINUTES = (15, 60, 360, 1440)
 # How long to wait before trying again when the failure was not the document's fault at all.
 READ_PAUSE_MINUTES = 60
 
-# Failures that will fail again in exactly the same way: a container PyMuPDF cannot open (a .MOV
-# from a driver's phone), a truncated or empty part, a re-fetch whose bytes are not this document.
-# Anything else - a 429/529, a timeout, an overloaded API - is transient and comes back.
-PERMANENT_READ_ERRORS = ("filedataerror", "emptyfileerror", "unsupportedformat", "filenotfounderror",
-                         "cannot open", "unsupported", "no pages", "do not match")
+# Only ONE failure is a final verdict on a file: a re-fetch whose bytes are not the document the
+# hash describes. That cannot come right, because re-fetching keeps returning the same wrong thing.
+#
+# A format the reader cannot open is NOT in this list, though it looks like the obvious candidate.
+# A HEIC PyMuPDF rejects today is readable the moment pillow-heif is installed, and a .MOV may yet
+# get a frame extractor; blocking them permanently means the fix lands and recovers nothing -
+# exactly what tests/test_intake.py calls "simulate the fix landing". They are also close to free to
+# retry, because load_document() fails locally, before any model call, so an attempt costs one Gmail
+# download and no spend. They take their four attempts like anything else and are then reported as
+# unreadable, which is the same end state arrived at without hard-coding a guess about formats.
+PERMANENT_READ_ERRORS = ("do not match",)
 
 
 # Failures that say nothing about this document, because the reader cannot read ANY document right
@@ -147,6 +153,30 @@ CREATE TABLE IF NOT EXISTS attachment (
     next_read_at          TEXT
 );
 
+-- One row per file already attached to a load in TransportPro. The mail side's `part` table does
+-- the same job for Gmail attachments: this is one row per OCCURRENCE, and `attachment` stays one
+-- row per unique SHA-256 whatever the source. That is what makes the two sides meet - a document
+-- emailed in and also filed on the load hashes the same, so its reading is already paid for and
+-- the ledger can prove the filed file and the emailed file are the same bytes.
+--
+-- sha256 is null until the file is downloaded. Listing costs one call per load and is free;
+-- downloading is free too. Only reading costs anything.
+CREATE TABLE IF NOT EXISTS tpro_file (
+    tpro_file_id   INTEGER PRIMARY KEY,
+    load_id        INTEGER NOT NULL,
+    filename       TEXT,
+    mime           TEXT,
+    file_type_id   INTEGER,
+    file_type_name TEXT,
+    comments       TEXT,
+    upload_by_id   INTEGER,
+    date_created   TEXT,
+    bytes          INTEGER,
+    sha256         TEXT,
+    seen_at        TEXT,
+    downloaded_at  TEXT
+);
+
 -- Idempotent filing. The UNIQUE key is the guard against double-filing, not a code path.
 CREATE TABLE IF NOT EXISTS filing (
     load_id       INTEGER NOT NULL,
@@ -227,6 +257,8 @@ CREATE INDEX IF NOT EXISTS ix_message_load      ON message (load_id);
 CREATE INDEX IF NOT EXISTS ix_part_sha          ON part (sha256);
 CREATE INDEX IF NOT EXISTS ix_load_due          ON load (next_check_at);
 CREATE INDEX IF NOT EXISTS ix_unresolved_retry  ON unresolved (next_retry_at);
+CREATE INDEX IF NOT EXISTS ix_tpro_file_load    ON tpro_file (load_id);
+CREATE INDEX IF NOT EXISTS ix_tpro_file_sha     ON tpro_file (sha256);
 """
 
 
@@ -299,6 +331,24 @@ def migrate(conn: sqlite3.Connection) -> None:
             if paused_error_text(err):
                 conn.execute("UPDATE attachment SET read_attempts=0, next_read_at=? WHERE sha256=?",
                              (now_iso(), sha))
+    if have < 9:
+        # v7 condemned anything matching a wide "permanent" list, which included formats the reader
+        # cannot open. That rule is gone (see PERMANENT_READ_ERRORS): those files are retryable, and
+        # nearly free to retry. Rows blocked by the old rule get their budget back, like v8 did for
+        # billing failures - a verdict handed down by a rule that no longer exists should not stand.
+        for sha, err in conn.execute("SELECT sha256, error FROM attachment WHERE error IS NOT NULL "
+                                     "AND extraction_json IS NULL AND next_read_at IS NULL").fetchall():
+            if not permanent_error_text(err):
+                conn.execute("UPDATE attachment SET read_attempts=0, next_read_at=? WHERE sha256=?",
+                             (now_iso(), sha))
+    if have < 10:
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS tpro_file ("
+            " tpro_file_id INTEGER PRIMARY KEY, load_id INTEGER NOT NULL, filename TEXT, mime TEXT,"
+            " file_type_id INTEGER, file_type_name TEXT, comments TEXT, upload_by_id INTEGER,"
+            " date_created TEXT, bytes INTEGER, sha256 TEXT, seen_at TEXT, downloaded_at TEXT);"
+            "CREATE INDEX IF NOT EXISTS ix_tpro_file_load ON tpro_file (load_id);"
+            "CREATE INDEX IF NOT EXISTS ix_tpro_file_sha  ON tpro_file (sha256);")
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -382,6 +432,58 @@ def record_part(conn: sqlite3.Connection, message_id: str, part_id: str, *, file
         (message_id, part_id, attachment_id, filename, size, mime,
          dims[0] if dims else None, dims[1] if dims else None, sha256, decision, now_iso()),
     )
+
+
+# ------------------------------------------------------------------ TransportPro files ----
+
+def record_tpro_file(conn: sqlite3.Connection, load_id: int, f: dict, *, sha256: str | None = None,
+                     size: int | None = None) -> None:
+    """Note that a file is attached to this load. Metadata only unless sha256 is given.
+
+    Re-listing a load is free and must stay free: the metadata is refreshed every time (comments and
+    even the type get corrected by hand), but a sha256 already recorded is never blanked by a
+    later metadata-only pass.
+    """
+    conn.execute(
+        "INSERT INTO tpro_file (tpro_file_id, load_id, filename, mime, file_type_id, file_type_name, "
+        "comments, upload_by_id, date_created, bytes, sha256, seen_at, downloaded_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(tpro_file_id) DO UPDATE SET load_id=excluded.load_id, filename=excluded.filename, "
+        "mime=excluded.mime, file_type_id=excluded.file_type_id, file_type_name=excluded.file_type_name, "
+        "comments=excluded.comments, upload_by_id=excluded.upload_by_id, seen_at=excluded.seen_at, "
+        "bytes=COALESCE(excluded.bytes, tpro_file.bytes), "
+        "sha256=COALESCE(excluded.sha256, tpro_file.sha256), "
+        "downloaded_at=COALESCE(excluded.downloaded_at, tpro_file.downloaded_at)",
+        (int(f["id"]), load_id, f.get("fileName"), f.get("mimeType"), f.get("fileTypeId"),
+         f.get("fileTypeName"), f.get("comments"), f.get("uploadById"), f.get("dateCreated"),
+         size, sha256, now_iso(), now_iso() if sha256 else None))
+
+
+def tpro_files_needing_download(conn: sqlite3.Connection, load_ids: list[int] | None = None,
+                                type_ids: tuple[int, ...] = (), limit: int = 200) -> list[sqlite3.Row]:
+    """Paperwork on a load whose bytes the service has never seen.
+
+    Restricted by type on purpose: a load's File History is mostly rate confirmations and billing
+    packets that TransportPro generated itself, and downloading those would be work with no
+    possible outcome. The caller passes the types that can carry driver paperwork.
+    """
+    sql = ("SELECT * FROM tpro_file WHERE sha256 IS NULL")
+    params: list = []
+    if type_ids:
+        sql += " AND file_type_id IN (" + ",".join("?" * len(type_ids)) + ")"
+        params += list(type_ids)
+    if load_ids:
+        sql += " AND load_id IN (" + ",".join("?" * len(load_ids)) + ")"
+        params += list(load_ids)
+    sql += " ORDER BY load_id, date_created LIMIT ?"
+    params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
+def tpro_file_for_sha(conn: sqlite3.Connection, sha256: str) -> sqlite3.Row | None:
+    """A TransportPro file carrying these exact bytes - the fallback when no Gmail part does."""
+    return conn.execute(
+        "SELECT * FROM tpro_file WHERE sha256=? ORDER BY date_created DESC LIMIT 1", (sha256,)).fetchone()
 
 
 def source_part(conn: sqlite3.Connection, sha256: str) -> sqlite3.Row | None:

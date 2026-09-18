@@ -246,19 +246,37 @@ def candidates(conn: sqlite3.Connection, limit: int = 200) -> list[tuple[int, st
 
 # ------------------------------------------------------------------ the write ----
 
-def fetch_bytes(conn: sqlite3.Connection, gmail, sha256: str) -> tuple[bytes, str]:
-    """Re-fetch a document from Gmail. The service stores the hash, never the bytes."""
-    src = db.source_part(conn, sha256)
-    if src is None:
-        raise RuntimeError(f"no re-fetchable source for {sha256[:12]}: no part row carries an attachment id")
-    data = gmail.attachment_bytes(src["message_id"], src["attachment_id"])
+def fetch_bytes(conn: sqlite3.Connection, gmail, sha256: str, tpro=None) -> tuple[bytes, str]:
+    """Re-fetch a document by its hash. The service stores the hash, never the bytes.
+
+    Gmail first, because most documents arrive that way and the attachment ids stay valid for the
+    life of the message. A document the service only ever saw ON the load - scanned by Loop C, never
+    emailed - has no part row at all, and TransportPro is then the only place its bytes exist. That
+    fallback needs a client, so a caller that cannot supply one still gets the old behaviour.
+
+    Either way the hash is verified before the bytes are trusted: whichever source answered, if it
+    hands back something else then the reading on file describes a different document and must not
+    be used to type this one.
+    """
     import hashlib
+
+    src = db.source_part(conn, sha256)
+    if src is not None:
+        data, name = gmail.attachment_bytes(src["message_id"], src["attachment_id"]), src["filename"]
+    else:
+        row = db.tpro_file_for_sha(conn, sha256)
+        if row is None:
+            raise RuntimeError(f"no re-fetchable source for {sha256[:12]}: no Gmail part and no "
+                               f"TransportPro file carries these bytes")
+        if tpro is None:
+            raise RuntimeError(f"{sha256[:12]} exists only on the load in TransportPro "
+                               f"(file {row['tpro_file_id']}); this call was given no TransportPro client")
+        data, _ = tpro.download_file(int(row["tpro_file_id"]))
+        name = row["filename"]
     got = hashlib.sha256(data).hexdigest()
     if got != sha256:
-        # The bytes are the identity of the document. If Gmail hands back something else, the
-        # reading on file describes a different file and must not be used to type this one.
         raise RuntimeError(f"re-fetched bytes do not match: expected {sha256[:12]}, got {got[:12]}")
-    return data, (src["filename"] or f"{sha256[:12]}.bin")
+    return data, (name or f"{sha256[:12]}.bin")
 
 
 def execute(conn: sqlite3.Connection, tpro, gmail, proposal: Proposal, *, dry_run: bool = True,
@@ -282,7 +300,9 @@ def execute(conn: sqlite3.Connection, tpro, gmail, proposal: Proposal, *, dry_ru
                           "documentType": proposal.document_type, "comments": proposal.comment,
                           "filename": proposal.filename}}
 
-    data, filename = fetch_bytes(conn, gmail, proposal.sha256)
+    # tpro as well as gmail: a document the service only ever saw ON the load has no Gmail
+    # part, and re-filing it under a clearing type is exactly the wrong_doc_type repair.
+    data, filename = fetch_bytes(conn, gmail, proposal.sha256, tpro=tpro)
     result = tpro.upload_file(record_type="Loads", record_id=proposal.load_id,
                               document_type=proposal.document_type, comments=proposal.comment or "",
                               filename=filename, data=data,

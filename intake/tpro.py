@@ -20,6 +20,9 @@ Endpoints, from the Public API Postman collection, with the quirks readiness.py 
                                               so document status is filtered client-side
   GET /dispatch/search?loadId=
   GET /files/search?recordType=loads&recordId=
+  GET /files/{id}                             the same object, plus the bytes in a base64 fileData
+                                              field (probed 18 Sep 2026). There is no raw-bytes
+                                              endpoint and no URL in the search response
   GET /dispatch/{id}/getTextMessages
 """
 from __future__ import annotations
@@ -157,6 +160,24 @@ class TransportPro:
 
     def files(self, load_id: int) -> list[dict]:
         return self.results(self.get("/files/search", {"recordType": "loads", "recordId": str(load_id)}))
+
+    def download_file(self, file_id: int) -> tuple[bytes, dict]:
+        """The bytes of a file already attached to a load, with its metadata.
+
+        This is what lets the service look at paperwork it did not receive by email. 74 in-view
+        loads carry nothing but a Driver Supplied BOL: the document is physically there and the
+        status is stuck because of its type, and until now the service could see that the file
+        existed but never what was on it.
+
+        Free, like every other read here - it is the model that costs money, not the download. The
+        response is the search object with a base64 `fileData` field added, so the metadata comes
+        back with the bytes and the caller needs no second call to know the type it was filed under.
+        """
+        payload = self.get(f"/files/{int(file_id)}")
+        raw = payload.get("fileData") if isinstance(payload, dict) else None
+        if not raw:
+            raise TProError(0, f"/files/{file_id}", "response carries no fileData")
+        return base64.b64decode(raw), payload
 
     def text_messages(self, dispatch_id: int) -> list[dict]:
         """Optional evidence; a failure here must never fail a load check."""

@@ -12,6 +12,8 @@ r"""Command line for the intake service.
   python -m intake backfill                  one-off mail history for loads new to the view
   python -m intake backfill --restale 24     ... and re-search loads still short paperwork
   python -m intake reconsider --loads 1,2    re-take attachments the free filters dropped
+  python -m intake tpro-scan                 look at the paperwork already ON the stuck loads
+  python -m intake tpro-scan --read          ... and read what has never been read
   python -m intake read --loads 1,2,3         read documents already ingested but never read
   python -m intake loads                     Loop B: check every load whose next check is due
   python -m intake queue                     the work queue, most urgent first
@@ -34,7 +36,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from intake import db, export, filing, gmail as gm, ingest, loadloop, review, tpro as tp  # noqa: E402
+from intake import db, export, filing, gmail as gm, ingest, loadloop, review, tpro as tp, tprodocs  # noqa: E402
 from pod_intake.localenv import load_local_env  # noqa: E402
 
 DEFAULT_DB = HERE / "out" / "intake.sqlite3"
@@ -115,6 +117,15 @@ def cmd_load(args) -> int:
         dup = f" (appeared {f['seen']}x in the thread)" if f["seen"] > 1 else ""
         typ = f["document_type"] or "not read yet"
         print(f"  {f['sha256'][:12]}  {(f['filename'] or '')[:40]:42} {f['bytes'] // 1024:5} KB  {typ}{dup}")
+    on_load = tprodocs.summary(conn, lid)
+    if on_load:
+        print(f"\n{len(on_load)} file(s) attached to the load in TransportPro:")
+        for f in on_load:
+            known = (f"reads as {f['document_type']}" if f["read_"] else
+                     ("bytes known, not read" if f["sha256"] else "not downloaded"))
+            same = f"  [same bytes as {f['mail_copies']} mail copy/copies]" if f["mail_copies"] else ""
+            print(f"  {(f['file_type_name'] or '')[:22]:24} {(f['filename'] or '')[:22]:24} "
+                  f"{(f['comments'] or '')[:20]:22} {known}{same}")
     dropped = db.dropped_parts(conn, lid)
     if dropped:
         print(f"\n{len(dropped)} attachment(s) the free filters dropped before any download:")
@@ -195,6 +206,34 @@ def cmd_reconsider(args) -> int:
                                  max_spend_usd=args.max_spend, limit=args.limit, verbose=True)
     print(f"\nrecovered {st.parts['keep']}, read {st.reads}, errors {st.read_errors}, "
           f"spend ${st.cost_usd:.3f}")
+    _print_health(conn)
+    return 0
+
+
+def cmd_tpro_scan(args) -> int:
+    """Loop C: look at the documents already attached to loads whose status has not cleared.
+
+    Listing and downloading are free; only --read costs money, and the ledger's de-duplication means
+    a file that also arrived by email is identified for nothing.
+    """
+    conn = db.connect(args.db)
+    client = tp.from_env()
+    loads = ([int(x) for x in args.loads.replace(",", " ").split()] if args.loads
+             else tprodocs.due_loads_for_scan(conn, tprodocs.SCAN_STATES, args.limit))
+    if not loads:
+        print("no loads to scan: nothing in-view is carrying paperwork under a type that has not cleared.")
+        return 0
+    reader = ingest.make_reader(args.model) if args.read else None
+    print(f"scanning {len(loads)} load(s) for paperwork already on the load"
+          + (f", reading what is new with {args.model}" if reader else ", recording and hashing only"))
+    st = tprodocs.scan_pass(conn, client, load_ids=loads, reader=reader, limit=args.limit,
+                            max_spend_usd=args.max_spend, verbose=args.verbose)
+    print("\n" + tprodocs.line(st, len(loads)) + f"   ({client.calls} TransportPro calls)")
+    both = conn.execute(
+        "SELECT COUNT(*) FROM tpro_file t WHERE t.sha256 IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM part p WHERE p.sha256 = t.sha256)").fetchone()[0]
+    total = conn.execute("SELECT COUNT(*) FROM tpro_file WHERE sha256 IS NOT NULL").fetchone()[0]
+    print(f"  {both} of {total} hashed file(s) on loads are byte-identical to something in the mail ledger")
     _print_health(conn)
     return 0
 
@@ -437,6 +476,15 @@ def main() -> int:
                          "Loop A cannot look backwards and Loop B never calls Gmail")
     bf.add_argument("-v", "--verbose", action="store_true")
     bf.set_defaults(fn=cmd_backfill)
+
+    ts = sub.add_parser("tpro-scan", help="look at the paperwork already attached to stuck loads")
+    ts.add_argument("--loads", default=None, help="comma-separated load numbers; default the stuck ones")
+    ts.add_argument("--limit", type=int, default=50)
+    ts.add_argument("--read", action="store_true", help="read what has never been read (costs money)")
+    ts.add_argument("--model", default="claude-opus-5")
+    ts.add_argument("--max-spend", type=float, default=None)
+    ts.add_argument("-v", "--verbose", action="store_true")
+    ts.set_defaults(fn=cmd_tpro_scan)
 
     rc = sub.add_parser("reconsider", help="re-take attachments the free filters dropped, by load")
     rc.add_argument("--loads", required=True, help="comma-separated load numbers. Required: this is "
