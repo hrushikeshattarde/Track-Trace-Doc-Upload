@@ -225,7 +225,62 @@ def classify_type(ex: Extraction, load: dict | None) -> tuple[str, str]:
     return "Bill Of Lading", f"no receiver signature; pickup copy{pickup_times}"
 
 
-def filing_comment(doc_type: str, load_id: int, channel: str, when: datetime, decision: str, signals: list[Signal]) -> str:
-    """PRD Section 8 comment format."""
-    top = "; ".join(s.detail for s in signals if s.strength == "strong")[:120] or "; ".join(s.detail for s in signals)[:120]
-    return f"{doc_type} for load - {load_id} | via {channel} {when.strftime('%m/%d/%Y %H:%M')} ET | {decision} | match: {top}"
+COMMENT_MAX = 480          # defensive; TransportPro does not document a limit for file comments
+
+
+def signals_detail(signals: list[Signal]) -> str:
+    """The strongest evidence from the matcher, for the comment. Strong signals if there are any,
+    otherwise whatever there is."""
+    return ("; ".join(s.detail for s in signals if s.strength == "strong")[:120]
+            or "; ".join(s.detail for s in signals)[:120])
+
+
+def page_summary(ex: Extraction) -> str:
+    """What is actually on the paper, in the few words a reviewer wants in the File History column.
+
+    This is the half of the comment that was missing. "Bill Of Lading for load - 2572445" says what
+    the service FILED it as; it never said what the service READ. Those differ in exactly the case
+    that matters - a page filed as a Driver Supplied BOL that is a signed POD - and the comment is
+    the only place that survives, because TransportPro renames every upload to <fileId>_<typeId>.
+    """
+    bits = [ex.document_type.replace("_", " ")]
+    sig = ex.signatures
+    if sig.receiver_signed:
+        who, when_ = (sig.receiver_name or "").strip(), (sig.receiver_date or "").strip()
+        bits.append("receiver signed" + (f" by {who}" if who else "") + (f" {when_}" if when_ else ""))
+    elif sig.stamp_present:
+        bits.append("receiving stamp, no signature")
+    else:
+        bits.append("no receiver signature")
+    if ex.times.check_out:
+        at = ex.times.at_stop
+        bits.append(f"out {ex.times.check_out}" + (f" at the {at}" if at != "unknown" else ", stop unstated"))
+    if len(ex.pages) > 1:
+        bits.append(f"{len(ex.pages)} pages")
+    return ", ".join(bits)
+
+
+def filing_comment(doc_type: str, load_id: int, channel: str, when: datetime, decision: str,
+                   match: str = "", page: str = "", was: str = "") -> str:
+    """PRD Section 8 comment format, with what the page says and where it came from.
+
+    `match` is why we believe the document belongs to this load, `page` is what the reader saw on
+    it, and `was` is the type it was previously filed under when this is a re-file. All three are
+    optional so a caller with less to say produces a shorter comment rather than empty fields - the
+    service used to pass no evidence at all and every comment ended in a bare "match:".
+    """
+    parts = [f"{doc_type} for load - {load_id}",
+             f"via {channel} {when.strftime('%m/%d/%Y %H:%M')} ET"]
+    if was:
+        parts.append(f"re-filed from {was}")
+    if page:
+        parts.append(f"page: {page}")
+    if match:
+        parts.append(f"match: {match}")
+    parts.append(decision)
+    out = " | ".join(parts)
+    # TransportPro's own comments run to about 50 characters and its limit is not documented, so a
+    # 300-character one could in principle be rejected and fail the upload. The fields are ordered
+    # most-important-first precisely so that clipping the tail costs the least, and the cap is
+    # defensive rather than measured - raise it once the real limit is known.
+    return out if len(out) <= COMMENT_MAX else out[:COMMENT_MAX - 1] + "…"

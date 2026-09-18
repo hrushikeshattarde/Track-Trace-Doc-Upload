@@ -19,7 +19,8 @@ from datetime import datetime
 from pathlib import Path
 
 from pod_intake.index import LoadIndex
-from pod_intake.matcher import classify_type, decide, filing_comment, score_candidates
+from pod_intake.matcher import (classify_type, decide, filing_comment, page_summary,
+                                signals_detail, score_candidates)
 from pod_intake.normalize import load_document
 from pod_intake.requirements import Requirements, check_document, parse_workbook
 from pod_intake.schema import Extraction
@@ -215,7 +216,9 @@ def report_match(name: str, ex: Extraction, index: LoadIndex, args, adjudicate_f
         print(f"   adjudicator: load {adj.load_id} conf {adj.confidence:.2f} - {adj.reasoning}")
         if adj.conflicts:
             print(f"   conflicts: {adj.conflicts}")
-    comment = filing_comment(doc_type, result.load_id, args.channel, datetime.now(), decision, cands[0].signals if cands else []) if result.load_id else "(no load)"
+    comment = (filing_comment(doc_type, result.load_id, args.channel, datetime.now(), decision,
+                              match=signals_detail(cands[0].signals) if cands else "",
+                              page=page_summary(ex)) if result.load_id else "(no load)")
     if pod_ctx:
         print(f"   pod: {pod_ctx['pod'] or 'unknown'} (terminal {pod_ctx['terminal_id']}) - {pod_ctx['status']}" + (f"; sheet '{pod_ctx['sheet']}' ({pod_ctx['map_confidence']} confidence mapping)" if pod_ctx.get('sheet') else ""))
     if rules:

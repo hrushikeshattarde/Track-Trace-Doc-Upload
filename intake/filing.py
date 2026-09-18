@@ -70,7 +70,7 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
         return Proposal(load_id, sha256, REVIEW, review.LOW_CONFIDENCE,
                         "not read yet: no extraction on file", None, None)
 
-    from pod_intake.matcher import classify_type, filing_comment
+    from pod_intake.matcher import classify_type, filing_comment, page_summary
     from pod_intake.schema import Extraction
 
     ex = Extraction.model_validate(json.loads(att["extraction_json"]))
@@ -116,6 +116,25 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
     #    stuck ones. What decides it is the document TYPE (state.CLEARING_TYPES), and classify_type
     #    already refuses to call anything a POD before the truck reaches the consignee.
 
+    # 5b. The comment, built here rather than at the end, because every branch below returns a
+    #     proposal and a reviewer who approves one needs to know what will be written to File
+    #     History. Passing None meant a re-file approved out of the queue - the wrong_doc_type
+    #     repair, the whole point of the queue - was uploaded with an EMPTY comment, and
+    #     TransportPro renames every upload to <fileId>_<typeId>, so nothing at all would have
+    #     survived to say what the document was or where it came from.
+    routing, conflicted = _routing_of(conn, load_id, sha256)
+    tpro_src = db.tpro_file_for_sha(conn, sha256)
+    channel = "email" if db.source_part(conn, sha256) is not None else "the load"
+    was = (f"{tpro_src['file_type_name']} {tpro_src['tpro_file_id']}"
+           if tpro_src is not None and tpro_src["file_type_name"] != doc_type else "")
+    match_detail = _match_detail(conn, load_id, sha256, routing)
+    page = page_summary(ex)
+
+    def mk_comment(decision: str) -> str:
+        c = filing_comment(doc_type, load_id, channel, _now(), decision,
+                           match=match_detail, page=page, was=was)
+        return f"{c} | {verdict_summary[:120]}" if verdict_summary else c
+
     # 6. Does this load actually need this document? Passing every safety gate is not the same as
     #    being work. Without this the auto gate fires on documents for loads that already show
     #    Documents Received, loads outside the worked service level, and BOLs for loads that are
@@ -137,18 +156,18 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
                         + (f" (state {load_state})" if load_state else " and has no ledger row")
                         + f", so whether it is short a {doc_type} is unknown. Run "
                         f"'python -m intake loads' and judge again",
-                        doc_type, None, filename, notes)
+                        doc_type, mk_comment("review"), filename, notes)
     if load_state in ("complete", "out_of_scope", "not_yet_due", "not_in_view"):
         return Proposal(load_id, sha256, REVIEW, review.NOT_NEEDED,
                         f"load is {load_state}: it is not short a document, so filing this adds a "
                         f"duplicate rather than clearing anything",
-                        doc_type, None, filename, notes)
+                        doc_type, mk_comment("review"), filename, notes)
     if load_state == "wrong_doc_type":
         return Proposal(load_id, sha256, REVIEW, review.WRONG_TYPE,
                         "the load's only paperwork is filed under a type that does not clear "
                         "Waiting for Documents (usually Driver Supplied BOL); filing this under a "
                         f"proper {doc_type} is what clears it",
-                        doc_type, None, filename, notes)
+                        doc_type, mk_comment("review"), filename, notes)
     if load_state == "filed_status_pending":
         # Only worth re-filing once the load is actually Delivered. Before that there is no
         # Delivered mark to be after, so "Waiting for Documents" is simply what an in-transit load
@@ -158,19 +177,18 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
                             f"already filed and the truck is {stage or 'still in transit'}: "
                             f"Waiting for Documents is expected until it delivers, so there is "
                             f"nothing to re-file yet",
-                            doc_type, None, filename, notes)
+                            doc_type, mk_comment("review"), filename, notes)
         return Proposal(load_id, sha256, REVIEW, review.REFILE,
                         "filed, Delivered, and documentStatus is still Waiting: re-filing after the "
                         "Delivered mark is the OQ-3 fix, and that is a person's call",
-                        doc_type, None, filename, notes)
+                        doc_type, mk_comment("review"), filename, notes)
     if needed and doc_type != needed:
         return Proposal(load_id, sha256, REVIEW, review.NOT_NEEDED,
                         f"the load is short a {needed} and this reads as a {doc_type}",
-                        doc_type, None, filename, notes)
+                        doc_type, mk_comment("review"), filename, notes)
 
     # 7. How the document reached this load. Anything weaker than the message's own subject line,
     #    or a thread whose binding was contradicted, is a person's call.
-    routing, conflicted = _routing_of(conn, load_id, sha256)
     if conflicted:
         gate, kind = REVIEW, review.CONFLICT
         reason = "a reply in this thread named a different load; the binding is contested"
@@ -178,10 +196,7 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
         gate, kind = REVIEW, review.LOW_CONFIDENCE
         reason = f"load resolved by the {routing} tier, not this message's own subject line"
 
-    comment = filing_comment(doc_type, load_id, "email", _now(), "auto" if gate == AUTO else "review",
-                             [])
-    if verdict_summary:
-        comment = f"{comment} | {verdict_summary[:120]}"
+    comment = mk_comment("auto" if gate == AUTO else "review")
 
     if gate == AUTO and not allow_auto:
         # Shadow mode: the proposal is sound, but nothing files without the operator saying so.
@@ -201,6 +216,29 @@ def _rules_for(conn, load_row, requirements_path):
     from pod_intake.requirements import Requirements
     reqs = Requirements.from_file(requirements_path)
     return reqs.for_customer(load_row["customer"], load_row["terminal"])
+
+
+def _match_detail(conn: sqlite3.Connection, load_id: int, sha256: str, routing: str | None) -> str:
+    """Why this document is believed to belong to this load, in words.
+
+    The routing tier is the evidence on the mail side, and it is worth naming precisely: "load
+    number in the subject line" is a different quality of claim from "the load an earlier message in
+    the thread resolved to", and a reviewer reading File History months later cannot tell them apart
+    from a tier name.
+    """
+    if routing == "subject":
+        row = conn.execute(
+            "SELECT m.subject_load_numbers FROM part p JOIN message m ON m.message_id = p.message_id "
+            "WHERE p.sha256=? AND m.load_id=? LIMIT 1", (sha256, load_id)).fetchone()
+        found = (row["subject_load_numbers"] if row else None) or str(load_id)
+        return f"load number {found} in the email subject"
+    if routing == "thread":
+        return "the load this email thread was already bound to"
+    if routing == "paper":
+        return "reference numbers on the document itself"
+    if db.tpro_file_for_sha(conn, sha256) is not None:
+        return f"already attached to load {load_id} in TransportPro"
+    return ""
 
 
 def _routing_of(conn, load_id: int, sha256: str) -> tuple[str | None, bool]:
