@@ -51,6 +51,9 @@ CADENCE_MINUTES: dict[str, int | None] = {
     # Nobody has read the document the claim rests on. Six-hourly, because reading it resolves this
     # on its own and the state exists to make that worth doing.
     "pod_unverified": 360,
+    # The POD is on the load under a label that does not say POD. Hourly: it is a minute's work for
+    # a person and the load cannot finish until somebody does it.
+    "pod_mislabelled": 60,
     "pod_expected": 15,
     "wrong_doc_type": 60,
     "bol_expected": 60,
@@ -142,6 +145,9 @@ def assess(load_id: int, load: dict, dispatches: list[dict], files: list[dict], 
     mailbox is something a size threshold threw away, that is what the person working the queue
     needs to be told - and on live data that is 4 of 761 in-view loads, not a banner on every row.
     """
+    # One lookup, at the top: the branches below do not all run, and the filed_status_pending
+    # path reached a `claims` that three different branches each assigned separately.
+    claims = pod_claims or {}
     status = load.get("status") or {}
     found_levels = service_levels(load)
     scope_levels = scope_levels or set()
@@ -171,7 +177,6 @@ def assess(load_id: int, load: dict, dispatches: list[dict], files: list[dict], 
         # page and the page disagrees, the load is not done, whatever the status says. This is the
         # only place in the service that contradicts documentStatus, and it earns that by having
         # looked: see db.filed_pod_claims and load 2580687.
-        claims = pod_claims or {}
         if claims.get("unsigned"):
             where = f" (TransportPro file {claims['unsigned_file']})" if claims.get("unsigned_file") else ""
             why = (f"documents received, but the POD on file{where} has no receiver signature and no "
@@ -190,16 +195,41 @@ def assess(load_id: int, load: dict, dispatches: list[dict], files: list[dict], 
         types = {f.get("fileTypeId") for f in filed}
         if not (types & CLEARING_TYPES):
             names = ", ".join(sorted({f.get("fileTypeName") or str(f.get("fileTypeId")) for f in filed}))
+            if claims.get("unclaimed"):
+                # Not just "re-file something" - re-file THIS one, and it is a POD. The service has
+                # read the page; saying so turns a vague instruction into a minute's work.
+                who = f" signed by {claims['unclaimed_by']}" if claims.get("unclaimed_by") else ""
+                why = (f"filed only as {names}, which does not clear Waiting for Documents - but "
+                       f"TransportPro file {claims['unclaimed_file']} on this load READS as a proof of "
+                       f"delivery{who}. Re-file that file as Proof of Delivery and the load is done")
+                return _row(load_id, load, "pod_mislabelled", stage, why, files)
             why = (f"filed only as {names}, which does not clear Waiting for Documents. The paperwork is "
                    f"on the load; re-file it as Bill Of Lading or Proof of Delivery and the status clears")
             return _row(load_id, load, "wrong_doc_type", stage, why, files)
         why = ("filed under a clearing type and still Waiting: does not fit the measured pattern, "
                "check by hand" + (f"; Delivered mark {delivered_at:%m/%d %H:%M}Z" if delivered_at else
                                   f"; truck is {stage}, a second document may still be due"))
+        # "Check by hand" is a lot easier when the service can say what the hand will find. Load
+        # 2576408 carries its signed POD twice, once as a Driver Supplied BOL and once as a Bill Of
+        # Lading, and neither says POD anywhere - so the person checking has no way to know the POD
+        # is already there unless something tells them which file it is.
+        if claims.get("unclaimed"):
+            who = f" signed by {claims['unclaimed_by']}" if claims.get("unclaimed_by") else ""
+            why += (f". TransportPro file {claims['unclaimed_file']} on this load reads as a proof of "
+                    f"delivery{who}, filed under a type that does not say POD")
         return _row(load_id, load, "filed_status_pending", stage, why, files)
 
     if rank < STAGE_ORDER["loaded"]:
         return _row(load_id, load, "not_yet_due", stage, f"truck is {stage}; no paperwork can exist yet", files)
+
+    if expects_pod and claims.get("unclaimed"):
+        # The load is not short a POD at all; it is short a correctly labelled one. Chasing the
+        # driver for a document already sitting on the load is the most expensive kind of wrong.
+        who = f" signed by {claims['unclaimed_by']}" if claims.get("unclaimed_by") else ""
+        why = (f"a proof of delivery{who} is ALREADY on this load as TransportPro file "
+               f"{claims['unclaimed_file']}, filed under a type that does not say POD. Nothing is "
+               f"missing - re-file that file as Proof of Delivery. Do not chase the driver")
+        return _row(load_id, load, "pod_mislabelled", stage, why, files)
 
     state = "pod_expected" if expects_pod else "bol_expected"
     want = "POD" if expects_pod else "BOL"

@@ -493,6 +493,13 @@ def filed_pod_claims(conn: sqlite3.Connection, load_id: int) -> dict:
     The reading is the only thing that can contradict the comment, so this returns the claim and the
     evidence side by side and lets assess() decide. `unsigned` is the confirmed case; `unread` is the
     honest one, because a claim nobody has looked at is not a claim anybody should rely on.
+
+    `unclaimed` is the mirror of all that, and load 2576408 is why it exists. Its receiver-signed
+    POD - Joseph Jarcimillo, 09/15/26, 6:14 PM - is on the load TWICE, once as a Driver Supplied BOL
+    commented "Driver Supplied Image" and once as a Bill Of Lading commented "Purchase Order", and
+    neither comment says POD. So nothing claims it, this function had nothing to check, and a load
+    whose customer requires a POD reads as having none while the signed POD sits on it. Over-claiming
+    is caught by `unsigned`; under-claiming needed its own count.
     """
     import json
     import re
@@ -503,22 +510,33 @@ def filed_pod_claims(conn: sqlite3.Connection, load_id: int) -> dict:
         "SELECT t.tpro_file_id, t.file_type_id, t.comments, t.sha256, a.extraction_json "
         "FROM tpro_file t LEFT JOIN attachment a ON a.sha256 = t.sha256 "
         "WHERE t.load_id = ?", (load_id,)).fetchall()
-    out = {"claimed": 0, "verified": 0, "unsigned": 0, "unread": 0, "unsigned_file": None}
+    out = {"claimed": 0, "verified": 0, "unsigned": 0, "unread": 0, "unsigned_file": None,
+           "unclaimed": 0, "unclaimed_file": None, "unclaimed_by": None}
     for r in rows:
         tid = r["file_type_id"]
+        if tid not in st.POD_TYPES and tid not in st.BOL_TYPES:
+            continue                      # a rate confirmation or a billing packet is never either
         by_comment = re.search(r"\bpod\b|proof|deliver", r["comments"] or "", re.I) is not None
-        if not (tid in st.POD_TYPES or (tid in st.BOL_TYPES and by_comment)):
-            continue
-        out["claimed"] += 1
-        if not r["extraction_json"]:
-            out["unread"] += 1
-            continue
-        sig = json.loads(r["extraction_json"]).get("signatures") or {}
-        if sig.get("receiver_signed") or sig.get("stamp_present"):
-            out["verified"] += 1
-        else:
-            out["unsigned"] += 1
-            out["unsigned_file"] = out["unsigned_file"] or r["tpro_file_id"]
+        claims_pod = tid in st.POD_TYPES or by_comment
+        read = json.loads(r["extraction_json"]) if r["extraction_json"] else None
+        sig = (read or {}).get("signatures") or {}
+        acknowledged = bool(sig.get("receiver_signed") or sig.get("stamp_present"))
+
+        if claims_pod:
+            out["claimed"] += 1
+            if read is None:
+                out["unread"] += 1
+            elif acknowledged:
+                out["verified"] += 1
+            else:
+                out["unsigned"] += 1
+                out["unsigned_file"] = out["unsigned_file"] or r["tpro_file_id"]
+        elif acknowledged:
+            # Nothing said this was a POD and the page says it is. Only a document the service has
+            # actually READ can land here, so this is evidence, never a guess from a filename.
+            out["unclaimed"] += 1
+            out["unclaimed_file"] = out["unclaimed_file"] or r["tpro_file_id"]
+            out["unclaimed_by"] = out["unclaimed_by"] or (sig.get("receiver_name") or None)
     return out
 
 
@@ -746,7 +764,7 @@ def due_loads(conn: sqlite3.Connection, limit: int = 100, in_view_only: bool = T
 # States where a load is still short the paperwork, so a second look at the mailbox can find
 # something. A complete load has nothing to recover and must not be re-searched.
 WAITING_STATES = ("pod_expected", "bol_expected", "wrong_doc_type", "filed_status_pending", "new",
-                  "pod_unsigned", "pod_unverified")
+                  "pod_unsigned", "pod_unverified", "pod_mislabelled")
 
 
 def loads_needing_backfill(conn: sqlite3.Connection, limit: int = 200,

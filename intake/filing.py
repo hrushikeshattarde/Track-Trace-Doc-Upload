@@ -200,7 +200,10 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
     # has already filed something claiming to be one. A real POD arriving by mail must be recognised
     # as wanted, or the one document that fixes the load would be turned away as a duplicate.
     needed = {"pod_expected": "Proof of Delivery", "bol_expected": "Bill Of Lading",
-              "pod_unsigned": "Proof of Delivery"}.get(load_state)
+              "pod_unsigned": "Proof of Delivery",
+              # A correctly typed POD still fixes a mislabelled one, and it is the likelier repair
+              # when a driver re-sends: file the new one properly rather than re-typing the old.
+              "pod_mislabelled": "Proof of Delivery"}.get(load_state)
     #    A load drain has not reached yet answers none of that. "new" is what upsert_load inserts and
     #    what every load created from the mail side carries until Loop B checks it, and "error" is a
     #    load TransportPro could not be read for; both mean the same thing here - nothing is KNOWN

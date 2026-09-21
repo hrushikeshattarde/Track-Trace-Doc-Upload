@@ -193,7 +193,10 @@ def work_queue(conn, limit: int = 40) -> list[Any]:
     # pod_unsigned leads because it is the only state that is actively lying to everybody else: the
     # load reads Documents Received, billing is open, and the POD does not exist. Everything below it
     # is at least honest about being unfinished.
-    order = ("pod_unsigned", "pod_expected", "bol_expected", "pod_unverified",
+    # pod_mislabelled sits second: it is the cheapest money on the board, a minute's re-filing on a
+    # load whose paperwork is already there, and it is above pod_expected because chasing a driver
+    # for a document that is on the load is worse than not chasing at all.
+    order = ("pod_unsigned", "pod_mislabelled", "pod_expected", "bol_expected", "pod_unverified",
              "filed_status_pending", "wrong_doc_type", "error", "not_yet_due", "out_of_scope",
              "complete")
     cases = " ".join(f"WHEN '{s}' THEN {i}" for i, s in enumerate(order))

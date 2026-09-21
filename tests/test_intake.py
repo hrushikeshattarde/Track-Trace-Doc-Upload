@@ -402,6 +402,31 @@ def test_state_machine() -> None:
 
     a = state.assess(1, received, delivered, [tp_file(360)])
     check("no claim recorded yet still reads complete", a["state"] == "complete", a["state"])
+
+    # The mirror of all that, from load 2576408 on 21 Sep 2026. Its receiver-signed POD - Joseph
+    # Jarcimillo, 09/15/26 6:14 PM - sits on the load as a Driver Supplied BOL commented "Driver
+    # Supplied Image", so NOTHING claims it is a POD. Over-claiming was caught; under-claiming left
+    # a load reading as short a POD while the signed POD was on it.
+    unclaimed = {"claimed": 0, "verified": 0, "unsigned": 0, "unread": 0, "unsigned_file": None,
+                 "unclaimed": 1, "unclaimed_file": 31294705, "unclaimed_by": "Joseph Jarcimillo"}
+
+    a = state.assess(1, tp_load(), [{"id": 9, "status": "Delivered"}], [tp_file(363, comment="Driver Supplied Image")],
+                     pod_claims=unclaimed)
+    check("a POD filed under a non-clearing type is not just wrong_doc_type",
+          a["state"] == "pod_mislabelled", a["state"])
+    check("and the action names the file to re-file", "31294705" in a["action"], a["action"])
+    check("and who signed it", "Joseph Jarcimillo" in a["action"], a["action"])
+
+    a = state.assess(1, tp_load(), [{"id": 9, "status": "At Consignee"}], [], pod_claims=unclaimed)
+    check("a load 'short a POD' that already has one is not short a POD",
+          a["state"] == "pod_mislabelled", a["state"])
+    check("and it says not to chase the driver", "not chase the driver" in a["action"], a["action"])
+
+    a = state.assess(1, tp_load(), [{"id": 9, "status": "At Consignee"}], [])
+    check("without the evidence it still asks for the POD, as before",
+          a["state"] == "pod_expected", a["state"])
+
+    a = state.assess(1, received, delivered, [tp_file(360)])
     check("a complete load is never polled again", a["next_check_at"] is None)
 
     a = state.assess(1, tp_load(levels=("Flexible / FCFS",)), [{"id": 9, "status": "Loaded"}], [],
