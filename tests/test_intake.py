@@ -144,6 +144,39 @@ def test_pii_gate() -> None:
           filing.mentions_personal_id("trailer license plate 1054078 ST, and a photo of a passport"))
 
 
+def test_receiving_stamp_is_acknowledgement() -> None:
+    """Load 2580959's Magna BOL carries a FORD NATIONAL PARTS / RECEIVED stamp and no signature
+    anywhere. Every other part of the service counts a stamp; classify_type was the one that did
+    not, so the page that would clear the load was typed as the pickup copy."""
+    print("a receiving stamp is acknowledgement")
+    from pod_intake.matcher import classify_type
+    from pod_intake.schema import Extraction
+
+    def page(doc_type, *, stamp=False, signed=False, check_out=None, at_stop="unknown"):
+        d = _extraction(doc_type)
+        d["signatures"] = {"shipper_signed": False, "driver_signed": False,
+                           "receiver_signed": signed, "stamp_present": stamp}
+        d["times"] = {"check_in": None, "check_out": check_out, "source": "none", "at_stop": at_stop}
+        return Extraction.model_validate(d)
+
+    stamped = page("proof_of_delivery", stamp=True)
+    t, why = classify_type(stamped, {"dispatch_status": "Delivered"})
+    check("a stamped POD at the consignee is a POD", t == "Proof of Delivery", f"{t}: {why}")
+    check("and the reason names the stamp", "receiving stamp" in why, why)
+
+    t, _ = classify_type(stamped, {"dispatch_status": "Loaded"})
+    check("but never before the truck gets there", t == "Bill Of Lading", t)
+
+    # A company stamp on a pickup copy must not promote it: the reader has to have called it a POD.
+    t, _ = classify_type(page("bill_of_lading", stamp=True), {"dispatch_status": "Delivered"})
+    check("a stamp on a page the reader calls a BOL promotes nothing", t == "Bill Of Lading", t)
+
+    t, _ = classify_type(page("proof_of_delivery", signed=True), {"dispatch_status": "Delivered"})
+    check("a signature still works on its own", t == "Proof of Delivery", t)
+    t, _ = classify_type(page("proof_of_delivery"), {"dispatch_status": "Delivered"})
+    check("and a page with neither is still the pickup copy", t == "Bill Of Lading", t)
+
+
 def test_notifications() -> None:
     """The team hears what happened on their loads, once, with the reason."""
     print("notifications: what the team is told")
@@ -988,6 +1021,7 @@ if __name__ == "__main__":
     test_filters()
     test_photo_stamp()
     test_pii_gate()
+    test_receiving_stamp_is_acknowledgement()
     test_notifications()
     test_dedup_and_custody()
     test_max_defers_it_does_not_drop()

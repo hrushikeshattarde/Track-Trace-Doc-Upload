@@ -193,9 +193,24 @@ def classify_type(ex: Extraction, load: dict | None) -> tuple[str, str]:
     # withdraws the evidence - "unknown" is what every extraction read before this field existed
     # reports, and it has to keep meaning exactly what it meant then.
     delivery_times = bool(ex.times.check_out) and ex.times.at_stop != "shipper"
-    signed = ex.signatures.receiver_signed or delivery_times
+
+    # A receiving stamp is acknowledgement as surely as a signature. "FORD NATIONAL PARTS /
+    # RECEIVED" inked across a Magna bill of lading is the consignee saying they took the freight,
+    # and load 2580959's stamped copy was typed "Bill Of Lading - no receiver signature; likely the
+    # pickup copy" because this function was the ONLY place in the service that did not count one:
+    # requirements.check_document counts a stamp, db.filed_pod_claims counts a stamp, and the
+    # reader's own prompt says a sheet is a POD if a receiver "has signed OR STAMPED it".
+    #
+    # Paired with the reader's own classification on purpose. Signatures.stamp_present covers a
+    # receiving stamp, and a company stamp can set it too, so a shipper's stamp on a pickup copy
+    # would otherwise promote a BOL to a POD. Requiring both means the stamp only ever confirms
+    # what the page already reads as.
+    stamped_pod = ex.signatures.stamp_present and ex.document_type == "proof_of_delivery"
+    signed = ex.signatures.receiver_signed or stamped_pod or delivery_times
     if ex.signatures.receiver_signed:
         evidence = "receiver signature"
+    elif stamped_pod:
+        evidence = "a receiving stamp on the page"
     elif delivery_times:
         evidence = ("in/out times recorded at the consignee" if ex.times.at_stop == "consignee"
                     else "in/out times, though the page does not say which stop")

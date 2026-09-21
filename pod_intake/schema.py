@@ -35,7 +35,7 @@ class Signatures(BaseModel):
     receiver_signed: bool
     receiver_name: Optional[str] = None
     receiver_date: Optional[str] = Field(default=None, description="As written, e.g. '9-11-26'.")
-    stamp_present: bool = Field(default=False, description="True if a receiving or company stamp (inked or printed) appears on the page.")
+    stamp_present: bool = Field(default=False, description="True if a RECEIVING stamp - one that says the consignee took the freight, such as 'RECEIVED' with a date - appears on the page, inked or printed. A shipper's or a company's own stamp, or a letterhead logo, is not one.")
 
 
 class Times(BaseModel):
