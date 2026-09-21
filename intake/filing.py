@@ -138,9 +138,15 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
         verdict = check_document(ex, doc_type, rules, {"dispatch_status": stage.title()}, set())
         verdict_summary = verdict.summary
         notes.append(verdict_summary)
-        if re.search(r"\bfail|missing|BLOCKED", verdict_summary, re.I):
+        # verdict.failed, not a regex over verdict.summary. Reading the prose meant any rule whose
+        # DETAIL happened to contain "fail" or "missing" gated the document, whatever its status -
+        # so an informational note could condemn a perfectly good BOL, and a genuine failure worded
+        # without those words would have slipped through. The structured list is what the checker
+        # actually decided.
+        if verdict.failed:
             gate, kind = REVIEW, review.RULES_FAILED
-            reason = f"customer requirements not met: {verdict_summary[:120]}"
+            reason = ("customer requirements not met: "
+                      + "; ".join(r.detail for r in verdict.failed))[:180]
 
     # 5. Nothing to hold for timing. This used to withhold any POD until the Delivered mark, on the
     #    OQ-3 theory that an earlier upload leaves the status stuck. Measured over 266 loads on

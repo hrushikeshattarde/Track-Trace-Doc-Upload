@@ -330,10 +330,25 @@ def check_document(ex: Extraction, filed_type: str, rules: dict | None, load: di
     if is_bol and rules.get("bol_before_leaving_shipper") and stage in ("Delivered", "At Consignee"):
         add("bol_timing", "fail", f"BOL required before leaving the shipper; arrived with dispatch {stage}")
 
-    # deliver-out readiness
+    # deliver-out readiness. This one is about the LOAD, not the document in hand, and that
+    # distinction was costing almost every bill of lading its verdict: a BOL can never be a POD, so
+    # for the 56 customers with pod_required it failed unconditionally, propose() read any "fail" as
+    # "customer requirements not met", and 48 of 95 read documents were gated to review on it.
+    # A bill of lading is not defective because the POD has not arrived yet.
+    #
+    # So it is only a pass/fail judgement on a POD, which is the only document that can satisfy it.
+    # On anything else it is recorded as unknown - still visible, still saying the load is not ready
+    # to deliver out, but not counted against the paperwork in front of us.
     if rules.get("pod_required"):
-        ready = is_pod and not [r for r in v.results if r.status == "fail"]
-        add("deliver_out_ready", "pass" if ready else "fail", "POD on file and passes checks; load may be delivered out" if ready else "POD required before delivering out; not yet satisfied")
+        if is_pod:
+            ready = not [r for r in v.results if r.status == "fail"]
+            add("deliver_out_ready", "pass" if ready else "fail",
+                "POD on file and passes checks; load may be delivered out" if ready
+                else "POD required before delivering out; not yet satisfied")
+        else:
+            add("deliver_out_ready", "unknown",
+                f"customer requires a POD before deliver-out; this is a {filed_type or 'document'}, "
+                f"so the load is not ready yet")
     if rules.get("deliver_out_with_detention") is False:
         add("detention_hold", "unknown", "customer requires the load to stay open while a detention/layover request is pending")
     return v
