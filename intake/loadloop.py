@@ -161,7 +161,8 @@ def drain(conn, tpro: TransportPro, *, limit: int = 100, scope_levels: set[str] 
         docs, unread = db.load_doc_evidence(conn, load_id)
         dropped = db.load_dropped_evidence(conn, load_id)
         assessment = st.assess(load_id, load, dispatches, files, ledger_docs=docs, ledger_unread=unread,
-                               ledger_dropped=dropped, scope_levels=scope_levels)
+                               ledger_dropped=dropped, pod_claims=db.filed_pod_claims(conn, load_id),
+                               scope_levels=scope_levels)
         db.update_load(conn, load_id, assessment)
         ds.checked += 1
         ds.states[assessment["state"]] = ds.states.get(assessment["state"], 0) + 1
@@ -189,8 +190,12 @@ def pod_terminals(path) -> tuple[list[int], set[str]]:
 def work_queue(conn, limit: int = 40) -> list[Any]:
     """What a pod lead would work, most urgent first. Order matches the cadence: the POD window
     first, then BOLs, then the filed-but-stuck loads."""
-    order = ("pod_expected", "bol_expected", "filed_status_pending", "error", "not_yet_due",
-             "out_of_scope", "complete")
+    # pod_unsigned leads because it is the only state that is actively lying to everybody else: the
+    # load reads Documents Received, billing is open, and the POD does not exist. Everything below it
+    # is at least honest about being unfinished.
+    order = ("pod_unsigned", "pod_expected", "bol_expected", "pod_unverified",
+             "filed_status_pending", "wrong_doc_type", "error", "not_yet_due", "out_of_scope",
+             "complete")
     cases = " ".join(f"WHEN '{s}' THEN {i}" for i, s in enumerate(order))
     return conn.execute(
         f"SELECT * FROM load WHERE in_view = 1 AND state IS NOT NULL AND state != 'new' "

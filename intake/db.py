@@ -480,6 +480,48 @@ def tpro_files_needing_download(conn: sqlite3.Connection, load_ids: list[int] | 
     return conn.execute(sql, params).fetchall()
 
 
+def filed_pod_claims(conn: sqlite3.Connection, load_id: int) -> dict:
+    """What the load's filed paperwork CLAIMS about a proof of delivery, and whether the page agrees.
+
+    state.is_pod_file() reads a POD off the metadata - a clearing type with "POD" in the comment -
+    and on 18 Sep 2026 load 2580687 showed exactly what that costs. A rep filed the pickup BOL as
+    type 12 with the comment "POD"; the page carries the shipper's signature and the carrier's, and
+    nothing at all from the consignee. TransportPro cleared documentStatus to "Documents Received",
+    billing opened, and the POD that PPG's own stop note demands within 15 minutes of delivery does
+    not exist anywhere on the load.
+
+    The reading is the only thing that can contradict the comment, so this returns the claim and the
+    evidence side by side and lets assess() decide. `unsigned` is the confirmed case; `unread` is the
+    honest one, because a claim nobody has looked at is not a claim anybody should rely on.
+    """
+    import json
+    import re
+
+    from . import state as st
+
+    rows = conn.execute(
+        "SELECT t.tpro_file_id, t.file_type_id, t.comments, t.sha256, a.extraction_json "
+        "FROM tpro_file t LEFT JOIN attachment a ON a.sha256 = t.sha256 "
+        "WHERE t.load_id = ?", (load_id,)).fetchall()
+    out = {"claimed": 0, "verified": 0, "unsigned": 0, "unread": 0, "unsigned_file": None}
+    for r in rows:
+        tid = r["file_type_id"]
+        by_comment = re.search(r"\bpod\b|proof|deliver", r["comments"] or "", re.I) is not None
+        if not (tid in st.POD_TYPES or (tid in st.BOL_TYPES and by_comment)):
+            continue
+        out["claimed"] += 1
+        if not r["extraction_json"]:
+            out["unread"] += 1
+            continue
+        sig = json.loads(r["extraction_json"]).get("signatures") or {}
+        if sig.get("receiver_signed") or sig.get("stamp_present"):
+            out["verified"] += 1
+        else:
+            out["unsigned"] += 1
+            out["unsigned_file"] = out["unsigned_file"] or r["tpro_file_id"]
+    return out
+
+
 def tpro_file_for_sha(conn: sqlite3.Connection, sha256: str) -> sqlite3.Row | None:
     """A TransportPro file carrying these exact bytes - the fallback when no Gmail part does."""
     return conn.execute(
@@ -703,7 +745,8 @@ def due_loads(conn: sqlite3.Connection, limit: int = 100, in_view_only: bool = T
 
 # States where a load is still short the paperwork, so a second look at the mailbox can find
 # something. A complete load has nothing to recover and must not be re-searched.
-WAITING_STATES = ("pod_expected", "bol_expected", "wrong_doc_type", "filed_status_pending", "new")
+WAITING_STATES = ("pod_expected", "bol_expected", "wrong_doc_type", "filed_status_pending", "new",
+                  "pod_unsigned", "pod_unverified")
 
 
 def loads_needing_backfill(conn: sqlite3.Connection, limit: int = 200,

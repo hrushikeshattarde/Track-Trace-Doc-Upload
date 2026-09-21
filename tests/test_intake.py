@@ -319,6 +319,37 @@ def test_state_machine() -> None:
     a = state.assess(1, tp_load(doc_status="Documents Received"), [{"id": 9, "status": "Delivered"}],
                      [tp_file(360)])
     check("documents received is terminal", a["state"] == "complete")
+
+    # Load 2580687, 18 Sep 2026: a rep filed the pickup BOL as type 12 with the comment "POD", the
+    # status cleared, billing opened, and the page carries the shipper's and the carrier's signatures
+    # and nothing from the consignee. "Documents Received" is TransportPro agreeing with the comment,
+    # not with the paper, so where the service has READ the paper it has to be able to disagree.
+    delivered = [{"id": 9, "status": "Delivered"}]
+    received = tp_load(doc_status="Documents Received")
+    claimed = [tp_file(12, comment="POD")]
+
+    a = state.assess(1, received, delivered, claimed,
+                     pod_claims={"claimed": 1, "verified": 0, "unsigned": 1, "unread": 0,
+                                 "unsigned_file": 31334276})
+    check("a POD claim the page contradicts is not complete", a["state"] == "pod_unsigned", a["state"])
+    check("and it says billing will reject it", "Billing will reject" in a["action"], a["action"])
+    check("and it names the file so a person can open it", "31334276" in a["action"], a["action"])
+    due = state.utc(a["next_check_at"]) - dt.datetime.now(dt.timezone.utc)
+    check("it is re-checked daily, not never", 23 * 3600 < due.total_seconds() < 25 * 3600, f"{due}")
+
+    a = state.assess(1, received, delivered, claimed,
+                     pod_claims={"claimed": 1, "verified": 0, "unsigned": 0, "unread": 1,
+                                 "unsigned_file": None})
+    check("a POD claim nobody has read is not complete either", a["state"] == "pod_unverified", a["state"])
+    check("and it says how to settle it", "tpro-scan --read" in a["action"], a["action"])
+
+    a = state.assess(1, received, delivered, claimed,
+                     pod_claims={"claimed": 1, "verified": 1, "unsigned": 0, "unread": 0,
+                                 "unsigned_file": None})
+    check("a POD the page backs up IS complete", a["state"] == "complete", a["state"])
+
+    a = state.assess(1, received, delivered, [tp_file(360)])
+    check("no claim recorded yet still reads complete", a["state"] == "complete", a["state"])
     check("a complete load is never polled again", a["next_check_at"] is None)
 
     a = state.assess(1, tp_load(levels=("Flexible / FCFS",)), [{"id": 9, "status": "Loaded"}], [],

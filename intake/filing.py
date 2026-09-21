@@ -196,7 +196,11 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
     #    Documents Received, loads outside the worked service level, and BOLs for loads that are
     #    short a POD - 140 of the 153 that cleared the gates on the 15 Sep 2026 run.
     load_state = (load_row["state"] if load_row else "") or ""
-    needed = {"pod_expected": "Proof of Delivery", "bol_expected": "Bill Of Lading"}.get(load_state)
+    # pod_unsigned is short a POD exactly as pod_expected is - the difference is only that somebody
+    # has already filed something claiming to be one. A real POD arriving by mail must be recognised
+    # as wanted, or the one document that fixes the load would be turned away as a duplicate.
+    needed = {"pod_expected": "Proof of Delivery", "bol_expected": "Bill Of Lading",
+              "pod_unsigned": "Proof of Delivery"}.get(load_state)
     #    A load drain has not reached yet answers none of that. "new" is what upsert_load inserts and
     #    what every load created from the mail side carries until Loop B checks it, and "error" is a
     #    load TransportPro could not be read for; both mean the same thing here - nothing is KNOWN

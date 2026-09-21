@@ -45,6 +45,12 @@ STAGE_ORDER = {"planned": 0, "dispatched": 1, "at shipper": 2, "loaded": 3, "in 
                "at consignee": 4, "delivered": 5}
 
 CADENCE_MINUTES: dict[str, int | None] = {
+    # A load whose POD claim the page contradicts. Daily rather than never: a person has to act, but
+    # if they file a real POD the next check should notice and close it without being told.
+    "pod_unsigned": 1440,
+    # Nobody has read the document the claim rests on. Six-hourly, because reading it resolves this
+    # on its own and the state exists to make that worth doing.
+    "pod_unverified": 360,
     "pod_expected": 15,
     "wrong_doc_type": 60,
     "bol_expected": 60,
@@ -122,7 +128,7 @@ def next_check_at(state: str, now: dt.datetime | None = None) -> str | None:
 
 def assess(load_id: int, load: dict, dispatches: list[dict], files: list[dict], *,
            ledger_docs: int = 0, ledger_unread: int = 0, ledger_dropped: int = 0,
-           scope_levels: set[str] | None = None) -> dict:
+           pod_claims: dict | None = None, scope_levels: set[str] | None = None) -> dict:
     """One load's state, the reason, and when to look again.
 
     ledger_docs / ledger_unread come from the intake ledger rather than a Gmail search: Loop A has
@@ -160,6 +166,23 @@ def assess(load_id: int, load: dict, dispatches: list[dict], files: list[dict], 
     delivered_at = (utc(disp.get("lastUpdated"))
                     if (disp.get("status") or "").lower() == "delivered" and disp.get("lastUpdated") else None)
     if docs_received:
+        # "Documents Received" is TransportPro agreeing with whoever filed the document, and what it
+        # agrees with is the TYPE and the COMMENT - never the page. Where the service has read the
+        # page and the page disagrees, the load is not done, whatever the status says. This is the
+        # only place in the service that contradicts documentStatus, and it earns that by having
+        # looked: see db.filed_pod_claims and load 2580687.
+        claims = pod_claims or {}
+        if claims.get("unsigned"):
+            where = f" (TransportPro file {claims['unsigned_file']})" if claims.get("unsigned_file") else ""
+            why = (f"documents received, but the POD on file{where} has no receiver signature and no "
+                   f"receiving stamp: the page does not show the consignee took the freight. Billing "
+                   f"will reject this. A real POD is still needed")
+            return _row(load_id, load, "pod_unsigned", stage, why, files)
+        if claims.get("claimed") and claims.get("unread") and not claims.get("verified"):
+            why = (f"documents received on the strength of a comment: {claims['unread']} file(s) are "
+                   f"filed as the POD but none has been read, so nothing has checked that the "
+                   f"consignee actually signed. 'intake tpro-scan --read --loads {load_id}' settles it")
+            return _row(load_id, load, "pod_unverified", stage, why, files)
         return _row(load_id, load, "complete", stage, "documents received", files)
 
     if filed:
