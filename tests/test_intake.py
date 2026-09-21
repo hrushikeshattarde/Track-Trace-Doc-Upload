@@ -122,6 +122,28 @@ def test_filters() -> None:
     check("pdf passes geometry", filters.geometry_decision(b"%PDF-1.4" + b"x" * 1000)[0] == filters.KEEP)
 
 
+def test_pii_gate() -> None:
+    """The block gate never files and is never retried, so a false positive is permanent."""
+    print("the PII gate: an identity document, not the word")
+    real = ["a cell-phone photo of two Florida Class A CDL driver's licenses (personal identification)",
+            "photo of a passport page", "a scan of an identity card", "social security card"]
+    for t in real:
+        check(f"still blocked: {t[:34]}", filing.mentions_personal_id(t), t)
+
+    benign = ["An Illinois semi-trailer license plate reading 1054078 ST is legible",
+              "a Maine license plate at the bottom is partially visible",
+              "an Ontario TRAILER licence plate reading 'Z74 76F'",
+              "consignee and carrier signature lines are all blank; driver's license field empty",
+              "driver signature line signed, driver's license # left blank"]
+    for t in benign:
+        check(f"no longer blocked: {t[:34]}", not filing.mentions_personal_id(t), t)
+
+    check("a BOL that lists a licence NUMBER stays blocked, deliberately",
+          filing.mentions_personal_id("driver Ryan Harper, cell 501-580-5442, license 945840493 AR"))
+    check("a licence plate AND a real ID is still blocked",
+          filing.mentions_personal_id("trailer license plate 1054078 ST, and a photo of a passport"))
+
+
 def _extraction(doc_type: str = "bill_of_lading", **over) -> dict:
     """A minimal valid extraction with NO photo_stamp key - exactly the shape of every row written
     before the field existed, which is what makes it the right fixture for the default."""
@@ -896,6 +918,7 @@ if __name__ == "__main__":
     test_routing()
     test_filters()
     test_photo_stamp()
+    test_pii_gate()
     test_dedup_and_custody()
     test_max_defers_it_does_not_drop()
     test_cursor_written_last()

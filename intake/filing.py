@@ -39,6 +39,30 @@ from . import db, review, state as st
 # say what it is in notes. These are the words that mean a person's identity document.
 PII_RE = re.compile(r"licen[cs]e|passport|social security|\bid card\b|identity card|driver'?s? lic", re.I)
 
+# ...and these are the ways a page MENTIONS a licence without one being on it. The blob searched is
+# the reader's own prose describing the page, and a description names things the page is not: the
+# trailer's licence plate in a freight photo, the empty "driver's license #" box on a blank BOL form.
+#
+# Measured 21 Sep 2026 over the 25 documents this gate had blocked: 21 matched on "license plate" and
+# two on a licence field recorded as empty or blank. One was real - a phone photo of two Florida CDLs.
+# The block gate never files and is never retried, so a single word in a description had permanently
+# withheld 24 legitimate freight photos and bills of lading. They are stripped before the test rather
+# than the pattern being loosened, so nothing that actually says "passport" or "driver's licence"
+# stops being caught.
+# Only the two categories actually measured: the trailer's plate, and a licence box recorded as
+# unfilled. A BOL that LISTS a driver's licence number stays blocked - that is a real number on a
+# real page, and widening a privacy guard on a judgement call rather than a measurement is not a
+# trade worth making for two documents.
+PII_BENIGN = re.compile(
+    r"licen[cs]e\s+plate"
+    r"|licen[cs]e\s*(?:#|number|field)?\s*(?:is\s+)?(?:left\s+)?(?:blank|empty|not\s+filled)",
+    re.I)
+
+
+def mentions_personal_id(text: str | None) -> bool:
+    """Whether this page carries somebody's identity document, as opposed to mentioning the words."""
+    return PII_RE.search(PII_BENIGN.sub(" ", text or "")) is not None
+
 BLOCK = "block"
 HOLD = "hold"
 REVIEW = "review"
@@ -112,7 +136,7 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
 
     # 1. Never file a person's identity document, whatever else is true.
     blob = f"{ex.document_type} {getattr(ex, 'notes', '') or ''} {filename or ''}"
-    if PII_RE.search(blob):
+    if mentions_personal_id(blob):
         return Proposal(load_id, sha256, BLOCK, review.PII,
                         f"personal ID on the page ({(getattr(ex, 'notes', '') or '')[:80]}): never file",
                         None, None, filename)
