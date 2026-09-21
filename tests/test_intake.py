@@ -144,6 +144,57 @@ def test_pii_gate() -> None:
           filing.mentions_personal_id("trailer license plate 1054078 ST, and a photo of a passport"))
 
 
+def test_notifications() -> None:
+    """The team hears what happened on their loads, once, with the reason."""
+    print("notifications: what the team is told")
+    from intake import notify
+
+    conn = fresh_db()
+    conn.execute("INSERT INTO load (load_id, terminal, customer, in_view) VALUES (2578456, 1088, 'Acme Foods', 1)")
+    conn.execute("INSERT INTO load (load_id, terminal, customer, in_view) VALUES (2578457, 1088, 'Acme Foods', 1)")
+    conn.execute("INSERT INTO load (load_id, terminal, customer, in_view) VALUES (2578999, 1135, 'Other Co', 1)")
+
+    notify.record(conn, load_id=2578456, event=notify.FILED, sha256="a" * 64,
+                  document_type="Driver Supplied BOL", filename="bol.jpg")
+    notify.record(conn, load_id=2578457, event=notify.REFUSED, sha256="b" * 64,
+                  kind=review.NOT_NEEDED, document_type="Bill Of Lading", filename="x.pdf",
+                  reason="the load is short a Proof of Delivery and this reads as a Bill Of Lading")
+    notify.record(conn, load_id=2578999, event=notify.REFUSED, sha256="c" * 64,
+                  kind=review.PII, document_type=None, filename="licence.jpg")
+
+    rows = notify.pending(conn)
+    check("every event is recorded", len(rows) == 3, str(len(rows)))
+    check("a refusal carries the plain reason, not the kind name",
+          "not short this document" in [r["detail"] for r in rows if r["kind"] == review.NOT_NEEDED][0],
+          str([r["detail"] for r in rows]))
+    check("and the specific reason is kept too",
+          "short a Proof of Delivery" in [r["detail"] for r in rows if r["kind"] == review.NOT_NEEDED][0])
+    check("a PII refusal says why without naming the document",
+          "never file one" in [r["detail"] for r in rows if r["kind"] == review.PII][0])
+
+    notify.record(conn, load_id=2578456, event=notify.FILED, sha256="a" * 64,
+                  document_type="Driver Supplied BOL", filename="bol.jpg")
+    check("recording the same event twice does not repeat it", len(notify.pending(conn)) == 3)
+
+    groups = notify.digest(rows, group="terminal")
+    check("one message per terminal", len(groups) == 2, str([g[0] for g in groups]))
+    t1088 = next(g for g in groups if g[0] == "1088")
+    body = "\n".join(t1088[1])
+    check("it counts both outcomes", "1 document(s) filed, 1 not filed" in body, body)
+    check("and names the load against each", "2578457" in body, body)
+
+    n = notify.mark_delivered(conn, t1088[2], channel="test")
+    check("marking delivered stamps only that group", n == 2, str(n))
+    left = notify.pending(conn)
+    check("the other terminal is still pending", len(left) == 1 and left[0]["terminal"] == 1135)
+    check("a second mark cannot re-send it", notify.mark_delivered(conn, t1088[2], channel="test") == 0)
+
+    notify.record(conn, load_id=2578456, event=notify.FILED, sha256="a" * 64,
+                  document_type="CHANGED", filename="bol.jpg")
+    sent = conn.execute("SELECT document_type FROM notification WHERE load_id=2578456").fetchone()[0]
+    check("a delivered notice is never rewritten behind the reader", sent == "Driver Supplied BOL", sent)
+
+
 def _extraction(doc_type: str = "bill_of_lading", **over) -> dict:
     """A minimal valid extraction with NO photo_stamp key - exactly the shape of every row written
     before the field existed, which is what makes it the right fixture for the default."""
@@ -919,6 +970,7 @@ if __name__ == "__main__":
     test_filters()
     test_photo_stamp()
     test_pii_gate()
+    test_notifications()
     test_dedup_and_custody()
     test_max_defers_it_does_not_drop()
     test_cursor_written_last()

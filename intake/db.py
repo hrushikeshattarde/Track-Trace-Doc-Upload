@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # Backoff for a failed read, by attempt. After the last one the file is left alone and reported as
 # a permanent failure: a .MOV or a corrupt part fails identically every time, and retrying it on a
@@ -188,6 +188,30 @@ CREATE TABLE IF NOT EXISTS filing (
     PRIMARY KEY (load_id, sha256)
 );
 
+-- What the team is told. One row per thing that HAPPENED on a load - a document filed, or refused
+-- with the reason - recorded whether or not any channel is switched on, so the account of what the
+-- bot did exists from the first run and turning delivery on later loses nothing.
+--
+-- delivered_at is the guard against saying the same thing twice, exactly as filing's UNIQUE key is
+-- the guard against filing the same document twice. A send that fails leaves the row pending.
+CREATE TABLE IF NOT EXISTS notification (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    load_id       INTEGER NOT NULL,
+    sha256        TEXT,
+    event         TEXT NOT NULL,      -- filed | refused
+    kind          TEXT,               -- review.KIND_* when it was refused
+    headline      TEXT NOT NULL,
+    detail        TEXT,               -- the reason, in words a person can act on
+    document_type TEXT,
+    filename      TEXT,
+    terminal      INTEGER,            -- who it is for; resolved when the event is recorded
+    customer      TEXT,
+    created_at    TEXT,
+    delivered_at  TEXT,
+    channel       TEXT,               -- how it went, once it has
+    UNIQUE (load_id, sha256, event, kind)
+);
+
 -- Everything the service will not file by itself, with the reason. A reviewer's decision is
 -- recorded here and nowhere else, so "who approved this filing, and when" has one answer.
 -- No bytes: `sha256` plus the part rows are enough to re-fetch the document from Gmail on demand.
@@ -259,6 +283,7 @@ CREATE INDEX IF NOT EXISTS ix_load_due          ON load (next_check_at);
 CREATE INDEX IF NOT EXISTS ix_unresolved_retry  ON unresolved (next_retry_at);
 CREATE INDEX IF NOT EXISTS ix_tpro_file_load    ON tpro_file (load_id);
 CREATE INDEX IF NOT EXISTS ix_tpro_file_sha     ON tpro_file (sha256);
+CREATE INDEX IF NOT EXISTS ix_notification_open  ON notification (delivered_at, created_at);
 """
 
 
@@ -349,6 +374,14 @@ def migrate(conn: sqlite3.Connection) -> None:
             " date_created TEXT, bytes INTEGER, sha256 TEXT, seen_at TEXT, downloaded_at TEXT);"
             "CREATE INDEX IF NOT EXISTS ix_tpro_file_load ON tpro_file (load_id);"
             "CREATE INDEX IF NOT EXISTS ix_tpro_file_sha  ON tpro_file (sha256);")
+    if have < 11:
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS notification ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, load_id INTEGER NOT NULL, sha256 TEXT,"
+            " event TEXT NOT NULL, kind TEXT, headline TEXT NOT NULL, detail TEXT,"
+            " document_type TEXT, filename TEXT, terminal INTEGER, customer TEXT, created_at TEXT,"
+            " delivered_at TEXT, channel TEXT, UNIQUE (load_id, sha256, event, kind));"
+            "CREATE INDEX IF NOT EXISTS ix_notification_open ON notification (delivered_at, created_at);")
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -899,6 +932,8 @@ def counts(conn: sqlite3.Connection) -> dict[str, Any]:
         "reads_avoided": max(0, occurrences - unique_files),
         "model_spend_usd": round(q("SELECT COALESCE(SUM(cost_usd),0) FROM attachment"), 4),
         "filings": q("SELECT COUNT(*) FROM filing"),
+        "notices_pending": q("SELECT COUNT(*) FROM notification WHERE delivered_at IS NULL"),
+        "notices_sent": q("SELECT COUNT(*) FROM notification WHERE delivered_at IS NOT NULL"),
         "oldest_unresolved": oldest_unres,
         "in_view": q("SELECT COUNT(*) FROM load WHERE in_view=1"),
         "in_view_unbackfilled": q("SELECT COUNT(*) FROM load WHERE in_view=1 AND mail_backfilled_at IS NULL"),

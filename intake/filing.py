@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import db, review, state as st
+from . import db, notify, review, state as st
 
 # The reader is told to return "other"/"unknown" for anything that is not freight paperwork, and to
 # say what it is in notes. These are the words that mean a person's identity document.
@@ -447,6 +447,10 @@ def execute(conn: sqlite3.Connection, tpro, gmail, proposal: Proposal, *, dry_ru
                  "filed_at) VALUES (?,?,?,?,?,?)",
                  (proposal.load_id, proposal.sha256, file_id, uploaded_as,
                   proposal.comment, db.now_iso()))
+    notify.record(conn, load_id=proposal.load_id, event=notify.FILED, sha256=proposal.sha256,
+                  document_type=uploaded_as, filename=proposal.filename,
+                  reason=f"uploaded as {uploaded_as}"
+                         + (f", which reads as a {proposal.document_type}" if uploaded_as != proposal.document_type else ""))
     if review_id is not None:
         review.mark_filed(conn, review_id)
     # The load's state has changed; look at it again now rather than on its old cadence.

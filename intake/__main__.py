@@ -20,6 +20,7 @@ r"""Command line for the intake service.
 
   python -m intake file                      judge read documents into the review queue (no writes)
   python -m intake review                    what is waiting for a person
+  python -m intake notify                    what the team would be told, by terminal
   python -m intake review approve 12 --by me
   python -m intake file --execute            WRITES: upload what has been approved
   python -m intake export --out queue.csv    the review queue as a sheet, with the evidence
@@ -36,7 +37,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from intake import db, export, filing, gmail as gm, ingest, loadloop, review, tpro as tp, tprodocs  # noqa: E402
+from intake import (db, export, filing, gmail as gm, ingest, loadloop, notify, review,  # noqa: E402
+                    tpro as tp, tprodocs)
 from pod_intake.localenv import load_local_env  # noqa: E402
 
 DEFAULT_DB = HERE / "out" / "intake.sqlite3"
@@ -300,6 +302,12 @@ def cmd_propose(args) -> int:
         if p.gate != filing.AUTO:
             review.enqueue(conn, load_id=p.load_id, sha256=p.sha256, message_id=None, kind=p.kind,
                            reason=p.reason, proposed_type=p.document_type, proposed_comment=p.comment)
+            # notify.NOTIFIABLE, not "anything that is not shadow". The queue keeps every
+            # judgement; this only wakes somebody when there is something for them to do.
+            if p.kind in notify.NOTIFIABLE:
+                notify.record(conn, load_id=p.load_id, event=notify.REFUSED, sha256=p.sha256,
+                              kind=p.kind, document_type=p.document_type, filename=p.filename,
+                              reason=p.reason)
         if args.verbose or p.gate == filing.AUTO:
             print("  " + p.line())
     if pairs:
@@ -343,6 +351,31 @@ def cmd_propose(args) -> int:
         else:
             print(f"  - load {load_id} {sha[:12]}: {out.get('why')}")
     print(f"\nfiled {filed}, failed {failed}")
+    return 0
+
+
+def cmd_notify(args) -> int:
+    """What the team would be told, grouped the way it would be sent.
+
+    Prints by default and writes nothing. --mark records the digest as delivered, which is what a
+    real channel will call once it has confirmed the message went; it is separate so that building
+    a digest and sending one can never be confused for each other.
+    """
+    conn = db.connect(args.db)
+    rows = notify.pending(conn, limit=args.limit)
+    if not rows:
+        print("nothing to tell anybody: no filing or refusal has been recorded since the last digest.")
+        return 0
+    groups = notify.digest(rows, group=args.group_by)
+    print(f"{len(rows)} notice(s) across {len(groups)} {args.group_by}(s)\n")
+    for who, lines, ids in groups:
+        print(notify.render(who, lines, args.group_by))
+        print()
+    if args.mark:
+        n = notify.mark_delivered(conn, [i for _, _, ids in groups for i in ids], channel=args.channel)
+        print(f"marked {n} notice(s) delivered via '{args.channel}'")
+    else:
+        print("  nothing was marked delivered. Re-run with --mark once a channel has actually sent it.")
     return 0
 
 
@@ -522,6 +555,14 @@ def main() -> int:
                    help="WRITES TO TRANSPORTPRO: upload what has been approved. Off by default")
     f.add_argument("-v", "--verbose", action="store_true")
     f.set_defaults(fn=cmd_propose)
+
+    nt = sub.add_parser("notify", help="what the team would be told: filings and refusals, by team")
+    nt.add_argument("--group-by", default="terminal", choices=["terminal", "customer"])
+    nt.add_argument("--limit", type=int, default=500)
+    nt.add_argument("--mark", action="store_true",
+                    help="record these as delivered. Only for a channel that has actually sent them")
+    nt.add_argument("--channel", default="printed")
+    nt.set_defaults(fn=cmd_notify)
 
     rv = sub.add_parser("review", help="the review queue")
     rv.add_argument("action", nargs="?", choices=["list", "approve", "reject"], default="list")
