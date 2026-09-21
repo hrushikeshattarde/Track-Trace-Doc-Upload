@@ -304,7 +304,7 @@ def cmd_propose(args) -> int:
                            reason=p.reason, proposed_type=p.document_type, proposed_comment=p.comment)
             # notify.NOTIFIABLE, not "anything that is not shadow". The queue keeps every
             # judgement; this only wakes somebody when there is something for them to do.
-            if p.kind in notify.NOTIFIABLE:
+            if notify.worth_telling(p.kind, p.document_type):
                 notify.record(conn, load_id=p.load_id, event=notify.REFUSED, sha256=p.sha256,
                               kind=p.kind, document_type=p.document_type, filename=p.filename,
                               reason=p.reason)

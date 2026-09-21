@@ -41,6 +41,11 @@ POD_TYPES = {360: "Proof of Delivery", 53: "Delivery Receipt"}
 CLEARING_TYPES = {12, 360, 53}
 NON_CLEARING_TYPES = {363}
 
+# The same set by name, because the filing side works in type NAMES - that is what the upload
+# API takes and what File History shows. Derived rather than retyped so the two cannot drift.
+CLEARING_TYPE_NAMES = frozenset(
+    name for tid, name in {**BOL_TYPES, **POD_TYPES}.items() if tid in CLEARING_TYPES)
+
 STAGE_ORDER = {"planned": 0, "dispatched": 1, "at shipper": 2, "loaded": 3, "in transit": 3,
                "at consignee": 4, "delivered": 5}
 

@@ -149,6 +149,12 @@ def test_notifications() -> None:
     print("notifications: what the team is told")
     from intake import notify
 
+    check("only a clearing type is claimed to clear the status",
+          state.CLEARING_TYPE_NAMES == {"Bill Of Lading", "Proof of Delivery", "Delivery Receipt"},
+          str(state.CLEARING_TYPE_NAMES))
+    check("Driver Supplied BOL is not one of them",
+          "Driver Supplied BOL" not in state.CLEARING_TYPE_NAMES)
+
     conn = fresh_db()
     conn.execute("INSERT INTO load (load_id, terminal, customer, in_view) VALUES (2578456, 1088, 'Acme Foods', 1)")
     conn.execute("INSERT INTO load (load_id, terminal, customer, in_view) VALUES (2578457, 1088, 'Acme Foods', 1)")
@@ -175,6 +181,18 @@ def test_notifications() -> None:
     notify.record(conn, load_id=2578456, event=notify.FILED, sha256="a" * 64,
                   document_type="Driver Supplied BOL", filename="bol.jpg")
     check("recording the same event twice does not repeat it", len(notify.pending(conn)) == 3)
+
+    # A stuck load produces one wrong_doc_type refusal per document in its thread, and most of them
+    # cannot repair it. Only the ones that could are worth telling anybody.
+    check("a BOL on a stuck load is news", notify.worth_telling(review.WRONG_TYPE, "Bill Of Lading"))
+    check("so is a POD", notify.worth_telling(review.WRONG_TYPE, "Proof of Delivery"))
+    check("a freight photo on the same load is not",
+          not notify.worth_telling(review.WRONG_TYPE, "Photo"))
+    check("nor are shipping documents",
+          not notify.worth_telling(review.WRONG_TYPE, "Shipping Documents"))
+    check("a personal ID is news whatever the document type",
+          notify.worth_telling(review.PII, None))
+    check("a not_needed refusal never is", not notify.worth_telling(review.NOT_NEEDED, "Bill Of Lading"))
 
     groups = notify.digest(rows, group="terminal")
     check("one message per terminal", len(groups) == 2, str([g[0] for g in groups]))

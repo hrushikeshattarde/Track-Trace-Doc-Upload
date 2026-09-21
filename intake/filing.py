@@ -250,10 +250,18 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
                         f"duplicate rather than clearing anything",
                         doc_type, mk_comment("review"), filename, notes, file_as(doc_type))
     if load_state == "wrong_doc_type":
-        return Proposal(load_id, sha256, REVIEW, review.WRONG_TYPE,
-                        "the load's only paperwork is filed under a type that does not clear "
-                        "Waiting for Documents (usually Driver Supplied BOL); filing this under a "
-                        f"proper {doc_type} is what clears it",
+        # Only a clearing type clears. This used to interpolate whatever the document happened to
+        # be, so a freight photo on a stuck load was reported as "filing this under a proper Photo
+        # is what clears it" - advice that cannot work, told to a pod lead as though it could.
+        if doc_type in st.CLEARING_TYPE_NAMES:
+            why_wrong = ("the load's only paperwork is filed under a type that does not clear "
+                         "Waiting for Documents (usually Driver Supplied BOL); filing this under a "
+                         f"proper {doc_type} is what clears it")
+        else:
+            why_wrong = ("the load's paperwork is filed under a type that does not clear Waiting "
+                         f"for Documents - but this document is a {doc_type}, which cannot clear it "
+                         "either. The load still needs a Bill Of Lading or a Proof of Delivery")
+        return Proposal(load_id, sha256, REVIEW, review.WRONG_TYPE, why_wrong,
                         doc_type, mk_comment("review"), filename, notes, file_as(doc_type))
     if load_state == "filed_status_pending":
         # Only worth re-filing once the load is actually Delivered. Before that there is no

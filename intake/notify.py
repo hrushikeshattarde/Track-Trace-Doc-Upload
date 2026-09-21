@@ -28,7 +28,7 @@ from __future__ import annotations
 import sqlite3
 from collections import defaultdict
 
-from . import db, review
+from . import db, review, state as st
 
 FILED = "filed"
 REFUSED = "refused"
@@ -67,6 +67,23 @@ WHY_REFUSED = {
     review.SHADOW: "auto-filing is switched off, so every filing waits for a person",
     review.ERROR: "the upload failed",
 }
+
+
+def worth_telling(kind: str | None, document_type: str | None) -> bool:
+    """Whether this refusal is news, as opposed to merely true.
+
+    NOTIFIABLE says which kinds matter. This adds the one case where the kind is right and the
+    document is not: a load stuck behind a Driver Supplied BOL produces one wrong_doc_type refusal
+    for EVERY document in its thread, and most of them cannot fix it. Load 2580959 generated three
+    notices this way - two about freight photos - and a photo cannot be re-filed into a type that
+    clears the status. Only the document that could actually repair the load is worth waking
+    somebody for; the rest are in the queue if anyone wants them.
+    """
+    if kind not in NOTIFIABLE:
+        return False
+    if kind == review.WRONG_TYPE:
+        return document_type in st.CLEARING_TYPE_NAMES
+    return True
 
 
 def headline(event: str, load_id: int, document_type: str | None, filename: str | None) -> str:
