@@ -44,6 +44,27 @@ HOLD = "hold"
 REVIEW = "review"
 AUTO = "auto"
 
+# House policy: the TransportPro type a document is UPLOADED under, when that is deliberately not
+# the type it reads as. Set 18 Sep 2026 at Circle's request: anything the service reads as a bill of
+# lading is filed as Driver Supplied BOL, so a document the bot found is visibly a document the bot
+# found and a person decides when it counts for billing.
+#
+# Be clear-eyed about the cost, because this project measured it. Type 363 does NOT clear "Waiting
+# for Documents": over 266 loads on 15 Sep 2026, 94 of the 96 loads that cleared carried a type 12,
+# and 145 of the 170 still waiting had only a 363. So every BOL filed under this policy leaves its
+# load unbillable until somebody re-files it, and the service will go on reporting those loads as
+# wrong_doc_type - correctly, because that is what they are. The policy buys human control over
+# billing status and pays for it in loads that stay open.
+#
+# Emptying this dict restores filing under the type the document actually is. Nothing else needs to
+# change: the mapping is applied at the upload boundary only.
+FILE_AS: dict[str, str] = {"Bill Of Lading": "Driver Supplied BOL"}
+
+
+def file_as(document_type: str | None) -> str | None:
+    """The type to upload under. The document's real type everywhere else."""
+    return FILE_AS.get(document_type or "", document_type)
+
 
 @dataclass
 class Proposal:
@@ -52,14 +73,24 @@ class Proposal:
     gate: str
     kind: str | None            # review.KIND_* when the gate is not auto
     reason: str
-    document_type: str | None   # the TransportPro type name, recomputed now
+    document_type: str | None   # what the document IS - what every decision here is made on
     comment: str | None
     filename: str | None = None
     notes: list[str] = field(default_factory=list)
+    # What it will actually be UPLOADED as. Differs from document_type only where FILE_AS says so,
+    # and it is kept separate on purpose: every judgement in propose() - does the load need this,
+    # do the customer's rules pass - has to be made on what the document is, never on the label
+    # policy puts on it. Conflating the two would make a BOL fail its own load's "needs a BOL" test.
+    # LAST on purpose too: every existing call site passes filename and notes positionally, and
+    # slotting a new field in front of notes sent the notes list into the upload's documentType.
+    upload_as: str | None = None
 
     def line(self) -> str:
+        shown = self.document_type or "-"
+        if self.upload_as and self.upload_as != self.document_type:
+            shown = f"{shown} as {self.upload_as}"
         return (f"load {self.load_id}  {self.sha256[:12]}  {self.gate:6} "
-                f"{(self.document_type or '-'):22} {self.reason[:90]}")
+                f"{shown:42} {self.reason[:78]}")
 
 
 def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements_path: str | Path | None = None,
@@ -70,7 +101,8 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
         return Proposal(load_id, sha256, REVIEW, review.LOW_CONFIDENCE,
                         "not read yet: no extraction on file", None, None)
 
-    from pod_intake.matcher import classify_type, filing_comment, page_summary
+    from pod_intake.matcher import (brief_page_comment, classify_type, filing_comment,
+                                     page_summary)
     from pod_intake.schema import Extraction
 
     ex = Extraction.model_validate(json.loads(att["extraction_json"]))
@@ -130,10 +162,28 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
     match_detail = _match_detail(conn, load_id, sha256, routing)
     page = page_summary(ex)
 
+    # The long audited line no longer goes to TransportPro, but it is not thrown away: it names the
+    # channel, the routing evidence, the type this was previously filed under and the customer
+    # verdict, which is exactly what a reviewer needs and far too much for a column a person scans.
+    # It lives in the proposal's notes, where the queue and the CSV export both show it.
+    notes.append(filing_comment(doc_type, load_id, channel, _now(), "proposed",
+                                match=match_detail, page=page, was=was))
+
     def mk_comment(decision: str) -> str:
-        c = filing_comment(doc_type, load_id, channel, _now(), decision,
-                           match=match_detail, page=page, was=was)
-        return f"{c} | {verdict_summary[:120]}" if verdict_summary else c
+        """The File History comment: what the page is, in under ten words.
+
+        Short on purpose. It is the only thing on that row a billing or imaging specialist will
+        actually read, and under FILE_AS it is the only thing saying whether the page is a signed
+        POD or an unsigned BOL - because the type column will say Driver Supplied BOL either way.
+        `decision` is accepted so the signature matches every caller, but a gate label is not
+        something a specialist reading File History needs.
+
+        The load number is on the end because every comment already in Circle's File History carries
+        one ("Rate and Dispatch Confirmation for load - 2547060"), and a row that breaks the house
+        convention reads as a row somebody got wrong. It costs three words, so the description gets
+        seven and the whole comment stays inside ten.
+        """
+        return f"{brief_page_comment(ex, max_words=7)} - load {load_id}"
 
     # 6. Does this load actually need this document? Passing every safety gate is not the same as
     #    being work. Without this the auto gate fires on documents for loads that already show
@@ -156,18 +206,18 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
                         + (f" (state {load_state})" if load_state else " and has no ledger row")
                         + f", so whether it is short a {doc_type} is unknown. Run "
                         f"'python -m intake loads' and judge again",
-                        doc_type, mk_comment("review"), filename, notes)
+                        doc_type, mk_comment("review"), filename, notes, file_as(doc_type))
     if load_state in ("complete", "out_of_scope", "not_yet_due", "not_in_view"):
         return Proposal(load_id, sha256, REVIEW, review.NOT_NEEDED,
                         f"load is {load_state}: it is not short a document, so filing this adds a "
                         f"duplicate rather than clearing anything",
-                        doc_type, mk_comment("review"), filename, notes)
+                        doc_type, mk_comment("review"), filename, notes, file_as(doc_type))
     if load_state == "wrong_doc_type":
         return Proposal(load_id, sha256, REVIEW, review.WRONG_TYPE,
                         "the load's only paperwork is filed under a type that does not clear "
                         "Waiting for Documents (usually Driver Supplied BOL); filing this under a "
                         f"proper {doc_type} is what clears it",
-                        doc_type, mk_comment("review"), filename, notes)
+                        doc_type, mk_comment("review"), filename, notes, file_as(doc_type))
     if load_state == "filed_status_pending":
         # Only worth re-filing once the load is actually Delivered. Before that there is no
         # Delivered mark to be after, so "Waiting for Documents" is simply what an in-transit load
@@ -177,15 +227,15 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
                             f"already filed and the truck is {stage or 'still in transit'}: "
                             f"Waiting for Documents is expected until it delivers, so there is "
                             f"nothing to re-file yet",
-                            doc_type, mk_comment("review"), filename, notes)
+                            doc_type, mk_comment("review"), filename, notes, file_as(doc_type))
         return Proposal(load_id, sha256, REVIEW, review.REFILE,
                         "filed, Delivered, and documentStatus is still Waiting: re-filing after the "
                         "Delivered mark is the OQ-3 fix, and that is a person's call",
-                        doc_type, mk_comment("review"), filename, notes)
+                        doc_type, mk_comment("review"), filename, notes, file_as(doc_type))
     if needed and doc_type != needed:
         return Proposal(load_id, sha256, REVIEW, review.NOT_NEEDED,
                         f"the load is short a {needed} and this reads as a {doc_type}",
-                        doc_type, mk_comment("review"), filename, notes)
+                        doc_type, mk_comment("review"), filename, notes, file_as(doc_type))
 
     # 7. How the document reached this load. Anything weaker than the message's own subject line,
     #    or a thread whose binding was contradicted, is a person's call.
@@ -200,9 +250,12 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
 
     if gate == AUTO and not allow_auto:
         # Shadow mode: the proposal is sound, but nothing files without the operator saying so.
+        shown = doc_type if file_as(doc_type) == doc_type else f"{doc_type}, uploaded as {file_as(doc_type)}"
         return Proposal(load_id, sha256, REVIEW, review.SHADOW,
-                        f"would file as {doc_type} ({why[:80]})", doc_type, comment, filename, notes)
-    return Proposal(load_id, sha256, gate, kind, reason, doc_type, comment, filename, notes)
+                        f"would file as {shown} ({why[:80]})", doc_type, comment, filename, notes,
+                        file_as(doc_type))
+    return Proposal(load_id, sha256, gate, kind, reason, doc_type, comment, filename, notes,
+                    file_as(doc_type))
 
 
 def _now():
@@ -335,20 +388,27 @@ def execute(conn: sqlite3.Connection, tpro, gmail, proposal: Proposal, *, dry_ru
     if dry_run:
         return {"filed": False, "dry_run": True, "why": "dry run",
                 "would": {"recordType": "Loads", "recordId": proposal.load_id,
-                          "documentType": proposal.document_type, "comments": proposal.comment,
+                          "documentType": proposal.upload_as or proposal.document_type,
+                          "readAs": proposal.document_type, "comments": proposal.comment,
                           "filename": proposal.filename}}
 
     # tpro as well as gmail: a document the service only ever saw ON the load has no Gmail
     # part, and re-filing it under a clearing type is exactly the wrong_doc_type repair.
     data, filename = fetch_bytes(conn, gmail, proposal.sha256, tpro=tpro)
+    # upload_as, not document_type: FILE_AS decides the label on the row, the reading decides
+    # everything else. They are the same value unless house policy says otherwise.
+    uploaded_as = proposal.upload_as or proposal.document_type
     result = tpro.upload_file(record_type="Loads", record_id=proposal.load_id,
-                              document_type=proposal.document_type, comments=proposal.comment or "",
+                              document_type=uploaded_as, comments=proposal.comment or "",
                               filename=filename, data=data,
                               content_type=mimetypes.guess_type(filename)[0] or "application/octet-stream")
     file_id = str((result or {}).get("id") or (result or {}).get("fileId") or "")
+    # The type it was UPLOADED as is what the filing record keeps, because that is what a later
+    # reader of File History will see, and what decides whether the status cleared. What the
+    # document reads as is already on the attachment row.
     conn.execute("INSERT OR IGNORE INTO filing (load_id, sha256, tpro_file_id, document_type, comment, "
                  "filed_at) VALUES (?,?,?,?,?,?)",
-                 (proposal.load_id, proposal.sha256, file_id, proposal.document_type,
+                 (proposal.load_id, proposal.sha256, file_id, uploaded_as,
                   proposal.comment, db.now_iso()))
     if review_id is not None:
         review.mark_filed(conn, review_id)

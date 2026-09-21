@@ -227,6 +227,56 @@ def classify_type(ex: Extraction, load: dict | None) -> tuple[str, str]:
 
 COMMENT_MAX = 480          # defensive; TransportPro does not document a limit for file comments
 
+# Short names for the File History comment. The point of the brief comment is that a billing or
+# imaging specialist scanning the column sees what the PAGE is, in a glance, whatever type it was
+# filed under - which matters most when policy files everything as Driver Supplied BOL.
+SHORT_NAME = {
+    "bill_of_lading": "BOL",
+    "proof_of_delivery": "POD",
+    "shipping_document": "Shipping docs",
+    "lumper": "Lumper receipt",
+    "weight_ticket": "Scale ticket",
+    "reefer_log": "Reefer log",
+    "carrier_invoice": "Carrier invoice",
+    "rate_confirmation": "Rate confirmation",
+    "photo": "Freight photo",
+    "other": "Not paperwork",
+    "unknown": "Unreadable",
+}
+
+
+def brief_page_comment(ex: Extraction, max_words: int = 10) -> str:
+    """What the document is, in at most `max_words` words.
+
+    Built in order of what a reviewer needs, so that truncating the tail loses the least: what it
+    is, whether the receiver acknowledged it and when, then the page count. The word cap is enforced
+    rather than hoped for - the caller asked for under ten words and a chatty receiver name would
+    otherwise blow it.
+    """
+    bits = [SHORT_NAME.get(ex.document_type, ex.document_type.replace("_", " "))]
+    sig = ex.signatures
+    if sig.receiver_signed:
+        who = " ".join((sig.receiver_name or "").split()[:2]).strip(" ,.")
+        when_ = (sig.receiver_date or "").strip()
+        bits.append("signed" + (f" by {who}" if who else "") + (f" {when_}" if when_ else ""))
+    elif sig.stamp_present:
+        bits.append("stamped, unsigned")
+    elif ex.times.check_out and ex.times.at_stop != "shipper":
+        # The other delivery evidence, and the reason an unsigned page can still be typed a POD.
+        # Leaving it out made the comment read as a contradiction of its own File column: load
+        # 2576277 files as Proof of Delivery on an out time, and a comment saying only "BOL,
+        # unsigned" looks like somebody filed it wrong.
+        at = ex.times.at_stop
+        bits.append(f"out {ex.times.check_out}" + (f" at {at}" if at != "unknown" else ""))
+    elif ex.document_type in ("bill_of_lading", "proof_of_delivery"):
+        bits.append("unsigned")
+    pages = len(ex.pages)
+    if pages > 1:
+        bits.append(f"{pages} pages")
+    text = ", ".join(bits)
+    words = text.split()
+    return text if len(words) <= max_words else " ".join(words[:max_words])
+
 
 def signals_detail(signals: list[Signal]) -> str:
     """The strongest evidence from the matcher, for the comment. Strong signals if there are any,
