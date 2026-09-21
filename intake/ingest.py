@@ -570,14 +570,13 @@ def make_reader(model: str) -> Reader:
     """Adapter over pod_intake.reader. Bytes go to a temp file because normalize.load_document
     works on paths (PyMuPDF opens PDFs and images the same way), and the file is deleted straight
     after - the ledger keeps the hash and the extraction, never the document."""
-    import anthropic
-
-    from pod_intake import reader as claude_reader
+    from pod_intake import provider, reader as claude_reader
     from pod_intake.localenv import load_local_env
     from pod_intake.normalize import load_document
 
     load_local_env()
-    client = anthropic.Anthropic()
+    client, which = provider.make_client()
+    print(f"  reader: {model} via {provider.describe()}")
 
     def read(data: bytes, filename: str) -> tuple[dict, str, str, float]:
         suffix = Path(filename).suffix or (".pdf" if data[:5] == b"%PDF-" else ".png")

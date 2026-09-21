@@ -15,6 +15,11 @@ from .schema import Adjudication, Extraction, reader_json_schema
 
 # Anthropic list prices per million tokens (input, output). Cache reads are billed at ~0.1x input,
 # cache writes at ~1.25x input. Source: claude-api skill reference, 24 Jun 2026. Verify before budgeting.
+#
+# These are the FIRST-PARTY rates. Amazon Bedrock is partner-operated and priced separately, so on
+# Bedrock every cost this module reports is an estimate carried over from here - close enough for
+# the ledger's spend column to stay useful, not close enough to bill anybody from. Put AWS's own
+# per-token numbers in before treating a Bedrock total as the truth.
 PRICES = {
     "claude-opus-5": (5.00, 25.00),
     "claude-sonnet-5": (2.00, 10.00),
@@ -65,7 +70,9 @@ class Usage:
 
     @property
     def cost_usd(self) -> float:
-        key = self.model.split("/")[-1]                      # tolerate provider-prefixed slugs like anthropic/claude-opus-5
+        from .provider import base_model
+
+        key = base_model(self.model.split("/")[-1])          # tolerate openrouter's anthropic/... and bedrock's anthropic....
         inp, out = PRICES.get(key, PRICES.get(key.replace(".", "-"), (5.00, 25.00)))
         return (self.input_tokens * inp + self.cache_read * inp * 0.1 + self.cache_write * inp * 1.25 + self.output_tokens * out) / 1_000_000
 
@@ -113,12 +120,14 @@ def _extract_json(text: str) -> str:
     return t[start:end + 1] if start != -1 and end != -1 else t
 
 
-def _structured_call(client: anthropic.Anthropic, model: str, system: str, content: list[dict], schema_model, effort: str | None = None):
+def _structured_call(client, model: str, system: str, content: list[dict], schema_model, effort: str | None = None):
     """One call, schema-constrained where the endpoint supports it, tolerant where it does not.
 
-    Against the Anthropic API, output_config.format guarantees valid JSON. Third-party Anthropic-compatible
-    endpoints (for example OpenRouter's) may ignore the constraint or reject it; the first case is handled
-    by parsing the text ourselves, the second by retrying with the schema pasted into the prompt.
+    Against the Anthropic API, output_config.format guarantees valid JSON. Other endpoints - OpenRouter's
+    proxy, and Bedrock, whose feature parity trails the first-party API - may ignore the constraint or
+    reject it; the first case is handled by parsing the text ourselves, the second by retrying with the
+    schema pasted into the prompt. That fallback is what makes the Bedrock switch safe without knowing
+    in advance whether structured outputs are available there.
 
     effort ("low" | "medium" | "high") trades thinking depth for cost on Opus 5 / Sonnet 5. It is not sent
     for Haiku 4.5, which rejects the parameter.
@@ -169,7 +178,13 @@ def _structured_call(client: anthropic.Anthropic, model: str, system: str, conte
     return parsed, _usage(model, response)
 
 
-def read_document(client: anthropic.Anthropic, doc: Document, model: str, effort: str | None = None) -> tuple[Extraction, Usage]:
+def read_document(client, doc: Document, model: str, effort: str | None = None) -> tuple[Extraction, Usage]:
+    """`client` is whichever platform client provider.make_client() built - the Messages surface is
+    identical across Anthropic, Bedrock (AnthropicBedrockMantle) and the OpenRouter proxy, so
+    nothing below this line needs to know which one it is."""
+    from .provider import model_id
+
+    model = model_id(model)
     content = _page_blocks(doc)
     if doc.text_layer:
         content.append({"type": "text", "text": f"The file also carries this typed text layer (likely an app stamp, not part of the printed form):\n{doc.text_layer}"})
@@ -177,7 +192,10 @@ def read_document(client: anthropic.Anthropic, doc: Document, model: str, effort
     return _structured_call(client, model, READER_SYSTEM, content, Extraction, effort=effort)
 
 
-def adjudicate(client: anthropic.Anthropic, doc: Document, extraction: Extraction, candidates: list[dict], model: str, effort: str | None = None) -> tuple[Adjudication, Usage]:
+def adjudicate(client, doc: Document, extraction: Extraction, candidates: list[dict], model: str, effort: str | None = None) -> tuple[Adjudication, Usage]:
+    from .provider import model_id
+
+    model = model_id(model)
     content = _page_blocks(doc)
     content.append({"type": "text", "text": "Structured extraction of this document:\n" + extraction.model_dump_json(indent=1)})
     content.append({"type": "text", "text": "Candidate loads from the TMS (JSON):\n" + json.dumps(candidates, indent=1)})

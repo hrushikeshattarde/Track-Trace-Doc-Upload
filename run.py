@@ -125,10 +125,16 @@ def main() -> int:
         kind = "anthropic" if is_claude(slug) else "openai-compatible"
         if kind not in backends:
             if kind == "anthropic":
+                # provider.make_client() decides between the Anthropic API, Bedrock and the
+                # OpenRouter proxy, so the choice is made in one place rather than implied here by
+                # which environment variables happen to be set.
+                from pod_intake import provider
                 try:
-                    backends[kind] = (claude_reader, anthropic.Anthropic())
-                except anthropic.AnthropicError as e:
-                    raise SystemExit(f"Cannot create the Anthropic client: {e}\nSet ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN/ANTHROPIC_BASE_URL as described in README.md.")
+                    client, which = provider.make_client()
+                    print(f"   model backend: {provider.describe()}")
+                    backends[kind] = (claude_reader, client)
+                except (anthropic.AnthropicError, RuntimeError) as e:
+                    raise SystemExit(f"Cannot create the model client: {e}")
             else:
                 from pod_intake import reader_openai
                 try:

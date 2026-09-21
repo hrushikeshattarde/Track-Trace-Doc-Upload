@@ -197,6 +197,72 @@ def test_comment_never_prints_a_non_name() -> None:
         check(f"no gibberish for {str(described)[:26]!r}", "signed SEP 15" in c and "illegible" not in c, c)
 
 
+def test_provider_selection() -> None:
+    """Which platform the reader calls, and what the model is called there. No client is built and
+    nothing is sent - these are the two decisions that have to be right before either happens."""
+    print("provider: anthropic / bedrock / openrouter")
+    import os
+
+    from pod_intake import provider
+
+    keys = ("INTAKE_MODEL_PROVIDER", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN", "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        def only(**env):
+            for k in keys:
+                os.environ.pop(k, None)
+            os.environ.update({k: v for k, v in env.items() if v})
+
+        only(AWS_PROFILE="paybot-admin", AWS_REGION="us-east-1")
+        check("an AWS profile with no Anthropic key means bedrock", provider.provider() == "bedrock")
+
+        only(AWS_PROFILE="paybot-admin", AWS_REGION="us-east-1", ANTHROPIC_API_KEY="sk-ant-x")
+        check("but an Anthropic key still wins over an ambient AWS profile",
+              provider.provider() == "anthropic", provider.provider())
+
+        only(AWS_PROFILE="paybot-admin", ANTHROPIC_API_KEY="sk-ant-x",
+             INTAKE_MODEL_PROVIDER="bedrock")
+        check("and an explicit setting beats both", provider.provider() == "bedrock")
+
+        only(ANTHROPIC_BASE_URL="https://openrouter.ai/api", ANTHROPIC_AUTH_TOKEN="x")
+        check("an openrouter base url is recognised", provider.provider() == "openrouter")
+
+        only(ANTHROPIC_API_KEY="sk-ant-x")
+        check("a plain key is the anthropic api", provider.provider() == "anthropic")
+
+        only()
+        check("and nothing set falls back to the anthropic api", provider.provider() == "anthropic")
+
+        # The id sent over the wire is the only thing that changes per platform.
+        check("bedrock prefixes the model id",
+              provider.model_id("claude-opus-5", "bedrock") == "anthropic.claude-opus-5")
+        check("and never prefixes it twice",
+              provider.model_id("anthropic.claude-opus-5", "bedrock") == "anthropic.claude-opus-5")
+        check("the anthropic api takes the bare id",
+              provider.model_id("claude-opus-5", "anthropic") == "claude-opus-5")
+        check("and the cost table can still find the model",
+              provider.base_model("anthropic.claude-opus-5") == "claude-opus-5")
+
+        from pod_intake.reader import PRICES, Usage
+        u = Usage(model="anthropic.claude-opus-5", input_tokens=1_000_000, output_tokens=0,
+                  cache_read=0, cache_write=0)
+        check("so a bedrock usage row prices at the opus rate, not the fallback",
+              abs(u.cost_usd - PRICES["claude-opus-5"][0]) < 1e-9, f"{u.cost_usd}")
+
+        only(AWS_PROFILE="paybot-admin", INTAKE_MODEL_PROVIDER="bedrock")
+        try:
+            provider.make_client()
+            check("bedrock without a region is refused", False, "no error raised")
+        except RuntimeError as e:
+            check("bedrock without a region is refused, by name", "region" in str(e).lower(), str(e))
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
 def test_notifications() -> None:
     """The team hears what happened on their loads, once, with the reason."""
     print("notifications: what the team is told")
@@ -1046,6 +1112,7 @@ if __name__ == "__main__":
     test_pii_gate()
     test_receiving_stamp_is_acknowledgement()
     test_comment_never_prints_a_non_name()
+    test_provider_selection()
     test_notifications()
     test_dedup_and_custody()
     test_max_defers_it_does_not_drop()
