@@ -273,9 +273,19 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
                             f"Waiting for Documents is expected until it delivers, so there is "
                             f"nothing to re-file yet",
                             doc_type, mk_comment("review"), filename, notes, file_as(doc_type))
-        return Proposal(load_id, sha256, REVIEW, review.REFILE,
-                        "filed, Delivered, and documentStatus is still Waiting: re-filing after the "
-                        "Delivered mark is the OQ-3 fix, and that is a person's call",
+        # Same distinction as wrong_doc_type above, and it was missed here first time round: only a
+        # clearing type can end this. Load 2581544 produced three refile notices, two of them about
+        # freight photos, each offering re-filing as the fix - and re-filing a photo as a Photo
+        # clears nothing at all.
+        if doc_type in st.CLEARING_TYPE_NAMES:
+            why_refile = ("filed, Delivered, and documentStatus is still Waiting: re-filing this "
+                          f"{doc_type} after the Delivered mark is the OQ-3 fix, and that is a "
+                          "person's call")
+        else:
+            why_refile = (f"filed, Delivered, and documentStatus is still Waiting - but this is a "
+                          f"{doc_type}, which cannot clear it. Re-filing the load's Bill Of Lading "
+                          "or Proof of Delivery is what might")
+        return Proposal(load_id, sha256, REVIEW, review.REFILE, why_refile,
                         doc_type, mk_comment("review"), filename, notes, file_as(doc_type))
     if needed and doc_type != needed:
         return Proposal(load_id, sha256, REVIEW, review.NOT_NEEDED,

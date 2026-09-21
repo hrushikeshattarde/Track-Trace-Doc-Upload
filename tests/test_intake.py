@@ -177,6 +177,26 @@ def test_receiving_stamp_is_acknowledgement() -> None:
     check("and a page with neither is still the pickup copy", t == "Bill Of Lading", t)
 
 
+def test_comment_never_prints_a_non_name() -> None:
+    """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
+    handwritten SEP 15" on a row somebody has to make sense of."""
+    print("comments: a description of a signature is not a name")
+    from pod_intake.matcher import brief_page_comment
+    from pod_intake.schema import Extraction
+
+    def page(name):
+        d = _extraction("proof_of_delivery")
+        d["signatures"] = {"shipper_signed": False, "driver_signed": True, "receiver_signed": True,
+                           "receiver_name": name, "receiver_date": "SEP 15", "stamp_present": True}
+        return Extraction.model_validate(d)
+
+    check("a real name is used", "Kevin Washington" in brief_page_comment(page("Kevin Washington")))
+    for described in ("illegible handwritten signature (possibly 'Mitchell Wi')", "unreadable",
+                      "signature not legible", None):
+        c = brief_page_comment(page(described), max_words=7)
+        check(f"no gibberish for {str(described)[:26]!r}", "signed SEP 15" in c and "illegible" not in c, c)
+
+
 def test_notifications() -> None:
     """The team hears what happened on their loads, once, with the reason."""
     print("notifications: what the team is told")
@@ -221,6 +241,9 @@ def test_notifications() -> None:
     check("so is a POD", notify.worth_telling(review.WRONG_TYPE, "Proof of Delivery"))
     check("a freight photo on the same load is not",
           not notify.worth_telling(review.WRONG_TYPE, "Photo"))
+    check("a refile is judged the same way - a BOL can fix it",
+          notify.worth_telling(review.REFILE, "Bill Of Lading"))
+    check("and a photo cannot", not notify.worth_telling(review.REFILE, "Photo"))
     check("nor are shipping documents",
           not notify.worth_telling(review.WRONG_TYPE, "Shipping Documents"))
     check("a personal ID is news whatever the document type",
@@ -1022,6 +1045,7 @@ if __name__ == "__main__":
     test_photo_stamp()
     test_pii_gate()
     test_receiving_stamp_is_acknowledgement()
+    test_comment_never_prints_a_non_name()
     test_notifications()
     test_dedup_and_custody()
     test_max_defers_it_does_not_drop()

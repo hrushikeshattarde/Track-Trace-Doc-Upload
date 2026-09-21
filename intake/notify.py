@@ -69,6 +69,13 @@ WHY_REFUSED = {
 }
 
 
+# Both of these say "this load is stuck and re-filing something could fix it", so for both the
+# document in hand has to be something that CAN fix it. wrong_doc_type was handled first and refile
+# was missed, which is how load 2581544 came to send three notices about a stuck load, two of them
+# about freight photos.
+NEEDS_A_CLEARING_TYPE = frozenset({review.WRONG_TYPE, review.REFILE})
+
+
 def worth_telling(kind: str | None, document_type: str | None) -> bool:
     """Whether this refusal is news, as opposed to merely true.
 
@@ -81,7 +88,7 @@ def worth_telling(kind: str | None, document_type: str | None) -> bool:
     """
     if kind not in NOTIFIABLE:
         return False
-    if kind == review.WRONG_TYPE:
+    if kind in NEEDS_A_CLEARING_TYPE:
         return document_type in st.CLEARING_TYPE_NAMES
     return True
 

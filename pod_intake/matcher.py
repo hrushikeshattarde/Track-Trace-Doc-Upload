@@ -242,6 +242,21 @@ def classify_type(ex: Extraction, load: dict | None) -> tuple[str, str]:
 
 COMMENT_MAX = 480          # defensive; TransportPro does not document a limit for file comments
 
+# A receiver_name that describes the signature rather than naming anybody. The reader is
+# honest about what it cannot read - "illegible handwritten signature (possibly 'Mitchell
+# Wi...')" - and taking the first two words of that produced "POD, signed by illegible
+# handwritten SEP 15" on a File History row somebody has to make sense of. When the reader
+# could not read the name, saying "signed" and stopping is both shorter and more truthful.
+_NOT_A_NAME = re.compile(
+    r"illegible|unreadable|not\s+legible|unclear|scrawl|signature|handwritten|possibly|unknown|n/?a",
+    re.I)
+
+
+def receiver_name(sig) -> str:
+    """The receiver's name, or empty when the reader described the mark instead of reading it."""
+    who = (sig.receiver_name or "").strip()
+    return "" if not who or _NOT_A_NAME.search(who) else who
+
 # Short names for the File History comment. The point of the brief comment is that a billing or
 # imaging specialist scanning the column sees what the PAGE is, in a glance, whatever type it was
 # filed under - which matters most when policy files everything as Driver Supplied BOL.
@@ -271,7 +286,7 @@ def brief_page_comment(ex: Extraction, max_words: int = 10) -> str:
     bits = [SHORT_NAME.get(ex.document_type, ex.document_type.replace("_", " "))]
     sig = ex.signatures
     if sig.receiver_signed:
-        who = " ".join((sig.receiver_name or "").split()[:2]).strip(" ,.")
+        who = " ".join(receiver_name(sig).split()[:2]).strip(" ,.")
         when_ = (sig.receiver_date or "").strip()
         bits.append("signed" + (f" by {who}" if who else "") + (f" {when_}" if when_ else ""))
     elif sig.stamp_present:
@@ -311,7 +326,7 @@ def page_summary(ex: Extraction) -> str:
     bits = [ex.document_type.replace("_", " ")]
     sig = ex.signatures
     if sig.receiver_signed:
-        who, when_ = (sig.receiver_name or "").strip(), (sig.receiver_date or "").strip()
+        who, when_ = receiver_name(sig), (sig.receiver_date or "").strip()
         bits.append("receiver signed" + (f" by {who}" if who else "") + (f" {when_}" if when_ else ""))
     elif sig.stamp_present:
         bits.append("receiving stamp, no signature")
