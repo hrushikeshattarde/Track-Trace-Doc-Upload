@@ -122,6 +122,58 @@ def test_filters() -> None:
     check("pdf passes geometry", filters.geometry_decision(b"%PDF-1.4" + b"x" * 1000)[0] == filters.KEEP)
 
 
+def _extraction(doc_type: str = "bill_of_lading", **over) -> dict:
+    """A minimal valid extraction with NO photo_stamp key - exactly the shape of every row written
+    before the field existed, which is what makes it the right fixture for the default."""
+    d = {"document_type": doc_type, "document_type_confidence": 0.95, "numbers": [],
+         "shipper": {}, "consignee": {},
+         "signatures": {"shipper_signed": True, "driver_signed": True,
+                        "receiver_signed": False, "stamp_present": False},
+         "times": {"source": "none"}, "pages": [], "notes": ""}
+    d.update(over)
+    return d
+
+
+def test_photo_stamp() -> None:
+    """A camera overlay is the only evidence of where paperwork was photographed: load 2574983's
+    BOL photo carries no Exif at all - JFIF and an ICC profile, nothing else, because the scanning
+    apps strip it - while the camera's own text sits in the pixels naming the shipper's street."""
+    print("photo stamp: where the paperwork was photographed")
+    from pod_intake.reader import _output_format
+    from pod_intake.requirements import check_document
+    from pod_intake.schema import Extraction, PhotoStamp, reader_json_schema
+
+    check("an extraction written before the field existed still validates",
+          Extraction.model_validate(_extraction()).photo_stamp.present is False)
+    for label, sch in (("structured output", _output_format(Extraction)["schema"]),
+                       ("prompt fallback", reader_json_schema(Extraction))):
+        check(f"the model must answer present ({label})",
+              "present" in sch["$defs"]["PhotoStamp"]["required"], str(sch["$defs"]["PhotoStamp"]))
+
+    rules = {"customer": "Kalustyan Corporation", "bol_before_leaving_shipper": True}
+    load = {"dispatch_status": "Loaded"}
+
+    def timing(stamp):
+        d = _extraction()
+        d["shipper"] = {"name": "Kalustyan Corp.", "city": "Kenilworth", "state": "NJ"}
+        if stamp is not None:
+            d["photo_stamp"] = stamp
+        v = check_document(Extraction.model_validate(d), "Bill Of Lading", rules, load, set())
+        return next((r for r in v.results if r.rule == "bol_timing"), None)
+
+    check("no overlay leaves the rule unevaluated, as before", timing(None) is None)
+    check("and so does a photo with no stamp on it",
+          timing({"present": False}) is None)
+    at_shipper = timing({"present": True, "place": "251 South 31st Street, Kenilworth, New Jersey",
+                         "date": "16 Sep 2026", "time": "11:27:08 AM"})
+    check("a stamp naming the shipper's city PASSES the rule on evidence",
+          at_shipper is not None and at_shipper.status == "pass", str(at_shipper))
+    check("and it quotes where and when", at_shipper and "11:27" in at_shipper.detail, str(at_shipper))
+    elsewhere = timing({"present": True, "place": "Elyria, Ohio", "date": "17 Sep 2026"})
+    check("a stamp naming somewhere else is unknown, never a failure",
+          elsewhere is not None and elsewhere.status == "unknown", str(elsewhere))
+
+
 def test_dedup_and_custody() -> None:
     print("ingest: dedup, custody, replay")
     bol = png(1200, 1600, b"BOL")
@@ -818,6 +870,7 @@ def test_narrow_sweep_never_evicts() -> None:
 if __name__ == "__main__":
     test_routing()
     test_filters()
+    test_photo_stamp()
     test_dedup_and_custody()
     test_max_defers_it_does_not_drop()
     test_cursor_written_last()

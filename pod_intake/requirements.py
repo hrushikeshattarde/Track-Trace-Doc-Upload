@@ -265,6 +265,19 @@ class Verdict:
         return "meets " + self.customer + " requirements"
 
 
+def _names_place(text: str | None, party) -> bool:
+    """Whether a camera overlay names this party's city or state.
+
+    Deliberately loose, and only ever used to let a rule PASS on positive evidence: a stamp that
+    does not match is recorded as unknown, never as a failure, because overlays give a street and a
+    county and sometimes only coordinates, and absence of a match means the check could not be made
+    rather than that the driver did the wrong thing.
+    """
+    t = (text or "").lower()
+    city = (getattr(party, "city", None) or "").strip().lower()
+    return bool(city) and len(city) > 2 and city in t
+
+
 def check_document(ex: Extraction, filed_type: str, rules: dict | None, load: dict | None, name_signals: set[str]) -> Verdict:
     """filed_type is the TransportPro type the pipeline chose ('Bill Of Lading', 'Proof of Delivery', ...).
     name_signals: matcher signal names that fired (e.g. 'shipper_name', 'consignee_name') for the address check."""
@@ -325,10 +338,26 @@ def check_document(ex: Extraction, filed_type: str, rules: dict | None, load: di
         has_photo = any(p.role == "photo" for p in ex.pages)
         add("freight_photos", "pass" if has_photo else "unknown", "freight photo included" if has_photo else "freight photos required before leaving shipper; none in this submission")
 
-    # timing relative to dispatch stage (informational)
+    # timing relative to the dispatch stage, corroborated by the photo where the camera left a stamp
     stage = (load or {}).get("dispatch_status", "")
-    if is_bol and rules.get("bol_before_leaving_shipper") and stage in ("Delivered", "At Consignee"):
-        add("bol_timing", "fail", f"BOL required before leaving the shipper; arrived with dispatch {stage}")
+    if is_bol and rules.get("bol_before_leaving_shipper"):
+        stamp = getattr(ex, "photo_stamp", None)
+        where = " ".join(filter(None, [(stamp.place if stamp else None), (stamp.text if stamp else None)]))
+        at_shipper = bool(stamp and stamp.present and _names_place(where, ex.shipper))
+        if at_shipper:
+            # The rule is about WHERE the photo was taken, and the camera says. Before this the
+            # only signal was the dispatch stage, which says where the truck is NOW - a different
+            # question, and a stale status answered it wrongly in both directions.
+            when = f" at {stamp.time}" if stamp.time else ""
+            add("bol_timing", "pass",
+                f"photographed at {stamp.place or where.strip()}{when}, which names the shipper's "
+                f"city - taken at the shipper")
+        elif stage in ("Delivered", "At Consignee"):
+            add("bol_timing", "fail", f"BOL required before leaving the shipper; arrived with dispatch {stage}")
+        elif stamp and stamp.present:
+            add("bol_timing", "unknown",
+                f"photo stamp reads {(stamp.place or stamp.text or '')[:60]!r}, which does not name "
+                f"the shipper's city {ex.shipper.city or '(unknown)'}: cannot confirm it was taken there")
 
     # deliver-out readiness. This one is about the LOAD, not the document in hand, and that
     # distinction was costing almost every bill of lading its verdict: a BOL can never be a POD, so

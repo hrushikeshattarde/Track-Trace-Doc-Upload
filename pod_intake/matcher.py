@@ -307,6 +307,15 @@ def page_summary(ex: Extraction) -> str:
         bits.append(f"out {ex.times.check_out}" + (f" at the {at}" if at != "unknown" else ", stop unstated"))
     if len(ex.pages) > 1:
         bits.append(f"{len(ex.pages)} pages")
+    # Only on the long line, never the brief comment: where and when the photo was taken is what a
+    # reviewer settles a "before leaving the shipper" argument with, and it is far too many words
+    # for a column somebody scans.
+    stamp = getattr(ex, "photo_stamp", None)
+    if stamp is not None and stamp.present:
+        when_where = " ".join(filter(None, [stamp.date, stamp.time,
+                                            f"at {stamp.place}" if stamp.place else None,
+                                            stamp.coordinates]))
+        bits.append(f"photographed {when_where.strip()}" if when_where.strip() else "carries a camera stamp")
     return ", ".join(bits)
 
 

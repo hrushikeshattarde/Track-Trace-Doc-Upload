@@ -55,7 +55,7 @@ class Times(BaseModel):
 # `required`, which lets the model omit it, and the default then comes back indistinguishable from a
 # real answer. For at_stop that is precisely the ambiguity the field was added to remove: "unknown"
 # has to mean the reader looked at the page and could not tell, never that it was never asked.
-MUST_ANSWER: dict[str, tuple[str, ...]] = {"Times": ("at_stop",)}
+MUST_ANSWER: dict[str, tuple[str, ...]] = {"Times": ("at_stop",), "PhotoStamp": ("present",)}
 
 
 def reader_json_schema(model: type[BaseModel]) -> dict:
@@ -75,6 +75,26 @@ def reader_json_schema(model: type[BaseModel]) -> dict:
             required += [f for f in fields if f in (defn.get("properties") or {}) and f not in required]
             defn["required"] = required
     return schema
+
+
+class PhotoStamp(BaseModel):
+    """Text a camera or scanning app burned INTO the image: a timestamp, an address, coordinates.
+
+    Not EXIF, and that is the whole reason this exists. Checked on load 2574983's BOL photo
+    (21 Sep 2026): the file carries a JFIF header and an ICC profile and no Exif segment at all -
+    WhatsApp and the scanning apps strip it - while the camera's own overlay is plainly legible in
+    the pixels, reading "16 Sep 2026 11:27:08 AM / 251 South 31st Street / Kenilworth / Union County
+    / New Jersey". That is the shipper's own address, and it is exactly what Kalustyan's "must have
+    BOL before leaving the shipper" rule needs in order to be CHECKED rather than guessed at from
+    the dispatch stage. The pixels are the only copy, so the reader is the only thing that can get
+    it - there is no free path.
+    """
+    present: bool = Field(default=False, description="True if the image carries an overlay burned in by a camera or scanning app (a timestamp, an address, coordinates). Answer false rather than leaving it out.")
+    text: Optional[str] = Field(default=None, description="The whole overlay transcribed verbatim; join its lines with ' / '.")
+    place: Optional[str] = Field(default=None, description="Only the place from the overlay - street, city, state - as written.")
+    date: Optional[str] = Field(default=None, description="The date from the overlay, as written.")
+    time: Optional[str] = Field(default=None, description="The time from the overlay, as written.")
+    coordinates: Optional[str] = Field(default=None, description="Latitude and longitude if the overlay shows them, as written.")
 
 
 class PageInfo(BaseModel):
@@ -100,6 +120,7 @@ class Extraction(BaseModel):
     times: Times
     pieces: Optional[str] = None
     weight_lbs: Optional[str] = None
+    photo_stamp: PhotoStamp = Field(default_factory=PhotoStamp)
     pages: List[PageInfo]
     notes: str = Field(description="Anything a reviewer should know: handwriting, glare, several documents in one file, unusual layout.")
 
