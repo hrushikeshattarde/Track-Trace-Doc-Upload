@@ -13,7 +13,7 @@ at the same rate:
     bol_expected           1 h     customers who gate on "BOL before leaving the shipper"
     wrong_doc_type         1 h     paperwork is on the load under a type that does not clear it
     filed_status_pending   1 h     filed under a clearing type and still Waiting: check by hand
-    not_yet_due            6 h     no paperwork can exist; only the stage can change
+    not_yet_due            6 h     truck is short of the shipper; only the stage can change
     out_of_scope          24 h     service level does get corrected on a stop
     in_review              never   a person owns it; event-driven
     complete               never   terminal
@@ -268,8 +268,17 @@ def assess(load_id: int, load: dict, dispatches: list[dict], files: list[dict], 
                     f"delivery{who}, filed under a type that does not say POD")
         return _row(load_id, load, "filed_status_pending", stage, why, files)
 
-    if rank < STAGE_ORDER["loaded"]:
-        return _row(load_id, load, "not_yet_due", stage, f"truck is {stage}; no paperwork can exist yet", files)
+    # A BOL is signed AT THE SHIPPER. That is the moment it exists, not the moment the truck pulls
+    # away. Until 22 Sep 2026 this boundary was STAGE_ORDER["loaded"], so a truck standing on the
+    # dock read as "not yet due" and every document on it was dismissed as not needed: load 2589536
+    # carried a shipper-signed BOL, corroborated against TransportPro on both stop cities and the
+    # piece count, and the service answered "filing this adds a duplicate rather than clearing
+    # anything". 44 of the 90 rows in index/customer_requirements.json carry
+    # bol_before_leaving_shipper - they want the BOL during exactly the window this used to discard.
+    if rank < STAGE_ORDER["at shipper"]:
+        return _row(load_id, load, "not_yet_due", stage,
+                    f"truck is {stage}; it has not reached the shipper, so no paperwork can exist yet",
+                    files)
 
     if expects_pod and claims.get("unclaimed"):
         # The load is not short a POD at all; it is short a correctly labelled one. Chasing the

@@ -196,6 +196,24 @@ def test_comment_never_prints_a_non_name() -> None:
         c = brief_page_comment(page(described), max_words=7)
         check(f"no gibberish for {str(described)[:26]!r}", "signed SEP 15" in c and "illegible" not in c, c)
 
+    # A pickup BOL is signed by the shipper and nobody else yet. Calling that "unsigned" tells
+    # billing the driver came back with a blank page - see load 2589536, 22 Sep 2026.
+    def pickup_bol(shipper_signed=True):
+        d = _extraction("bill_of_lading")
+        d["signatures"] = {"shipper_signed": shipper_signed, "driver_signed": False,
+                           "receiver_signed": False, "receiver_name": None, "receiver_date": None,
+                           "stamp_present": False}
+        return Extraction.model_validate(d)
+
+    c = brief_page_comment(pickup_bol(), max_words=7)
+    check("a shipper-signed pickup BOL is not called unsigned", "unsigned" not in c, c)
+    check("and the comment says who signed it", "shipper signed" in c, c)
+    c = brief_page_comment(pickup_bol(shipper_signed=False), max_words=7)
+    check("a genuinely blank BOL is still unsigned", "unsigned" in c, c)
+    pod = brief_page_comment(page("Kevin Washington"))
+    check("a receiver-signed POD still reports the receiver, not the shipper",
+          "signed by Kevin Washington SEP 15" in pod and "shipper signed" not in pod, pod)
+
 
 def test_provider_selection() -> None:
     """Which platform the reader calls, and what the model is called there. No client is built and
@@ -564,6 +582,17 @@ def test_state_machine() -> None:
     due = state.utc(a["next_check_at"]) - dt.datetime.now(dt.timezone.utc)
     check("its next check is ~6 h out, not minutes", 5.5 * 3600 < due.total_seconds() < 6.5 * 3600,
           f"{due}")
+
+    # The boundary is the shipper, not departure. A BOL is signed at the dock, so a truck standing
+    # there is short a document, not waiting for one to become possible. This used to answer
+    # not_yet_due, which made state.shortfall() say NOTHING and dismissed real pickup BOLs as
+    # duplicates - load 2589536, 22 Sep 2026. 44 of 90 customer rows gate on this window.
+    a = state.assess(1, tp_load(), [{"id": 9, "status": "At Shipper"}], [], ledger_docs=1)
+    check("a truck AT the shipper is already short a BOL", a["state"] == "bol_expected", a["state"])
+    check("and a document on it counts as work", state.shortfall(a["state"]) == ("Bill Of Lading", state.NEEDS),
+          str(state.shortfall(a["state"])))
+    due = state.utc(a["next_check_at"]) - dt.datetime.now(dt.timezone.utc)
+    check("at-shipper is checked hourly, not six-hourly", due.total_seconds() < 1.5 * 3600, f"{due}")
 
     a = state.assess(1, tp_load(), [{"id": 9, "status": "Loaded"}], [], ledger_docs=2, ledger_unread=2)
     check("loaded with nothing filed wants the BOL", a["state"] == "bol_expected", a["state"])

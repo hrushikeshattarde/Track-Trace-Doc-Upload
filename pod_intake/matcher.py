@@ -298,6 +298,13 @@ def brief_page_comment(ex: Extraction, max_words: int = 10) -> str:
         # unsigned" looks like somebody filed it wrong.
         at = ex.times.at_stop
         bits.append(f"out {ex.times.check_out}" + (f" at {at}" if at != "unknown" else ""))
+    elif sig.shipper_signed and ex.document_type == "bill_of_lading":
+        # A pickup BOL's signature IS the shipper's - that is the whole document at that stage, and
+        # there is no receiver to sign yet. Until 22 Sep 2026 only receiver_signed and stamp_present
+        # were tested, so a shipper-signed pickup BOL went to File History as "BOL, unsigned": load
+        # 2589536, signed at Blackwood NJ, described to billing as if the driver had brought back a
+        # blank. Nothing upstream had surfaced it because at-shipper loads never reached the queue.
+        bits.append("shipper signed")
     elif ex.document_type in ("bill_of_lading", "proof_of_delivery"):
         bits.append("unsigned")
     pages = len(ex.pages)
