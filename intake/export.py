@@ -143,7 +143,8 @@ def build_rows(conn, tpro, *, limit: int = 500, load_ids: list[int] | None = Non
             "sha256": it["sha256"] or "",
         })
     order = {"READY - fills the gap": 0, "check signature": 1, "check match": 2,
-             "hold (delivered mark)": 3, "re-file to clear status": 4, "not needed": 5, "blocked": 6}
+             "check load state": 3, "hold (delivered mark)": 4, "re-file to clear status": 5,
+             "not needed": 6, "blocked": 7}
     # Gap first, then confidence, then how much the page corroborates. A perfectly corroborated
     # document on a load that already has that type filed is not work; it belongs below the fold.
     rows.sort(key=lambda r: (order.get(r["ready"], 9), -r["match_count"]))
@@ -152,29 +153,40 @@ def build_rows(conn, tpro, *, limit: int = 500, load_ids: list[int] | None = Non
 
 def _gap(load_state: str | None, proposed: str | None, filed_types: str | None,
          stage: str = "", delivered_at: str | None = None) -> tuple[str, str]:
-    """Does this document supply what the load is actually short of? Returns (fills_gap, note)."""
-    needed = {"pod_expected": "Proof of Delivery", "bol_expected": "Bill Of Lading"}.get(load_state or "")
-    filed = (filed_types or "").lower()
-    if load_state == "not_in_view":
-        return "no", ("the load is not on the Load Management view - it is outside the dashboard "
-                      "filter, so it is not Track & Trace work")
-    if load_state == "out_of_scope":
-        return "no", "load is not in the worked service level"
-    if load_state == "complete":
-        return "no", "load already shows Documents Received"
-    if load_state == "not_yet_due":
-        return "no", "truck has not loaded yet"
-    if load_state == "filed_status_pending":
-        if not delivered_at:
+    """Does this document supply what the load is actually short of? Returns (fills_gap, note).
+
+    The judgement itself lives in state.shortfall() and is shared with filing.propose(): keeping a
+    second copy here is what let pod_unverified read "not needed" on the sheet while the gate called
+    the same document "would file".
+    """
+    needed, verdict = st.shortfall(load_state)
+
+    if verdict == st.UNKNOWN:
+        return "unknown", (f"the load state {load_state or '(none)'!r} is not one this export knows, so "
+                           "whether it is short a document is unknown - a person should look")
+    if verdict == st.NOTHING:
+        why = {"complete": "load already shows Documents Received",
+               "not_yet_due": "truck has not loaded yet",
+               "out_of_scope": "load is not in the worked service level",
+               "not_in_view": "the load is not on the Load Management view, so it is not Track & Trace work",
+               }.get(load_state or "", "the load is not short a document")
+        return "no", why
+    if verdict == st.REFILE:
+        if load_state == "filed_status_pending" and not delivered_at:
             return "no", (f"already filed and the truck is {stage or 'still in transit'}; "
                           "Waiting for Documents is expected until it delivers, so nothing to do yet")
+        if load_state == "wrong_doc_type":
+            return "re-file", ("the paperwork is on the load under a type that does not clear the "
+                               "status; re-filing it properly is what clears it")
         return "re-file", ("filed, Delivered, and the status is still Waiting; re-filing after the "
-                           "Delivered mark is the OQ-3 fix")
-    if needed and proposed == needed:
+                           "Delivered mark is the fix")
+    if verdict == st.REVIEW:
+        return "unknown", (f"the load is {load_state}: the document it rests on has not been read, so "
+                           "whether this one helps is a person's call")
+    # NEEDS
+    if proposed == needed:
         return "yes", f"the load is short a {needed} and this is one"
-    if needed:
-        return "no", f"the load needs a {needed}, this is a {proposed}"
-    return "no", "the load is not short a document"
+    return "no", f"the load needs a {needed}, this is a {proposed}"
 
 
 def _looks_already_filed(it, filed: list[dict], conn) -> str:
@@ -241,6 +253,8 @@ def _verdict(it, ex, sig, n_match, stage, delivered_at, bol, pod, fills, gap_not
     bits.append(gap_note)
     reason = "; ".join(bits) + "."
 
+    if fills == "unknown":
+        return "check load state", reason
     if fills == "no":
         return "not needed", reason
     if fills == "re-file":

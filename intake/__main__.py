@@ -243,9 +243,18 @@ def cmd_tpro_scan(args) -> int:
 def cmd_read(args) -> int:
     conn = db.connect(args.db)
     loads = [int(x) for x in args.loads.replace(",", " ").split()] if args.loads else None
+    if args.retry_now:
+        n = db.clear_read_backoff(conn, loads)
+        if n:
+            print(f"cleared the retry delay on {n} document(s) - the cause is reported fixed")
     pend = db.unread_attachments(conn, load_ids=loads, in_view_only=not args.any_load, limit=args.limit)
     if not pend:
-        print("nothing to read: every document in scope already has an extraction.")
+        waiting = db.reads_in_backoff(conn, load_ids=loads, in_view_only=not args.any_load)
+        if waiting:
+            print(f"nothing readable right now: {waiting} document(s) failed and are waiting out a "
+                  f"retry delay. Re-run with --retry-now if the cause is fixed.")
+        else:
+            print("nothing to read: every document in scope already has an extraction.")
         return 0
     print(f"{len(pend)} document(s) to read with {args.model}. This costs money.")
     st = ingest.read_pending(conn, gm.from_env(), reader=ingest.make_reader(args.model),
@@ -534,6 +543,8 @@ def main() -> int:
     rd.add_argument("--limit", type=int, default=50)
     rd.add_argument("--model", default="claude-opus-5")
     rd.add_argument("--max-spend", type=float, default=None)
+    rd.add_argument("--retry-now", action="store_true",
+                    help="bring waiting retries forward: use after fixing credentials or credits")
     rd.set_defaults(fn=cmd_read)
 
     ld = sub.add_parser("loads", help="Loop B: check every load whose next check is due")

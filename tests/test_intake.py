@@ -1105,8 +1105,42 @@ def test_narrow_sweep_never_evicts() -> None:
     check("and the row survives", db.counts(conn)["loads"] == 1)
 
 
+def test_every_load_state_is_classified() -> None:
+    """A new load state must be taught to state.shortfall(), or it silently becomes "not needed".
+
+    On 21 Sep 2026 pod_unverified and pod_mislabelled existed in the state machine and in neither
+    classifier. The export answered "not needed" for every document on those loads while the gate
+    answered "would file" for the same documents, and the two were reconciled only because someone
+    happened to compare them. This test is what makes that impossible: it reads the states the
+    machine can actually emit and fails if the classifier has not been taught one.
+    """
+    print("classification: every load state has an answer")
+    import re as _re
+
+    src = (HERE / "intake" / "state.py").read_text(encoding="utf-8")
+    emitted = set(_re.findall(r'_row\(load_id, load, "([a-z_]+)"', src))
+    emitted |= set(state.CADENCE_MINUTES)      # anything given a cadence is a real state
+    emitted -= {"in_review"}                    # event-driven; never carries a document decision
+    missing = sorted(s for s in emitted if s not in state.SHORTFALL)
+    check("every state the machine emits is classified", not missing, f"unclassified: {missing}")
+
+    stray = {v for _, v in state.SHORTFALL.values()} - {
+        state.NEEDS, state.REFILE, state.NOTHING, state.REVIEW, state.UNKNOWN}
+    check("every verdict is one the callers handle", not stray, str(stray))
+
+    check("an unseen state answers UNKNOWN, never NOTHING",
+          state.shortfall("some_state_invented_next_month") == (None, state.UNKNOWN))
+    check("pod_unverified is no longer silently 'nothing'",
+          state.shortfall("pod_unverified")[1] != state.NOTHING)
+    check("bol_expected still asks for a BOL",
+          state.shortfall("bol_expected") == ("Bill Of Lading", state.NEEDS))
+    check("complete really is nothing",
+          state.shortfall("complete") == (None, state.NOTHING))
+
+
 if __name__ == "__main__":
     test_routing()
+    test_every_load_state_is_classified()
     test_filters()
     test_photo_stamp()
     test_pii_gate()

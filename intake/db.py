@@ -622,6 +622,39 @@ def unread_attachments(conn: sqlite3.Connection, *, load_ids: list[int] | None =
     return conn.execute(sql, params).fetchall()
 
 
+def reads_in_backoff(conn: sqlite3.Connection, *, load_ids: list[int] | None = None,
+                     in_view_only: bool = True) -> int:
+    """Documents that failed and are waiting out their retry delay.
+
+    Distinct from "already read": the difference matters to whoever just fixed the credential or
+    topped up the credits and wants to know whether there is anything left to do.
+    """
+    sql = ("SELECT COUNT(DISTINCT a.sha256) FROM attachment a "
+           "JOIN part p ON p.sha256 = a.sha256 AND p.decision = 'keep' "
+           "JOIN message m ON m.message_id = p.message_id "
+           "JOIN load l ON l.load_id = m.load_id "
+           "WHERE a.extraction_json IS NULL AND a.next_read_at IS NOT NULL AND a.next_read_at > ?")
+    params: list = [now_iso()]
+    if in_view_only:
+        sql += " AND l.in_view = 1"
+    if load_ids:
+        sql += " AND m.load_id IN (" + ",".join("?" * len(load_ids)) + ")"
+        params += list(load_ids)
+    return conn.execute(sql, params).fetchone()[0]
+
+
+def clear_read_backoff(conn: sqlite3.Connection, load_ids: list[int] | None = None) -> int:
+    """Bring every waiting retry forward to now. For an operator who has just fixed the cause -
+    the backoff protects a broken service, and there is no point waiting it out once it works."""
+    sql = "UPDATE attachment SET next_read_at=? WHERE extraction_json IS NULL AND next_read_at > ?"
+    params: list = [now_iso(), now_iso()]
+    if load_ids:
+        sql += (" AND sha256 IN (SELECT p.sha256 FROM part p JOIN message m ON m.message_id=p.message_id "
+                "WHERE m.load_id IN (" + ",".join("?" * len(load_ids)) + "))")
+        params += list(load_ids)
+    return conn.execute(sql, params).rowcount
+
+
 def get_attachment(conn: sqlite3.Connection, sha256: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM attachment WHERE sha256=?", (sha256,)).fetchone()
 

@@ -72,6 +72,50 @@ CADENCE_MINUTES: dict[str, int | None] = {
 }
 
 
+# ---------------------------------------------------------------- shortfall ----
+# The single answer to "what is this load short of, and is a new document work?".
+#
+# filing.propose() and export._gap() both used to carry their own copy of this map, and they drifted
+# the moment a state was added: on 21 Sep 2026 filing knew pod_unsigned and the export did not, and
+# NEITHER knew pod_unverified or pod_mislabelled. An unrecognised state fell through the export's
+# last `return "no"` and every document on those loads read "not needed", while the gate was calling
+# the same documents "would file". Both sides now ask this function, and a state nobody has taught it
+# answers UNKNOWN - which routes to a person - rather than silently answering "nothing".
+NEEDS = "needs"          # the load is short this document type; a matching one is work
+REFILE = "refile"        # the paperwork is on the load under a type that does not satisfy it
+NOTHING = "nothing"      # nothing to file: complete, out of scope, or not yet due
+REVIEW = "review"        # a document may help but the state is not about a missing document
+UNKNOWN = "unknown"      # this function has not been taught this state - ask a person
+
+SHORTFALL: dict[str, tuple[str | None, str]] = {
+    "pod_expected":   ("Proof of Delivery", NEEDS),
+    # Short a POD exactly as pod_expected is; the difference is only that something claiming to be
+    # one is already filed. A real POD arriving by mail is the document that fixes the load.
+    "pod_unsigned":   ("Proof of Delivery", NEEDS),
+    # A correctly typed POD still fixes a mislabelled one, and re-sending is the likelier repair.
+    "pod_mislabelled": ("Proof of Delivery", NEEDS),
+    "bol_expected":   ("Bill Of Lading", NEEDS),
+    # The POD claim rests on a document nobody has read. Reading it resolves the state on its own,
+    # so a newly arrived document is not obviously the answer - a person decides.
+    "pod_unverified": ("Proof of Delivery", REVIEW),
+    "wrong_doc_type": (None, REFILE),
+    "filed_status_pending": (None, REFILE),   # caller still checks the Delivered mark
+    "complete":       (None, NOTHING),
+    "not_yet_due":    (None, NOTHING),
+    "out_of_scope":   (None, NOTHING),
+    "not_in_view":    (None, NOTHING),
+    # Nothing is KNOWN about these yet: Loop B has not reached the load.
+    "new":            (None, UNKNOWN),
+    "error":          (None, UNKNOWN),
+    "":               (None, UNKNOWN),
+}
+
+
+def shortfall(load_state: str | None) -> tuple[str | None, str]:
+    """(document type the load is short, verdict). An unseen state answers UNKNOWN, never NOTHING."""
+    return SHORTFALL.get(load_state or "", (None, UNKNOWN))
+
+
 def utc(s: str | None) -> dt.datetime | None:
     if not s:
         return None

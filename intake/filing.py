@@ -220,14 +220,13 @@ def propose(conn: sqlite3.Connection, load_id: int, sha256: str, *, requirements
     #    Documents Received, loads outside the worked service level, and BOLs for loads that are
     #    short a POD - 140 of the 153 that cleared the gates on the 15 Sep 2026 run.
     load_state = (load_row["state"] if load_row else "") or ""
-    # pod_unsigned is short a POD exactly as pod_expected is - the difference is only that somebody
-    # has already filed something claiming to be one. A real POD arriving by mail must be recognised
-    # as wanted, or the one document that fixes the load would be turned away as a duplicate.
-    needed = {"pod_expected": "Proof of Delivery", "bol_expected": "Bill Of Lading",
-              "pod_unsigned": "Proof of Delivery",
-              # A correctly typed POD still fixes a mislabelled one, and it is the likelier repair
-              # when a driver re-sends: file the new one properly rather than re-typing the old.
-              "pod_mislabelled": "Proof of Delivery"}.get(load_state)
+    # The one answer to "what is this load short of" lives in state.shortfall(), shared with the
+    # export. A state neither side has been taught answers UNKNOWN and routes to a person.
+    needed, verdict = st.shortfall(load_state)
+    if verdict in (st.UNKNOWN, st.REVIEW) and gate == AUTO:
+        return Proposal(load_id, sha256, REVIEW, review.NOT_ASSESSED,
+                        f"load state {load_state or '(none)'!r}: what this load is short of is not "
+                        f"established, so filing is a person's call", doc_type, None, filename, notes)
     #    A load drain has not reached yet answers none of that. "new" is what upsert_load inserts and
     #    what every load created from the mail side carries until Loop B checks it, and "error" is a
     #    load TransportPro could not be read for; both mean the same thing here - nothing is KNOWN
