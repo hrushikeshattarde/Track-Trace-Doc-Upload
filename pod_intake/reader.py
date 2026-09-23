@@ -120,6 +120,12 @@ def _extract_json(text: str) -> str:
     return t[start:end + 1] if start != -1 and end != -1 else t
 
 
+# Endpoints that have already refused output_config, so the next read does not ask again.
+# Process-scoped on purpose: a new run re-checks, so moving to an endpoint that gained
+# support costs one request to discover rather than a code change.
+_NO_STRUCTURED_OUTPUT: dict[str, bool] = {}
+
+
 def _structured_call(client, model: str, system: str, content: list[dict], schema_model, effort: str | None = None):
     """One call, schema-constrained where the endpoint supports it, tolerant where it does not.
 
@@ -138,19 +144,34 @@ def _structured_call(client, model: str, system: str, content: list[dict], schem
     output_config: dict = {"format": _output_format(schema_model)}
     if effort and "haiku" not in model.lower():
         output_config["effort"] = effort
-    try:
-        response = client.messages.create(
-            model=model, max_tokens=8000, system=system_blocks, messages=messages,
-            output_config=output_config,
-        )
-    except anthropic.BadRequestError as e:
-        if not any(k in str(e).lower() for k in ("output_config", "output_format", "format", "schema")):
-            raise
-        print("   note: endpoint rejected structured outputs; retrying with the schema in the prompt")
+
+    # An endpoint either supports structured outputs or it does not, and that answer does not change
+    # between documents. Learning it once per PROCESS rather than once per document is the whole
+    # point: Bedrock rejects the constraint, so every read used to pay for a refused request before
+    # the one that worked - two API round trips per document, for hundreds of documents, plus a line
+    # of log noise each that buried anything worth reading. Keyed by model, because the answer is a
+    # property of the endpoint serving it.
+    if _NO_STRUCTURED_OUTPUT.get(model):
         response = client.messages.create(
             model=model, max_tokens=8000, system=system_blocks,
             messages=[{"role": "user", "content": content + [schema_hint]}],
         )
+    else:
+        try:
+            response = client.messages.create(
+                model=model, max_tokens=8000, system=system_blocks, messages=messages,
+                output_config=output_config,
+            )
+        except anthropic.BadRequestError as e:
+            if not any(k in str(e).lower() for k in ("output_config", "output_format", "format", "schema")):
+                raise
+            _NO_STRUCTURED_OUTPUT[model] = True
+            print(f"   note: this endpoint does not support structured outputs for {model}; "
+                  f"sending the schema in the prompt for the rest of this run")
+            response = client.messages.create(
+                model=model, max_tokens=8000, system=system_blocks,
+                messages=[{"role": "user", "content": content + [schema_hint]}],
+            )
     _check_stop(response)
     text = next((b.text for b in response.content if b.type == "text"), "")
     try:

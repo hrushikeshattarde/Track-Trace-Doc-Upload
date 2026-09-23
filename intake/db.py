@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Backoff for a failed read, by attempt. After the last one the file is left alone and reported as
 # a permanent failure: a .MOV or a corrupt part fails identically every time, and retrying it on a
@@ -382,6 +382,18 @@ def migrate(conn: sqlite3.Connection) -> None:
             " document_type TEXT, filename TEXT, terminal INTEGER, customer TEXT, created_at TEXT,"
             " delivered_at TEXT, channel TEXT, UNIQUE (load_id, sha256, event, kind));"
             "CREATE INDEX IF NOT EXISTS ix_notification_open ON notification (delivered_at, created_at);")
+    if have < 12:
+        # Where the durable copy of this row landed in S3. NULL means "not archived", which is both
+        # the state of every row written before the archive existed and the state of every row when
+        # the archive is switched off - so `pending_*_archive` needs no separate flag to tell an
+        # un-archived row from an unarchivable one.
+        for table, col in (("message", "s3_key"), ("attachment", "s3_key"),
+                           ("attachment", "s3_extraction_key")):
+            if col not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+        conn.executescript(
+            "CREATE INDEX IF NOT EXISTS ix_message_unarchived ON message (s3_key) WHERE s3_key IS NULL;"
+            "CREATE INDEX IF NOT EXISTS ix_attachment_unarchived ON attachment (s3_key) WHERE s3_key IS NULL;")
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -592,7 +604,8 @@ def source_part(conn: sqlite3.Connection, sha256: str) -> sqlite3.Row | None:
 # ------------------------------------------------------------------ attachments ----
 
 def unread_attachments(conn: sqlite3.Connection, *, load_ids: list[int] | None = None,
-                       in_view_only: bool = True, limit: int = 100) -> list[sqlite3.Row]:
+                       in_view_only: bool = True, limit: int = 100,
+                       skip_satisfied: bool = True) -> list[sqlite3.Row]:
     """Documents in the ledger that have never been read.
 
     A pass run without --read stores the hash, the geometry and the filter decision but no
@@ -604,6 +617,20 @@ def unread_attachments(conn: sqlite3.Connection, *, load_ids: list[int] | None =
     error unconditionally meant a timeout or an overloaded API stranded a document as permanently
     as a corrupt one, with the only recovery being the same bytes turning up in a later message.
     The permanent case is still excluded, and it is the one with next_read_at NULL.
+
+    skip_satisfied leaves out documents whose load cannot want anything: complete, out of scope,
+    not in view, or not yet due. Measured 23 Sep 2026 over 177 reads costing $11.53, only 4 landed
+    on a load short exactly that document; most of the rest were real paperwork for loads that
+    already had it. The filing gate has always applied this test - it just applied it AFTER paying.
+
+    This is a DEFERRAL, not a decision. Nothing is written to the document: it stays unread, and the
+    moment its load stops being satisfied - not_yet_due becomes bol_expected when the truck reaches
+    the shipper, a complete load reopens - the same query offers it again. Recording a skip would
+    turn a fact that expires into one that does not, and lose the document for good.
+
+    A load nobody has assessed is NOT satisfied: state.SATISFIED_STATES is derived from the NOTHING
+    verdicts, so "new", "error" and anything unclassified fall through and are read. Not knowing is
+    a reason to look.
     """
     sql = ("SELECT DISTINCT a.sha256, a.filename, a.bytes, m.load_id FROM attachment a "
            "JOIN part p ON p.sha256 = a.sha256 AND p.decision = 'keep' "
@@ -614,12 +641,119 @@ def unread_attachments(conn: sqlite3.Connection, *, load_ids: list[int] | None =
     params: list = [now_iso()]
     if in_view_only:
         sql += " AND l.in_view = 1"
+    if skip_satisfied:
+        from . import state as _st
+        sql += (" AND COALESCE(l.state,'') NOT IN ("
+                + ",".join("?" * len(_st.SATISFIED_STATES)) + ")")
+        params += sorted(_st.SATISFIED_STATES)
     if load_ids:
         sql += " AND m.load_id IN (" + ",".join("?" * len(load_ids)) + ")"
         params += list(load_ids)
     sql += " ORDER BY m.load_id, a.bytes DESC LIMIT ?"
     params.append(limit)
     return conn.execute(sql, params).fetchall()
+
+
+# ----------------------------------------------------------------- archive ----
+# What has and has not reached S3. The ledger is the index; these are the only queries that know
+# an archive exists, so switching it off costs nothing anywhere else.
+
+
+def pending_mail_archive(conn: sqlite3.Connection, limit: int = 500,
+                         in_view_only: bool = False) -> list[sqlite3.Row]:
+    """Messages with no S3 key yet, oldest first.
+
+    Oldest first on purpose: Gmail is the only copy until a message is archived, and the oldest
+    messages are the ones closest to any retention or mailbox change that would end that.
+    """
+    sql = ("SELECT m.message_id, m.internal_date, m.thread_id, m.load_id, m.from_domain,"
+           "       m.routing_tier, m.part_count "
+           "FROM message m ")
+    if in_view_only:
+        sql += "JOIN load l ON l.load_id = m.load_id AND l.in_view = 1 "
+    sql += "WHERE m.s3_key IS NULL ORDER BY m.internal_date LIMIT ?"
+    return conn.execute(sql, (limit,)).fetchall()
+
+
+def retry_write(conn: sqlite3.Connection, sql: str, params: tuple, *,
+                attempts: int = 6, base_delay: float = 0.4) -> int:
+    """One small write, retried through a transient lock.
+
+    connect() already sets a 30 s busy timeout, which is enough for the sub-millisecond single-row
+    updates this service does against each other. It is NOT enough when a long job runs beside a
+    cycle: on 22 Sep 2026 the mail archive, 90 minutes into an 11,700-message run, hit a writer
+    holding the lock past 30 s and died on `database is locked` at message 5,447.
+
+    Losing the run was survivable - archiving is resumable and the ledger had committed everything
+    up to that point - but a job measured in hours must not end on a lock that clears in a second.
+    The backoff is exponential and short; anything still locked after roughly 12 s of retries is a
+    real problem and deserves to be raised rather than swallowed.
+    """
+    import time
+    for attempt in range(attempts):
+        try:
+            return conn.execute(sql, params).rowcount
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower() and "busy" not in str(e).lower():
+                raise
+            if attempt == attempts - 1:
+                raise
+            time.sleep(base_delay * (2 ** attempt))
+    return 0
+
+
+def message_parts(conn: sqlite3.Connection, message_id: str) -> list[dict]:
+    """Every attachment a message carried, kept or dropped, as the mail manifest records it.
+
+    Dropped parts are included deliberately. They never become a doc/ object, so this manifest is
+    the only place in the archive that says a message arrived with six images and the filters kept
+    one - and which one. Without that a reviewer looking at S3 cannot tell "no paperwork came" from
+    "paperwork came and was judged too small to be paperwork".
+    """
+    rows = conn.execute(
+        "SELECT p.sha256, p.decision, a.filename, a.bytes, a.document_type "
+        "FROM part p LEFT JOIN attachment a ON a.sha256 = p.sha256 "
+        "WHERE p.message_id = ? ORDER BY p.decision, a.filename", (message_id,)).fetchall()
+    return [{"sha256": r["sha256"], "decision": r["decision"], "filename": r["filename"],
+             "bytes": r["bytes"], "read_as": r["document_type"],
+             # Only kept parts are stored standalone; saying so here saves a HEAD that would 404.
+             "in_doc_prefix": r["decision"] == "keep"} for r in rows]
+
+
+def mark_mail_archived(conn: sqlite3.Connection, message_id: str, key: str) -> None:
+    retry_write(conn, "UPDATE message SET s3_key=? WHERE message_id=?", (key, message_id))
+
+
+def pending_doc_archive(conn: sqlite3.Connection, limit: int = 200,
+                        in_view_only: bool = True) -> list[sqlite3.Row]:
+    """Unique documents with no S3 key yet. One row per sha256 - the archive de-duplicates exactly
+    as the reader does, so a BOL forwarded through five replies is uploaded once."""
+    sql = ("SELECT DISTINCT a.sha256, a.filename, a.bytes, a.extraction_json,"
+           "       p.message_id, p.attachment_id, m.load_id "
+           "FROM attachment a "
+           "JOIN part p ON p.sha256 = a.sha256 AND p.decision = 'keep' "
+           "JOIN message m ON m.message_id = p.message_id ")
+    if in_view_only:
+        sql += "JOIN load l ON l.load_id = m.load_id AND l.in_view = 1 "
+    sql += "WHERE a.s3_key IS NULL GROUP BY a.sha256 LIMIT ?"
+    return conn.execute(sql, (limit,)).fetchall()
+
+
+def mark_doc_archived(conn: sqlite3.Connection, sha256: str, key: str,
+                      extraction_key: str | None = None) -> None:
+    retry_write(conn, "UPDATE attachment SET s3_key=?, s3_extraction_key=COALESCE(?, s3_extraction_key) "
+                      "WHERE sha256=?", (key, extraction_key, sha256))
+
+
+def archive_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """The two numbers that say whether the archive is keeping up."""
+    one = lambda q: conn.execute(q).fetchone()[0]  # noqa: E731
+    return {
+        "messages": one("SELECT COUNT(*) FROM message"),
+        "messages_archived": one("SELECT COUNT(*) FROM message WHERE s3_key IS NOT NULL"),
+        "documents": one("SELECT COUNT(*) FROM attachment"),
+        "documents_archived": one("SELECT COUNT(*) FROM attachment WHERE s3_key IS NOT NULL"),
+    }
 
 
 def reads_in_backoff(conn: sqlite3.Connection, *, load_ids: list[int] | None = None,

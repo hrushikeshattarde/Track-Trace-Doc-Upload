@@ -52,6 +52,7 @@ class Stats:
     new_files: int = 0
     reads: int = 0
     reads_avoided: int = 0
+    reads_deferred: int = 0
     read_errors: int = 0
     deferred: int = 0
     spend_capped: bool = False
@@ -68,6 +69,8 @@ class Stats:
                 f"parts kept {self.parts[filters.KEEP]}, dropped: {dropped} | "
                 f"downloads {self.downloads}, new files {self.new_files}, reads {self.reads}, "
                 f"reads avoided by hash {self.reads_avoided}"
+                + (f", {self.reads_deferred} not read (load not short a document)"
+                   if self.reads_deferred else "")
                 + (f", read errors {self.read_errors}" if self.read_errors else "")
                 + (f", {self.deferred} message(s) deferred to the next pass" if self.deferred else "")
                 + (" [SPEND CAP HIT: some documents left unread]" if self.spend_capped else "")
@@ -467,7 +470,8 @@ def _process(conn, client: gm.Delegated, msg: dict, *, group: str, reader: Reade
         db.bind_thread(conn, thread_id, route.load_id, route.tier)
     st.bound += 1
 
-    kept = _handle_parts(conn, client, msg, parts, reader=reader, st=st, verbose=verbose)
+    kept = _handle_parts(conn, client, msg, parts, load_id=route.load_id, reader=reader,
+                         st=st, verbose=verbose)
 
     # A load can reach the ledger from the mail side before any dashboard sweep has produced it.
     db.upsert_load(conn, route.load_id, source="mail", due_now=True)
@@ -492,7 +496,7 @@ def _candidate_parts(msg: dict, max_parts: int) -> list[dict]:
 
 
 def _handle_parts(conn, client: gm.Delegated, msg: dict, parts: list[dict], *,
-                  reader: Reader | None, st: Stats, verbose: bool) -> int:
+                  load_id: int | None, reader: Reader | None, st: Stats, verbose: bool) -> int:
     message_id = msg["id"]
     kept = 0
     for p in parts:
@@ -535,6 +539,27 @@ def _handle_parts(conn, client: gm.Delegated, msg: dict, parts: list[dict], *,
 
         if existing is None:
             st.new_files += 1
+
+        # Does this load want ANY document right now? A load that is complete, out of scope, not in
+        # view, or whose truck has not reached the shipper cannot be short one, so reading this page
+        # buys nothing. Measured 23 Sep 2026: of 177 documents read for $11.53, four landed on a load
+        # short exactly that document. The filing gate has always asked this - it asked after paying.
+        #
+        # The page is still stored, hashed and de-duplicated; only the model call is deferred. When
+        # the load's state moves - the truck reaches the shipper, a delivery lands - unread_attachments
+        # offers it again with nothing recorded against it. A load nobody has assessed answers UNKNOWN
+        # and IS read: not knowing is a reason to look.
+        if reader is not None and _load_is_satisfied(conn, load_id):
+            st.reads_deferred += 1
+            if existing is None:
+                db.put_attachment(conn, digest, message_id=message_id, filename=p["filename"],
+                                  size=len(data), extraction=None, document_type=None, model=None,
+                                  cost_usd=None)
+            if verbose:
+                print(f"    - {p['filename']} {digest[:12]} not read: load {message_load_id} is not "
+                      f"short a document right now")
+            continue
+
         if reader is None:
             # Only ever create the placeholder. Rewriting an existing row here would reset the
             # failure and its attempt count every time a reply re-quoted the same bytes.
@@ -564,6 +589,22 @@ def _handle_parts(conn, client: gm.Delegated, msg: dict, parts: list[dict], *,
         if verbose:
             print(f"    * {p['filename']} read as {doc_type} (${cost:.4f})")
     return kept
+
+
+def _load_is_satisfied(conn, load_id) -> bool:
+    """Whether this load can want a document at all, right now.
+
+    False for anything unknown - no load id, no ledger row, a state nobody has classified. The only
+    True answers come from state.SATISFIED_STATES, which is derived from the NOTHING verdicts, so a
+    state added tomorrow and not classified defaults to being read rather than being skipped.
+    """
+    if not load_id:
+        return False
+    row = conn.execute("SELECT state FROM load WHERE load_id=?", (load_id,)).fetchone()
+    if row is None:
+        return False
+    from . import state as _st
+    return (row["state"] or "") in _st.SATISFIED_STATES
 
 
 def make_reader(model: str) -> Reader:

@@ -77,7 +77,13 @@ def missing(keys: list[str]) -> list[str]:
     return [k for k in keys if not os.environ.get(k)]
 
 
-MODEL_KEYS_AUTHORITATIVE = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"]
+MODEL_KEYS_AUTHORITATIVE = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
+                            # Which AWS identity the service runs as is the project's decision, not the
+                            # shell's. On 22 Sep 2026 a stale AWS_PROFILE inherited from the terminal
+                            # silently won over the .env for a whole day of runs: everything worked, but
+                            # as a different role than configured, and `aws sso login` on the profile the
+                            # .env named refreshed a token nothing used.
+                            "AWS_PROFILE", "AWS_REGION"]
 TPRO_KEYS = ["PAYBOT_TP_BASE_URL", "PAYBOT_TP_USERNAME", "PAYBOT_TP_PASSWORD"]
 GMAIL_KEYS = ["PAYBOT_GMAIL_USER", "PAYBOT_GOOGLE_SA_FILE"]
 MODEL_KEYS_ANY = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENROUTER_API_KEY"]

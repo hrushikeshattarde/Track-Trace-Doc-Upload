@@ -31,14 +31,15 @@ Read-only against Gmail. The ONLY command that writes to TransportPro is
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from intake import (db, export, filing, gmail as gm, ingest, loadloop, notify, review,  # noqa: E402
-                    tpro as tp, tprodocs)
+from intake import (archive, db, export, filing, gmail as gm, ingest, loadloop, notify, review,  # noqa: E402
+                    store as s3store, tpro as tp, tprodocs)
 from pod_intake.localenv import load_local_env  # noqa: E402
 
 DEFAULT_DB = HERE / "out" / "intake.sqlite3"
@@ -238,6 +239,138 @@ def cmd_tpro_scan(args) -> int:
     print(f"  {both} of {total} hashed file(s) on loads are byte-identical to something in the mail ledger")
     _print_health(conn)
     return 0
+
+
+def cmd_archive(args) -> int:
+    """Put the mail and the documents somewhere that outlives Gmail retention and this laptop."""
+    conn = db.connect(args.db)
+    store = s3store.from_env()
+    if store is None:
+        print("no archive configured. Set INTAKE_S3_BUCKET (and optionally INTAKE_S3_PREFIX) "
+              "to turn it on; without it the service keeps only the hash and the "
+              "extraction, as before.")
+        return 2
+    ok, why = store.writable()
+    print(("archive: " if ok else "CANNOT WRITE: ") + why)
+    if not ok:
+        # Said before anything is fetched. A role that can list every bucket and write to none is
+        # common, and finding out after 11,000 Gmail calls is the expensive way to learn it.
+        return 1
+    if args.check:
+        c = db.archive_counts(conn)
+        print(f"  mail      {c['messages_archived']}/{c['messages']} archived")
+        print(f"  documents {c['documents_archived']}/{c['documents']} archived")
+        return 0
+
+    gmail = gm.from_env()
+    if not args.documents_only:
+        st = archive.archive_mail(conn, gmail, store, limit=args.limit,
+                                  in_view_only=args.in_view_only, rewrite=args.rewrite,
+                                  verbose=args.verbose)
+        print("  " + st.line("mail"))
+    if not args.mail_only:
+        st = archive.archive_documents(conn, gmail, store, limit=args.doc_limit,
+                                       in_view_only=not args.any_load, skip_pii=not args.include_pii,
+                                       rewrite=args.rewrite, verbose=args.verbose)
+        print("  " + st.line("documents"))
+    c = db.archive_counts(conn)
+    print("")
+    print(f"  mail      {c['messages_archived']}/{c['messages']} archived")
+    print(f"  documents {c['documents_archived']}/{c['documents']} archived")
+    return 0
+
+
+def cmd_cycle(args) -> int:
+    """One production cycle. This is what the hourly scheduler calls.
+
+    The order is not arbitrary. Mail is collected first so that everything downstream sees it in the
+    same pass; the archive runs next so a message is durable before anything depends on it; the
+    dashboard is reconciled before loads are drained, so a load that appeared this hour gets checked
+    this hour rather than next; and judging runs last, on everything the earlier steps produced.
+
+    Nothing here writes to TransportPro. `file --execute` is a separate, deliberate command and is
+    not reachable from the scheduler - an unattended job that can upload is an unattended job that
+    can upload the wrong thing at 3am.
+
+    Every step is bounded and every step is resumable, so an hour that cannot finish its work leaves
+    the remainder for the next hour instead of failing the cycle. That is the property that lets this
+    run unattended: falling behind is a slower queue, never a lost message.
+    """
+    import time
+    started = time.time()
+    conn = db.connect(args.db)
+    steps: list[str] = []
+    failed: list[str] = []
+
+    def step(name: str, fn) -> None:
+        """Run one step. A step that raises is reported and the cycle continues.
+
+        A Gmail outage must not stop the load loop, and a TransportPro outage must not stop mail
+        collection: they fail independently, so they are allowed to fail independently. The exit
+        code still reflects it, so the scheduler's own alerting sees a bad cycle.
+        """
+        try:
+            steps.append(f"{name}: {fn()}")
+        except Exception as e:                                   # noqa: BLE001 - reported, not raised
+            failed.append(name)
+            steps.append(f"{name}: FAILED {type(e).__name__} {str(e)[:120]}")
+
+    def _collect() -> str:
+        client = gm.from_env()
+        reader = ingest.make_reader(args.model) if args.read else None
+        st = ingest.sync_once(conn, client, group=args.group, reader=reader, max_messages=args.max,
+                              max_spend_usd=args.max_spend, verbose=False)
+        return st.line()
+
+    def _archive() -> str:
+        store = s3store.from_env()
+        if store is None:
+            return "off (no INTAKE_S3_BUCKET)"
+        client = gm.from_env()
+        m = archive.archive_mail(conn, client, store, limit=args.archive_limit)
+        d = archive.archive_documents(conn, client, store, limit=args.archive_doc_limit,
+                                      skip_pii=not args.include_pii)
+        return f"{m.stored} mail, {d.stored} document(s) stored"
+
+    def _reconcile() -> str:
+        tpro = tp.from_env()
+        loads, levels = loadloop.pod_terminals(args.pod_map)
+        return loadloop.reconcile(conn, tpro, terminals=loads, scope_levels=levels).line()
+
+    def _drain() -> str:
+        tpro = tp.from_env()
+        _, levels = loadloop.pod_terminals(args.pod_map)
+        return loadloop.drain(conn, tpro, limit=args.load_limit, scope_levels=levels).line()
+
+    def _judge() -> str:
+        pairs = filing.candidates(conn, limit=args.judge_limit)
+        gates: dict[str, int] = {}
+        for load_id, sha in pairs:
+            pr = filing.propose(conn, load_id, sha, requirements_path=args.requirements,
+                                allow_auto=False)
+            gates[pr.gate] = gates.get(pr.gate, 0) + 1
+            if pr.gate != filing.AUTO:
+                review.enqueue(conn, load_id=pr.load_id, sha256=pr.sha256, message_id=None,
+                               kind=pr.kind, reason=pr.reason, proposed_type=pr.document_type,
+                               proposed_comment=pr.comment)
+        return f"{len(pairs)} judged" + (f" ({gates})" if gates else "")
+
+    print(f"=== cycle {dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}")
+    step("collect", _collect)
+    if not args.no_archive:
+        step("archive", _archive)
+    if not args.no_loads:
+        step("reconcile", _reconcile)
+        step("drain", _drain)
+    step("judge", _judge)
+
+    for line in steps:
+        print("  " + line)
+    c = review.counts(conn)
+    print(f"  queue: {c['_pending']} pending, {c['_approved']} approved and waiting for a person")
+    print(f"=== cycle done in {time.time() - started:.0f}s" + (f", FAILED: {', '.join(failed)}" if failed else ""))
+    # Non-zero tells the scheduler something needs looking at, without having to parse the log.
+    return 1 if failed else 0
 
 
 def cmd_read(args) -> int:
@@ -546,6 +679,40 @@ def main() -> int:
     rd.add_argument("--retry-now", action="store_true",
                     help="bring waiting retries forward: use after fixing credentials or credits")
     rd.set_defaults(fn=cmd_read)
+
+    cy = sub.add_parser("cycle", help="one production cycle: collect, archive, drain, judge")
+    cy.add_argument("--read", action="store_true", help="read new documents (costs money)")
+    cy.add_argument("--model", default="claude-opus-5")
+    cy.add_argument("--max-spend", type=float, default=2.0, help="model spend cap for THIS cycle")
+    cy.add_argument("--max", type=int, default=500, help="messages collected this cycle")
+    cy.add_argument("--group", default=GROUP)
+    cy.add_argument("--archive-limit", type=int, default=1000)
+    cy.add_argument("--archive-doc-limit", type=int, default=300)
+    cy.add_argument("--include-pii", action="store_true")
+    cy.add_argument("--no-archive", action="store_true")
+    cy.add_argument("--no-loads", action="store_true", help="mail only: skip TransportPro entirely")
+    cy.add_argument("--load-limit", type=int, default=300)
+    cy.add_argument("--judge-limit", type=int, default=2000)
+    cy.add_argument("--pod-map", default=str(POD_MAP))
+    cy.add_argument("--requirements", default=str(HERE / "index" / "customer_requirements.json"))
+    cy.set_defaults(fn=cmd_cycle)
+
+    ar = sub.add_parser("archive", help="store mail and documents in S3")
+    ar.add_argument("--limit", type=int, default=500, help="messages this pass")
+    ar.add_argument("--doc-limit", type=int, default=200, help="documents this pass")
+    ar.add_argument("--mail-only", action="store_true")
+    ar.add_argument("--documents-only", action="store_true")
+    ar.add_argument("--in-view-only", action="store_true",
+                    help="only mail bound to a load in the dashboard view")
+    ar.add_argument("--any-load", action="store_true", help="documents on loads outside the view too")
+    ar.add_argument("--include-pii", action="store_true",
+                    help="ALSO store pages the reader found a personal ID on (licences, CDLs). "
+                         "Off by default: storing them is a retention decision, not a default")
+    ar.add_argument("--rewrite", action="store_true",
+                    help="re-PUT objects already at their key: use after changing what an object holds")
+    ar.add_argument("--check", action="store_true", help="report coverage and write access, store nothing")
+    ar.add_argument("--verbose", action="store_true")
+    ar.set_defaults(fn=cmd_archive)
 
     ld = sub.add_parser("loads", help="Loop B: check every load whose next check is due")
     ld.add_argument("--limit", type=int, default=100)

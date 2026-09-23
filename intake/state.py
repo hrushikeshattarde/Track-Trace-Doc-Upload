@@ -111,6 +111,16 @@ SHORTFALL: dict[str, tuple[str | None, str]] = {
 }
 
 
+# The states for which a newly arrived document cannot be work, derived from SHORTFALL so the two
+# cannot drift. Used to decide what NOT to pay to read.
+#
+# Deriving rather than listing is the whole safety property here. A state nobody has classified
+# answers UNKNOWN, which is not in this set, so the document is read - not knowing is a reason to
+# look, never a reason to skip. The same rule the filing gate already follows, applied one step
+# earlier, before the money is spent instead of after.
+SATISFIED_STATES = frozenset(k for k, (_, verdict) in SHORTFALL.items() if verdict == NOTHING)
+
+
 def shortfall(load_state: str | None) -> tuple[str | None, str]:
     """(document type the load is short, verdict). An unseen state answers UNKNOWN, never NOTHING."""
     return SHORTFALL.get(load_state or "", (None, UNKNOWN))

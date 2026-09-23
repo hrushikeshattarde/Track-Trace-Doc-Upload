@@ -19,7 +19,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from intake import db, filing, filters, ingest, loadloop, review, routing, state  # noqa: E402
+from intake import (archive, db, filing, filters, ingest, loadloop, review, routing,  # noqa: E402
+                    state, store as s3store)
 
 PASSED = 0
 
@@ -1134,6 +1135,387 @@ def test_narrow_sweep_never_evicts() -> None:
     check("and the row survives", db.counts(conn)["loads"] == 1)
 
 
+
+RAW_MSG = b"From: a@b" + bytes([13, 10]) + b"Subject: load 2589536"
+
+
+class FakeS3:
+    """Enough of the S3 client to test the key scheme and idempotence without AWS."""
+
+    def __init__(self):
+        self.objects: dict[str, bytes] = {}
+        self.meta: dict[str, dict] = {}
+        self.puts = 0
+
+    def put_object(self, Bucket, Key, Body, **kw):      # noqa: N803 - boto3's spelling
+        self.puts += 1
+        self.objects[Key] = Body
+        self.meta[Key] = kw.get("Metadata", {})
+        return {}
+
+    def head_object(self, Bucket, Key):                  # noqa: N803
+        if Key not in self.objects:
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject")
+        return {"ContentLength": len(self.objects[Key])}
+
+    def get_object(self, Bucket, Key):                   # noqa: N803
+        import io
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def delete_object(self, Bucket, Key):                # noqa: N803
+        self.objects.pop(Key, None)
+        return {}
+
+
+
+def test_no_group_is_a_configuration_not_a_crash() -> None:
+    """A mailbox that is not behind a Google Group has nothing to unwrap.
+
+    `intake cycle` shipped with --group defaulting to None and every message in its collect step
+    died on None.lower(). The step wrapper caught it, so the cycle reported one failed step and
+    carried on - which is the right behaviour, and is also why a whole broken collect could look
+    like a small red line in an otherwise healthy log.
+    """
+    print("routing: no group configured")
+
+    plain = {"from": "driver@carrier.example", "x-original-sender": "someone@else.example"}
+    check("no group set: the From header is used as-is",
+          routing.original_sender(plain, None) == "driver@carrier.example",
+          routing.original_sender(plain, None))
+    check("empty string behaves the same",
+          routing.original_sender(plain, "") == "driver@carrier.example")
+
+    wrapped = {"from": "Loads <loads@circledelivers.com>", "x-original-sender": "driver@carrier.example"}
+    check("with a group, the real sender is still unwrapped",
+          routing.original_sender(wrapped, "loads@circledelivers.com") == "driver@carrier.example",
+          routing.original_sender(wrapped, "loads@circledelivers.com"))
+    check("a message not from the group is left alone",
+          routing.original_sender(plain, "loads@circledelivers.com") == "driver@carrier.example")
+
+
+def test_every_subcommand_defaults_its_group() -> None:
+    """Whatever a new subcommand forgets, it must not forget this one.
+
+    The bug was not in routing; it was one argparse default out of step with the others.
+    """
+    print("cli: --group defaults")
+    import re as _re
+
+    src = (HERE / "intake" / "__main__.py").read_text(encoding="utf-8")
+    defaults = _re.findall(r'add_argument\("--group", default=([^)]+)\)', src)
+    check("every --group defaults to GROUP, never None",
+          defaults and all(d.strip() == "GROUP" for d in defaults), str(defaults))
+
+
+
+
+class _FakeSchema:
+    __name__ = "_FakeSchema"
+
+    @staticmethod
+    def model_validate_json(t):
+        return {"parsed": t}
+
+    @staticmethod
+    def model_json_schema():
+        return {"type": "object"}
+
+
+
+
+def test_a_satisfied_load_is_not_paid_to_read() -> None:
+    """Ask whether the load wants a document BEFORE paying to read one, not after.
+
+    Measured 23 Sep 2026: 177 documents read for $11.53, of which 4 landed on a load short exactly
+    that document. The filing gate already applied state.shortfall() - it applied it after the money
+    was gone.
+    """
+    print("reads: the check runs before the money")
+
+    conn = fresh_db()
+
+    def doc(sha, load_id, load_state):
+        conn.execute("INSERT OR IGNORE INTO load (load_id, state, in_view) VALUES (?,?,1)",
+                     (load_id, load_state))
+        conn.execute("INSERT OR IGNORE INTO message (message_id, thread_id, load_id, part_count) "
+                     "VALUES (?,?,?,1)", (f"m{load_id}", f"t{load_id}", load_id))
+        conn.execute("INSERT OR IGNORE INTO attachment (sha256, filename, bytes) VALUES (?,?,100)",
+                     (sha, f"{load_id}.pdf"))
+        conn.execute("INSERT OR IGNORE INTO part (message_id, part_id, sha256, decision) "
+                     "VALUES (?,?,?,'keep')", (f"m{load_id}", "p1", sha))
+
+    doc("a" * 64, 101, "bol_expected")     # short a BOL      -> read
+    doc("b" * 64, 102, "complete")         # done             -> defer
+    doc("c" * 64, 103, "not_yet_due")      # truck not there  -> defer
+    doc("d" * 64, 104, "new")              # UNASSESSED       -> read
+    doc("e" * 64, 105, "")                 # no state at all  -> read
+    doc("f" * 64, 106, "invented_state")   # unclassified     -> read
+    conn.commit()
+
+    got = {r["sha256"][0] for r in db.unread_attachments(conn, limit=99, skip_satisfied=True)}
+    check("a load short a BOL is read", "a" in got, str(sorted(got)))
+    check("a complete load is not", "b" not in got, str(sorted(got)))
+    check("a not-yet-due load is not", "c" not in got, str(sorted(got)))
+    # These three are the safety property. Skipping an unknown load loses documents silently.
+    check("a load nobody has assessed IS read", "d" in got, str(sorted(got)))
+    check("a load with no state IS read", "e" in got, str(sorted(got)))
+    check("a state nobody classified IS read", "f" in got, str(sorted(got)))
+
+    all_ = {r["sha256"][0] for r in db.unread_attachments(conn, limit=99, skip_satisfied=False)}
+    check("without the check every one is offered", len(all_) == 6, str(sorted(all_)))
+
+    # The whole design rests on this: deferral must not be a decision. Nothing is written to the
+    # document, so the moment the truck reaches the shipper the same query offers it again.
+    conn.execute("UPDATE load SET state='bol_expected' WHERE load_id=103")
+    conn.commit()
+    again = {r["sha256"][0] for r in db.unread_attachments(conn, limit=99, skip_satisfied=True)}
+    check("a deferred document returns the moment its load needs one", "c" in again, str(sorted(again)))
+
+    # And the reverse: a load that completes stops offering, without touching the document either.
+    conn.execute("UPDATE load SET state='complete' WHERE load_id=101")
+    conn.commit()
+    done = {r["sha256"][0] for r in db.unread_attachments(conn, limit=99, skip_satisfied=True)}
+    check("and stops being offered when the load completes", "a" not in done, str(sorted(done)))
+
+
+def test_satisfied_states_are_derived_not_listed() -> None:
+    """The skip list must come from SHORTFALL, or a new state silently becomes unreadable."""
+    print("reads: the skip list cannot drift")
+    from intake import state as _st
+
+    check("every satisfied state is one SHORTFALL calls NOTHING",
+          all(_st.SHORTFALL[k][1] == _st.NOTHING for k in _st.SATISFIED_STATES))
+    check("every NOTHING state is in the skip list",
+          {k for k, (_, v) in _st.SHORTFALL.items() if v == _st.NOTHING} == set(_st.SATISFIED_STATES))
+    for s_ in ("new", "error", "", "a_state_invented_next_month"):
+        check(f"{s_!r} is never treated as satisfied", s_ not in _st.SATISFIED_STATES)
+
+
+def test_structured_output_refusal_is_learned_once() -> None:
+    """Bedrock refuses output_config. Asking it again for every document doubles the request count.
+
+    Measured 22 Sep 2026: one "endpoint rejected structured outputs" line per document read, each
+    one a paid-for refused request before the request that worked.
+    """
+    print("reader: the endpoint is asked once, not once per document")
+    import anthropic as _an
+    from pod_intake import reader as _rd
+
+    _rd._NO_STRUCTURED_OUTPUT.clear()
+    calls = {"structured": 0, "prompt": 0}
+
+    class Resp:
+        content = [type("B", (), {"type": "text", "text": '{"ok": true}'})()]
+        stop_reason = "end_turn"
+        usage = type("U", (), {"input_tokens": 1, "output_tokens": 1,
+                               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})()
+
+    class Messages:
+        def create(self, **kw):
+            if "output_config" in kw:
+                calls["structured"] += 1
+                raise _an.BadRequestError(
+                    "output_config not supported",
+                    response=type("R", (), {"status_code": 400, "headers": {}, "request": None})(),
+                    body=None)
+            calls["prompt"] += 1
+            return Resp()
+
+    class Client:
+        messages = Messages()
+
+    client = Client()
+    for _ in range(5):
+        try:
+            _rd._structured_call(client, "claude-opus-5", "sys", [], _FakeSchema)
+        except Exception:
+            pass
+
+    check("the endpoint is probed exactly once across five documents",
+          calls["structured"] == 1, f"probed {calls['structured']} times")
+    check("and every document still gets its request", calls["prompt"] == 5, str(calls))
+    _rd._NO_STRUCTURED_OUTPUT.clear()
+
+
+def test_a_transient_lock_does_not_end_a_long_job() -> None:
+    """An archive run measured in hours must not die on a lock that clears in a second."""
+    print("ledger: transient locks")
+
+    import sqlite3 as _sq
+
+    class FlakyConn:
+        """A connection that is locked for its first two writes, then works. sqlite3.Connection
+        will not let its own execute be replaced, so the retry is tested against a stand-in."""
+
+        def __init__(self, fail_times: int, error: str = "database is locked"):
+            self.calls = 0
+            self.fail_times = fail_times
+            self.error = error
+
+        def execute(self, sql, params=()):
+            self.calls += 1
+            if self.calls <= self.fail_times:
+                raise _sq.OperationalError(self.error)
+            class R:
+                rowcount = 1
+            return R()
+
+    c = FlakyConn(fail_times=2)
+    n = db.retry_write(c, "UPDATE x SET y=?", ("v",), base_delay=0.001)
+    check("it retries through a lock and succeeds", c.calls == 3 and n == 1, f"calls={c.calls} n={n}")
+
+    # A lock is transient; a broken statement is not. Retrying real errors would turn a typo into
+    # twelve seconds of waiting and then the same failure.
+    c = FlakyConn(fail_times=99, error="no such column: nope")
+    try:
+        db.retry_write(c, "SELECT nope", (), base_delay=0.001)
+        raised = False
+    except _sq.OperationalError:
+        raised = True
+    check("a real error is raised at once, not retried", raised and c.calls == 1, f"calls={c.calls}")
+
+    c = FlakyConn(fail_times=99)
+    try:
+        db.retry_write(c, "UPDATE x SET y=?", ("v",), attempts=3, base_delay=0.001)
+        gave_up = False
+    except _sq.OperationalError:
+        gave_up = True
+    check("a lock that never clears is raised, not swallowed", gave_up and c.calls == 3,
+          f"calls={c.calls}")
+
+
+def test_archive_keys_are_derived_not_random() -> None:
+    """A random id per object would make every re-run a duplicate and undo the read de-duplication."""
+    print("archive: keys")
+
+    sha = "a" * 64
+    check("a document is addressed by its content",
+          s3store.doc_key(sha) == f"doc/aa/{'a' * 64}", s3store.doc_key(sha))
+    check("the same document asked for twice gives the same key",
+          s3store.doc_key(sha) == s3store.doc_key(sha))
+    check("its extraction sits beside it",
+          s3store.extraction_key(sha) == s3store.doc_key(sha) + ".extraction.json")
+
+    k = s3store.mail_key("18f2abc", "2026-09-22T12:34:40+00:00")
+    check("mail is partitioned by the date it arrived", k == "mail/2026/09/22/18f2abc.json.gz", k)
+    check("re-syncing the same message gives the same key",
+          s3store.mail_key("18f2abc", "2026-09-22T12:34:40+00:00") == k)
+    # A message with no internalDate must not land under today's date: today moves on every re-run,
+    # which is the one thing the date prefix exists to prevent.
+    check("a message with no date does not get today's",
+          s3store.mail_key("18f2abc", None) == "mail/unknown/18f2abc.json.gz")
+
+
+def test_archive_is_idempotent_and_resumable() -> None:
+    """Interrupting an archive run must cost the next run nothing but what is genuinely missing."""
+    print("archive: idempotence")
+
+    fake = FakeS3()
+    store = s3store.Store("a-bucket", "intake", client=fake)
+    ok, why = store.writable()
+    check("write access is proved before anything is fetched", ok, why)
+
+    first = store.put_document("b" * 64, b"PDFBYTES", filename="bol.pdf")
+    check("the first write stores the bytes", not first.skipped and first.bytes_written == 8)
+    again = store.put_document("b" * 64, b"PDFBYTES", filename="bol.pdf")
+    check("the second is skipped, not duplicated", again.skipped and again.key == first.key)
+    check("and S3 was asked to store it exactly once",
+          len([k for k in fake.objects if k.endswith("b" * 64)]) == 1, str(list(fake.objects)))
+
+    check("the prefix is applied to the stored key", first.key.startswith("intake/doc/"), first.key)
+
+    store.put_mail(message_id="m1", internal_date="2026-09-22T00:00:00+00:00",
+                   raw=RAW_MSG, envelope={"load_id": 2589536})
+    back = store.get_mail("m1", "2026-09-22T00:00:00+00:00")
+    check("the raw message survives the round trip",
+          base64.b64decode(back["raw_rfc822_b64"]) == RAW_MSG, str(back)[:90])
+    check("and the routing that found its load rides along", back["envelope"]["load_id"] == 2589536)
+
+
+
+def test_archive_links_mail_to_its_documents() -> None:
+    """S3 must answer both directions on its own. The ledger is an index, not a dependency.
+
+    Without this the join between a message and its documents lived only in the SQLite part table:
+    an Athena query over the bucket could not say which mail a BOL arrived on without downloading
+    every message and re-hashing its MIME parts.
+    """
+    print("archive: the link between mail and documents")
+
+    conn = fresh_db()
+    conn.executescript(
+        "INSERT INTO message (message_id, thread_id, internal_date, load_id, part_count) "
+        "VALUES ('m9','t9','2026-09-22T00:00:00+00:00',2589536,2);"
+        "INSERT INTO attachment (sha256, filename, bytes, document_type) "
+        "VALUES ('" + "c" * 64 + "','bol.pdf',1234,'bill_of_lading');"
+        "INSERT INTO attachment (sha256, filename, bytes) "
+        "VALUES ('" + "d" * 64 + "','sig.png',90);"
+        "INSERT INTO part (message_id, part_id, sha256, decision) VALUES ('m9','p1','" + "c" * 64 + "','keep');"
+        "INSERT INTO part (message_id, part_id, sha256, decision) VALUES ('m9','p2','" + "d" * 64 + "','signature_or_logo');")
+    conn.commit()
+
+    manifest = db.message_parts(conn, "m9")
+    check("the manifest names every part the message carried", len(manifest) == 2, str(manifest))
+    kept = [m for m in manifest if m["in_doc_prefix"]]
+    check("and says which of them reached doc/", len(kept) == 1 and kept[0]["filename"] == "bol.pdf",
+          str(kept))
+    dropped = [m for m in manifest if not m["in_doc_prefix"]]
+    check("a dropped part is still recorded, with why", dropped[0]["decision"] == "signature_or_logo",
+          str(dropped))
+    check("the manifest carries what the reader made of it",
+          kept[0]["read_as"] == "bill_of_lading", str(kept))
+
+    fake = FakeS3()
+    store = s3store.Store("b", client=fake)
+    store.put_mail(message_id="m9", internal_date="2026-09-22T00:00:00+00:00", raw=RAW_MSG,
+                   envelope={"load_id": 2589536}, attachments=manifest)
+    back = store.get_mail("m9", "2026-09-22T00:00:00+00:00")
+    shas = [a["sha256"] for a in back["attachments"]]
+    check("mail -> documents: the object names its attachments by the key they are stored under",
+          ("c" * 64) in shas, str(shas)[:80])
+    check("and that sha is the doc/ key", s3store.doc_key(shas[0]).startswith("doc/"))
+
+    store.put_document("c" * 64, b"PDF", filename="bol.pdf", message_id="m9", load_id=2589536)
+    meta = fake.meta[store.full(s3store.doc_key("c" * 64))]
+    check("documents -> mail: the object names the message it arrived on",
+          meta.get("first-seen-message") == "m9", str(meta))
+    check("and the load it belongs to", meta.get("load-id") == "2589536", str(meta))
+
+
+def test_archive_withholds_personal_id_by_default() -> None:
+    """The service has never stored these bytes. Starting to is a decision, not a default."""
+    print("archive: personal id")
+
+    check("a CDL page is recognised",
+          archive._is_pii('{"notes": "photo of an Ohio COMMERCIAL DRIVER LICENSE card"}'))
+    check("so is the reader's own personal_id finding",
+          archive._is_pii('{"personal_id": true}'))
+    check("an ordinary BOL is not", not archive._is_pii('{"document_type": "bill_of_lading"}'))
+    # An unread document flags nothing: withholding every unread page would archive nothing at all
+    # on the first run, which is not a safety property, just an empty bucket.
+    check("an unread document is not treated as personal ID", not archive._is_pii(None))
+
+
+def test_archive_records_what_landed() -> None:
+    """The ledger is the index. If it does not record the key, the next run re-uploads everything."""
+    print("archive: the ledger records it")
+
+    conn = fresh_db()
+    c = db.archive_counts(conn)
+    check("a fresh ledger has archived nothing",
+          c["messages_archived"] == 0 and c["documents_archived"] == 0, str(c))
+
+    conn.execute("INSERT INTO message (message_id, thread_id, internal_date, load_id, part_count) "
+                 "VALUES ('m1','t1','2026-09-22T00:00:00+00:00',2589536,1)")
+    conn.commit()
+    check("an un-archived message is offered", len(db.pending_mail_archive(conn)) == 1)
+    db.mark_mail_archived(conn, "m1", "mail/2026/09/22/m1.json.gz")
+    conn.commit()
+    check("and is not offered again once stored", len(db.pending_mail_archive(conn)) == 0)
+    check("the count reflects it", db.archive_counts(conn)["messages_archived"] == 1)
+
+
 def test_every_load_state_is_classified() -> None:
     """A new load state must be taught to state.shortfall(), or it silently becomes "not needed".
 
@@ -1169,6 +1551,17 @@ def test_every_load_state_is_classified() -> None:
 
 if __name__ == "__main__":
     test_routing()
+    test_no_group_is_a_configuration_not_a_crash()
+    test_every_subcommand_defaults_its_group()
+    test_a_satisfied_load_is_not_paid_to_read()
+    test_satisfied_states_are_derived_not_listed()
+    test_structured_output_refusal_is_learned_once()
+    test_a_transient_lock_does_not_end_a_long_job()
+    test_archive_keys_are_derived_not_random()
+    test_archive_is_idempotent_and_resumable()
+    test_archive_links_mail_to_its_documents()
+    test_archive_withholds_personal_id_by_default()
+    test_archive_records_what_landed()
     test_every_load_state_is_classified()
     test_filters()
     test_photo_stamp()

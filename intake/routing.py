@@ -105,10 +105,16 @@ def sender_domain(from_header: str) -> str:
     return addr.split("@")[-1] if "@" in addr else ""
 
 
-def original_sender(headers: dict[str, str], group: str) -> str:
+def original_sender(headers: dict[str, str], group: str | None) -> str:
     """Google Groups rewrites From to the group address and hides the real sender in
-    X-Original-Sender. Without this every external carrier looks like an internal message."""
+    X-Original-Sender. Without this every external carrier looks like an internal message.
+
+    No group is a legitimate configuration - a mailbox that is not behind a Google Group has nothing
+    to unwrap - and it must not be a crash. It was one until 22 Sep 2026: `intake cycle` passed
+    group=None and every message in the collect step died on `None.lower()`, which the step wrapper
+    reported as one failed step rather than 500 lost messages.
+    """
     frm = headers.get("from", "")
-    if group.lower() in frm.lower() and headers.get("x-original-sender"):
+    if group and group.lower() in frm.lower() and headers.get("x-original-sender"):
         return headers["x-original-sender"]
     return frm
