@@ -739,6 +739,19 @@ def pending_doc_archive(conn: sqlite3.Connection, limit: int = 200,
     return conn.execute(sql, (limit,)).fetchall()
 
 
+def pending_extraction_archive(conn: sqlite3.Connection, limit: int = 500) -> list[sqlite3.Row]:
+    """Documents archived before they were read, and read since.
+
+    Their object in doc/ is tagged pii=unchecked and has no extraction beside it. Nothing else
+    offers them again - they already have an s3_key - so without this the tag would stay
+    `unchecked` for ever, including on a page the reader has since found a licence on.
+    """
+    return conn.execute(
+        "SELECT sha256, s3_key, extraction_json FROM attachment "
+        "WHERE s3_key IS NOT NULL AND s3_extraction_key IS NULL AND extraction_json IS NOT NULL "
+        "LIMIT ?", (limit,)).fetchall()
+
+
 def mark_doc_archived(conn: sqlite3.Connection, sha256: str, key: str,
                       extraction_key: str | None = None) -> None:
     retry_write(conn, "UPDATE attachment SET s3_key=?, s3_extraction_key=COALESCE(?, s3_extraction_key) "

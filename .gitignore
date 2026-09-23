@@ -31,3 +31,6 @@ compare.md
 # run logs (name the S3 bucket and the AWS profile, which carries the account id)
 *.log
 logs/
+
+# lambda build output
+build/

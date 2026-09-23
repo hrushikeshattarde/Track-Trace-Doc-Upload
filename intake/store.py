@@ -41,6 +41,11 @@ knowingly storing them, which is a retention decision rather than an engineering
 carried on the ledger row and stamped on the object as metadata and a tag, so a bucket policy or a
 lifecycle rule can act on it without re-reading a single page. Whether those documents are stored
 at all is `--skip-pii`, and the caller decides.
+
+The tag has three values, not two. `true` and `false` are what the reader found; `unchecked` means
+nobody has read the page, so nobody knows. An unread page used to be tagged `false`, which is a
+claim the service could not back: collection alone never reads, and a driver's licence collected
+that way would have gone into the bucket labelled as not being one.
 """
 from __future__ import annotations
 
@@ -160,7 +165,8 @@ class Store:
                         if_absent=if_absent)
 
     def put_document(self, sha256: str, data: bytes, *, filename: str = "", message_id: str = "",
-                     load_id: int | None = None, pii: bool = False, if_absent: bool = True) -> Stored:
+                     load_id: int | None = None, pii: bool | None = False,
+                     if_absent: bool = True) -> Stored:
         """One document, addressed by content, naming the message it was first seen on.
 
         first-seen rather than "the" message: the same file forwarded through five replies is one
@@ -173,13 +179,18 @@ class Store:
             meta["first-seen-message"] = message_id
         if load_id:
             meta["load-id"] = str(load_id)
-        return self.put(doc_key(sha256), data, metadata=meta,
-                        tags={"pii": "true" if pii else "false"}, if_absent=if_absent)
+        return self.put(doc_key(sha256), data, metadata=meta, tags={"pii": pii_tag(pii)},
+                        if_absent=if_absent)
 
     def put_extraction(self, sha256: str, extraction: dict, *, pii: bool = False) -> Stored:
         data = json.dumps(extraction, ensure_ascii=False).encode("utf-8")
         return self.put(extraction_key(sha256), data, content_type="application/json",
-                        tags={"pii": "true" if pii else "false"}, if_absent=False)
+                        tags={"pii": pii_tag(pii)}, if_absent=False)
+
+    def retag(self, key: str, tags: dict[str, str]) -> None:
+        """Replace an object's tags. How an `unchecked` document gets its real answer once read."""
+        self.s3.put_object_tagging(Bucket=self.bucket, Key=self.full(key), Tagging={
+            "TagSet": [{"Key": k, "Value": v} for k, v in tags.items()]})
 
     # -- reads --------------------------------------------------------------------------------
     def exists(self, key: str) -> bool:
@@ -228,6 +239,11 @@ def from_env(client: Any = None) -> Store | None:
         return None
     return Store(bucket, os.environ.get("INTAKE_S3_PREFIX", "").strip(), client=client,
                  region=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"))
+
+
+def pii_tag(pii: bool | None) -> str:
+    """None is "not read", which is not the same thing as "read and found nothing"."""
+    return "unchecked" if pii is None else ("true" if pii else "false")
 
 
 def _b64(data: bytes) -> str:

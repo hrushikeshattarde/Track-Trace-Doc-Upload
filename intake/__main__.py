@@ -38,8 +38,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from intake import (archive, db, export, filing, gmail as gm, ingest, loadloop, notify, review,  # noqa: E402
-                    store as s3store, tpro as tp, tprodocs)
+from intake import (archive, collector, db, export, filing, gmail as gm, ingest, loadloop,  # noqa: E402
+                    notify, review, store as s3store, tpro as tp, tprodocs)
 from pod_intake.localenv import load_local_env  # noqa: E402
 
 DEFAULT_DB = HERE / "out" / "intake.sqlite3"
@@ -239,6 +239,20 @@ def cmd_tpro_scan(args) -> int:
     print(f"  {both} of {total} hashed file(s) on loads are byte-identical to something in the mail ledger")
     _print_health(conn)
     return 0
+
+
+def cmd_collect(args) -> int:
+    """The S3-only collector, run from here: exactly what the scheduled Lambda does, for a manual
+    run or a check. It uses no ledger, and moves the same bookmark the Lambda does."""
+    store = s3store.from_env()
+    if store is None:
+        print("no archive configured: set INTAKE_S3_BUCKET")
+        return 2
+    gmail = gm.from_env()
+    st = collector.run(gmail, store, group=args.group, max_messages=args.max, verbose=args.verbose)
+    print(st.line())
+    print(f"({gmail.calls} Gmail calls)")
+    return 1 if st.error else 0
 
 
 def cmd_archive(args) -> int:
@@ -696,6 +710,12 @@ def main() -> int:
     cy.add_argument("--pod-map", default=str(POD_MAP))
     cy.add_argument("--requirements", default=str(HERE / "index" / "customer_requirements.json"))
     cy.set_defaults(fn=cmd_cycle)
+
+    co = sub.add_parser("collect", help="S3-only: new Gmail messages and their documents to S3 (what the Lambda runs)")
+    co.add_argument("--max", type=int, default=400, help="messages this run")
+    co.add_argument("--group", default=GROUP)
+    co.add_argument("--verbose", action="store_true")
+    co.set_defaults(fn=cmd_collect)
 
     ar = sub.add_parser("archive", help="store mail and documents in S3")
     ar.add_argument("--limit", type=int, default=500, help="messages this pass")

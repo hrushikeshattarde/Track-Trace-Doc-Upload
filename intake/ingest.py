@@ -55,6 +55,7 @@ class Stats:
     reads_deferred: int = 0
     read_errors: int = 0
     deferred: int = 0
+    vanished: int = 0
     spend_capped: bool = False
     cost_usd: float = 0.0
     mode: str = "history"
@@ -73,6 +74,8 @@ class Stats:
                    if self.reads_deferred else "")
                 + (f", read errors {self.read_errors}" if self.read_errors else "")
                 + (f", {self.deferred} message(s) deferred to the next pass" if self.deferred else "")
+                + (f", {self.vanished} deleted from Gmail before they could be fetched"
+                   if self.vanished else "")
                 + (" [SPEND CAP HIT: some documents left unread]" if self.spend_capped else "")
                 + f", spend ${self.cost_usd:.3f}")
 
@@ -156,10 +159,7 @@ def sync_once(conn, client: gm.Delegated, *, group: str, reader: Reader | None =
     fresh = [r for r in refs if not db.message_seen(conn, r["id"])]
     st.already_seen = len(refs) - len(fresh)
     st.deferred = max(0, len(fresh) - max_messages)
-    messages = []
-    for ref in fresh[:max_messages]:
-        messages.append(client.message(ref["id"]))
-        st.fetched += 1
+    messages = [m for m in (_fetch(client, ref["id"], st) for ref in fresh[:max_messages]) if m]
     # internalDate, never arrival order: history pagination and retries deliver replies out of order,
     # and the thread binding should be set by the earliest message that can resolve it.
     messages.sort(key=lambda m: int(m.get("internalDate") or 0))
@@ -190,6 +190,27 @@ def sync_once(conn, client: gm.Delegated, *, group: str, reader: Reader | None =
     return st
 
 
+def _fetch(client: gm.Delegated, message_id: str, st: Stats) -> dict | None:
+    """One message, or None when Gmail no longer has it.
+
+    History reports a message the moment it arrives, and keeps reporting it after someone deletes
+    it. Fetching it then answers 404, and until 23 Sep 2026 that 404 ended the pass: every message
+    is fetched before any is processed, so nothing committed, the cursor never moved, and the next
+    pass listed the same deleted message and died on it again. One deletion stopped collection for
+    good. There is nothing left to collect for a message that is gone, so it is counted and skipped;
+    any other error is still raised, because a 5xx or a revoked grant is not an absence.
+    """
+    try:
+        msg = client.message(message_id)
+    except gm.GmailError as e:
+        if e.status != 404:
+            raise
+        st.vanished += 1
+        return None
+    st.fetched += 1
+    return msg
+
+
 def backfill_load(conn, client: gm.Delegated, *, group: str, load_id: int,
                   reader: Reader | None = None, st: Stats | None = None,
                   max_messages: int = 40, verbose: bool = False) -> int:
@@ -207,10 +228,7 @@ def backfill_load(conn, client: gm.Delegated, *, group: str, load_id: int,
     st = st or Stats()
     refs = client.search(f"to:{group} subject:{load_id}", cap=max_messages)
     fresh = [r for r in refs if not db.message_seen(conn, r["id"])]
-    messages = []
-    for ref in fresh[:max_messages]:
-        messages.append(client.message(ref["id"]))
-        st.fetched += 1
+    messages = [m for m in (_fetch(client, ref["id"], st) for ref in fresh[:max_messages]) if m]
     st.already_seen += len(refs) - len(fresh)
     messages.sort(key=lambda m: int(m.get("internalDate") or 0))
     for msg in messages:

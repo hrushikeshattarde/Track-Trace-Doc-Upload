@@ -19,8 +19,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from intake import (archive, db, filing, filters, ingest, loadloop, review, routing,  # noqa: E402
-                    state, store as s3store)
+from intake import (archive, collector, db, filing, filters, ingest, loadloop, review,  # noqa: E402
+                    routing, state, store as s3store)
 
 PASSED = 0
 
@@ -1145,12 +1145,38 @@ class FakeS3:
     def __init__(self):
         self.objects: dict[str, bytes] = {}
         self.meta: dict[str, dict] = {}
+        self.tags: dict[str, dict] = {}
+        self.etags: dict[str, str] = {}
         self.puts = 0
 
+    def _refused(self, op):
+        from botocore.exceptions import ClientError
+        return ClientError({"Error": {"Code": "PreconditionFailed", "Message": "At least one of the "
+                                      "pre-conditions you specified did not hold"}}, op)
+
     def put_object(self, Bucket, Key, Body, **kw):      # noqa: N803 - boto3's spelling
+        if "IfMatch" in kw and self.etags.get(Key) != kw["IfMatch"]:
+            raise self._refused("PutObject")
+        if kw.get("IfNoneMatch") == "*" and Key in self.objects:
+            raise self._refused("PutObject")
         self.puts += 1
         self.objects[Key] = Body
         self.meta[Key] = kw.get("Metadata", {})
+        from urllib.parse import parse_qsl
+        self.tags[Key] = dict(parse_qsl(kw.get("Tagging", "")))
+        self.etags[Key] = '"' + hashlib.md5(Body).hexdigest() + '"'
+        return {"ETag": self.etags[Key]}
+
+    def put_object_tagging(self, Bucket, Key, Tagging):  # noqa: N803
+        self.tags[Key] = {t["Key"]: t["Value"] for t in Tagging["TagSet"]}
+        return {}
+
+    def copy_object(self, Bucket, Key, CopySource, CopySourceIfMatch=None, **kw):  # noqa: N803
+        src = CopySource["Key"]
+        if CopySourceIfMatch and self.etags.get(src) != CopySourceIfMatch:
+            raise self._refused("CopyObject")
+        self.objects[Key] = self.objects[src]
+        self.etags[Key] = self.etags[src]
         return {}
 
     def head_object(self, Bucket, Key):                  # noqa: N803
@@ -1161,7 +1187,10 @@ class FakeS3:
 
     def get_object(self, Bucket, Key):                   # noqa: N803
         import io
-        return {"Body": io.BytesIO(self.objects[Key])}
+        if Key not in self.objects:
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "no such key"}}, "GetObject")
+        return {"Body": io.BytesIO(self.objects[Key]), "ETag": self.etags.get(Key, '"0"')}
 
     def delete_object(self, Bucket, Key):                # noqa: N803
         self.objects.pop(Key, None)
@@ -1516,6 +1545,366 @@ def test_archive_records_what_landed() -> None:
     check("the count reflects it", db.archive_counts(conn)["messages_archived"] == 1)
 
 
+def test_a_deleted_message_does_not_stop_collection() -> None:
+    """History keeps naming a message after someone deletes it; fetching it then answers 404.
+
+    Until 23 Sep 2026 that 404 ended the pass before anything committed, so the cursor never moved
+    and every later pass died on the same deleted message. An hourly job would have collected
+    nothing, ever, from the first deletion on.
+    """
+    print("ingest: a deleted message")
+    blob = png(1200, 1600, b"D")
+    msgs = [message(f"del{i}", f"td{i}", f"RE: Load 257810{i}", when_ms=1_700_000_000_000 + i,
+                    parts=[(f"d{i}.png", blob)]) for i in range(3)]
+    conn = fresh_db()
+    fake = FakeGmail(msgs, {f"att-del{i}-0": blob for i in range(3)})
+    real = fake.message
+
+    def gone_or_real(message_id, fmt="full"):
+        if message_id == "del1":
+            raise ingest.gm.GmailError(404, f"/messages/{message_id}", "Requested entity was not found.")
+        return real(message_id, fmt)
+
+    fake.message = gone_or_real
+    st = ingest.sync_once(conn, fake, group="g", reader=None)
+    check("the pass completes", st.fetched == 2, st.line())
+    check("the deleted one is counted, not hidden", st.vanished == 1 and "deleted from Gmail" in st.line(),
+          st.line())
+    check("and the cursor moves past it", db.get_cursor(conn, fake.subject) == "1000")
+
+    def down(message_id, fmt="full"):
+        raise ingest.gm.GmailError(503, f"/messages/{message_id}", "backend unavailable")
+
+    fake.message = down
+    conn2 = fresh_db()
+    try:
+        ingest.sync_once(conn2, fake, group="g", reader=None)
+    except ingest.gm.GmailError:
+        check("any other Gmail error still stops the pass - an outage is not an absence", True)
+    else:
+        check("any other Gmail error still stops the pass - an outage is not an absence", False)
+    check("with the cursor untouched", db.get_cursor(conn2, fake.subject) is None)
+
+
+def _doc_rows(conn, docs: list[tuple[str, str | None]]) -> None:
+    """One message carrying one kept part per (sha256, extraction_json)."""
+    conn.execute("INSERT INTO message (message_id, thread_id, internal_date, load_id, part_count) "
+                 "VALUES ('md','td','2026-09-23T00:00:00+00:00',2589536,?)", (len(docs),))
+    for i, (sha, extraction) in enumerate(docs):
+        conn.execute("INSERT INTO attachment (sha256, filename, bytes, extraction_json) VALUES (?,?,?,?)",
+                     (sha, f"page{i}.png", 10, extraction))
+        conn.execute("INSERT INTO part (message_id, part_id, attachment_id, sha256, decision) "
+                     "VALUES ('md',?,?,?,'keep')", (str(i), f"att-{i}", sha))
+    conn.commit()
+
+
+def test_unread_documents_are_tagged_unchecked() -> None:
+    """Not read is not the same as read and found nothing, and the bucket tag must say which.
+
+    Collection alone never reads a page. Tagging those pii=false claimed a check that never happened,
+    so a licence collected that way would have been stored labelled as not being one.
+    """
+    print("archive: unread documents")
+    check("an unread page has no finding", archive._pii_finding(None) is None)
+    check("and is tagged unchecked", s3store.pii_tag(None) == "unchecked")
+    check("a read page keeps its answer", s3store.pii_tag(False) == "false" and s3store.pii_tag(True) == "true")
+
+    unread, plain, licence = "1" * 64, "2" * 64, "3" * 64
+    conn = fresh_db()
+    _doc_rows(conn, [(unread, None), (plain, '{"document_type": "bill_of_lading"}'),
+                     (licence, '{"personal_id": true}')])
+    fake = FakeS3()
+    store = s3store.Store("b", client=fake)
+    gmail = FakeGmail([], {f"att-{i}": b"PAGE%d" % i for i in range(3)})
+
+    st = archive.archive_documents(conn, gmail, store, in_view_only=False)
+    tag = lambda sha: fake.tags.get(s3store.doc_key(sha), {}).get("pii")  # noqa: E731
+    check("the unread page is stored", s3store.doc_key(unread) in fake.objects, st.line("documents"))
+    check("tagged unchecked, not false", tag(unread) == "unchecked", str(fake.tags))
+    check("the read page says what the reader found", tag(plain) == "false", str(fake.tags))
+    check("a licence is still withheld by default", s3store.doc_key(licence) not in fake.objects)
+    check("and the run says how many went in unchecked", st.unchecked == 1 and "unchecked" in st.line("x"),
+          st.line("documents"))
+
+    # The page is read later. Nothing else would offer it again - it already has an s3_key - so
+    # without the re-tag pass it would say `unchecked` for ever, even once a licence was found on it.
+    conn.execute("UPDATE attachment SET extraction_json=? WHERE sha256=?",
+                 ('{"notes": "COMMERCIAL DRIVER LICENSE"}', unread))
+    conn.commit()
+    st = archive.archive_documents(conn, gmail, store, in_view_only=False)
+    check("once read, it is re-tagged with the answer", tag(unread) == "true", str(fake.tags))
+    check("and its reading is stored beside it", s3store.extraction_key(unread) in fake.objects)
+    check("the run counts it", st.retagged == 1, st.line("documents"))
+    st = archive.archive_documents(conn, gmail, store, in_view_only=False)
+    check("and does not do it twice", st.retagged == 0, st.line("documents"))
+
+
+def raw_mail(mid: str, thread: str, subject: str, *, when_ms: int, snippet: str = "",
+             attachments: list[tuple[str, bytes, str]] | None = None) -> dict:
+    """A message as Gmail's format=raw returns it: the whole RFC822, base64url."""
+    from email.message import EmailMessage
+    m = EmailMessage()
+    m["From"] = "Ratecon <ratecon@circledelivers.com>"
+    m["X-Original-Sender"] = "driver@carrier.example"
+    m["To"] = "ratecon@circledelivers.com"
+    m["Subject"] = subject
+    m.set_content("paperwork attached")
+    for name, data, mime in attachments or []:
+        maintype, subtype = mime.split("/")
+        m.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
+    return {"id": mid, "threadId": thread, "internalDate": str(when_ms), "snippet": snippet,
+            "labelIds": ["INBOX"], "_subject": subject,
+            "raw": base64.urlsafe_b64encode(m.as_bytes()).decode("ascii").rstrip("=")}
+
+
+class FakeRawGmail:
+    """Gmail as the S3-only collector sees it: history, raw messages, thread metadata."""
+
+    subject = "bot@circledelivers.com"
+
+    def __init__(self, messages: list[dict], history_id: str = "2000") -> None:
+        self._m = {m["id"]: m for m in messages}
+        self.history_id = history_id
+        self.calls = 0
+        self.fetched: list[str] = []
+        self.threads_asked: list[str] = []
+        self.gone: set[str] = set()
+        self.failing: set[str] = set()
+        self.expired = False
+        self.searched = ""
+
+    def profile(self) -> dict:
+        return {"historyId": "3000"}
+
+    def _refs(self):
+        return [{"id": m["id"], "threadId": m["threadId"]} for m in self._m.values()]
+
+    def history_since(self, start, label_id=None, max_pages=50):
+        if self.expired:
+            raise collector.gm.CursorTooOld(404, "/history", "startHistoryId too old")
+        return self._refs(), self.history_id
+
+    def search(self, query: str, cap: int = 2000) -> list[dict]:
+        self.searched = query
+        return self._refs()
+
+    def message(self, message_id: str, fmt: str = "full") -> dict:
+        self.calls += 1
+        self.fetched.append(message_id)
+        if message_id in self.gone:
+            raise collector.gm.GmailError(404, f"/messages/{message_id}", "Requested entity was not found.")
+        if message_id in self.failing:
+            raise collector.gm.GmailError(503, f"/messages/{message_id}", "backend unavailable")
+        assert fmt == "raw", fmt
+        return self._m[message_id]
+
+    def thread(self, thread_id: str) -> dict:
+        self.threads_asked.append(thread_id)
+        return {"id": thread_id, "messages": [
+            {"id": m["id"], "internalDate": m["internalDate"], "snippet": m["snippet"],
+             "payload": {"headers": [{"name": "Subject", "value": m["_subject"]}]}}
+            for m in self._m.values() if m["threadId"] == thread_id]}
+
+
+def _bookmarked_store(history_id: str = "1000", taken_at: str = "2026-09-23T12:00:00+00:00"):
+    fake = FakeS3()
+    store = s3store.Store("b", client=fake)
+    collector.write_bookmark(store, collector.Bookmark(history_id, taken_at), create=True)
+    return fake, store
+
+
+def _mail_obj(fake: FakeS3, store, mid: str) -> dict:
+    import gzip
+    import json
+    key = next(k for k in fake.objects if k.startswith("mail/") and k.endswith(f"/{mid}.json.gz"))
+    return json.loads(gzip.decompress(fake.objects[key]))
+
+
+def test_collector_stores_mail_and_documents_linked() -> None:
+    """The S3-only collector must do what the ledger loop and the archive did together, with no ledger."""
+    print("collector: mail and documents, linked, without a ledger")
+    page = png(1200, 1600, b"P")
+    logo = png(900, 120, b"L")                      # passes the size test, fails the shape test
+    pdf = b"%PDF-1.4\n" + b"x" * 50_000
+    msgs = [
+        raw_mail("m1", "t1", "Load 2589536 POD", when_ms=1_758_600_000_000,
+                 attachments=[("pod.png", page, "image/png"), ("logo.png", logo, "image/png")]),
+        raw_mail("m2", "t1", "RE: Load 2589536 POD", when_ms=1_758_600_100_000,
+                 attachments=[("pod.png", page, "image/png")]),
+        raw_mail("m3", "t1", "RE: paperwork", when_ms=1_758_600_200_000,
+                 attachments=[("bol.pdf", pdf, "application/pdf")]),
+        raw_mail("m4", "t9", "hello", when_ms=1_758_600_300_000),
+    ]
+    gmail = FakeRawGmail(msgs)
+    fake, store = _bookmarked_store()
+
+    st = collector.run(gmail, store, group="ratecon@circledelivers.com")
+    check("every message is stored", st.mail_stored == 4 and not st.error, st.line())
+    check("a page forwarded twice is one document", st.docs_stored == 2 and st.docs_already == 1, st.line())
+    page_key = s3store.doc_key(hashlib.sha256(page).hexdigest())
+    check("documents are addressed by content", page_key in fake.objects)
+    check("a logo is not stored as a document",
+          s3store.doc_key(hashlib.sha256(logo).hexdigest()) not in fake.objects)
+    check("unread documents are tagged unchecked", fake.tags[page_key].get("pii") == "unchecked",
+          str(fake.tags.get(page_key)))
+    check("documents -> mail: the first message it arrived on", fake.meta[page_key].get("first-seen-message") == "m1",
+          str(fake.meta[page_key]))
+
+    m1 = _mail_obj(fake, store, "m1")
+    shas = {a["sha256"]: a for a in m1["attachments"]}
+    check("mail -> documents: the manifest names the stored page",
+          hashlib.sha256(page).hexdigest() in shas and shas[hashlib.sha256(page).hexdigest()]["in_doc_prefix"])
+    dropped = [a for a in m1["attachments"] if not a["in_doc_prefix"]]
+    check("and records the dropped logo, with why", len(dropped) == 1 and dropped[0]["decision"] == "signature_or_logo",
+          str(dropped))
+    check("the raw message is kept whole", b"Load 2589536" in base64.b64decode(m1["raw_rfc822_b64"]))
+    check("the group's rewrite is undone", m1["envelope"]["from"] == "driver@carrier.example", m1["envelope"]["from"])
+
+    m3 = _mail_obj(fake, store, "m3")
+    check("a reply with no load number takes its thread's", m3["envelope"]["load_id"] == 2589536
+          and m3["envelope"]["routing_tier"] == "thread", str(m3["envelope"]))
+    check("the thread is asked only when the subject cannot decide", gmail.threads_asked.count("t1") == 1,
+          str(gmail.threads_asked))
+    m4 = _mail_obj(fake, store, "m4")
+    check("mail with no load number anywhere is still stored", m4["envelope"]["load_id"] is None)
+
+    bm = collector.read_bookmark(store)
+    check("the bookmark moves to the history head", bm.history_id == "2000" and bm.stored == [], str(bm))
+
+    st = collector.run(gmail, store, group="ratecon@circledelivers.com")
+    check("a re-run stores nothing twice", st.mail_stored == 0 and st.mail_already == 4 and st.docs_stored == 0,
+          st.line())
+
+
+def test_collector_resumes_where_it_stopped() -> None:
+    """A run cut short must leave the rest for the next one, without redoing what it finished."""
+    print("collector: stopping early")
+    import time as _time
+    msgs = [raw_mail(f"r{i}", f"tr{i}", f"Load 258900{i}", when_ms=1_758_600_000_000 + i) for i in range(5)]
+    gmail = FakeRawGmail(msgs)
+    fake, store = _bookmarked_store()
+
+    st = collector.run(gmail, store, group="g", max_messages=2)
+    bm = collector.read_bookmark(store)
+    check("the cap defers the rest", st.mail_stored == 2 and st.deferred == 3, st.line())
+    check("the bookmark does not move", bm.history_id == "1000", str(bm))
+    check("but remembers what finished", sorted(bm.stored) == ["r0", "r1"], str(bm.stored))
+
+    st = collector.run(gmail, store, group="g", max_messages=2)
+    check("the next run takes the next two", st.mail_stored == 2 and st.done_before == 2, st.line())
+    check("without fetching the finished ones again", len(gmail.fetched) == len(set(gmail.fetched)),
+          str(gmail.fetched))
+    st = collector.run(gmail, store, group="g", max_messages=2)
+    bm = collector.read_bookmark(store)
+    check("the last one lands and only then the bookmark moves", st.deferred == 0 and bm.history_id == "2000"
+          and bm.stored == [], f"{st.line()} {bm}")
+
+    fake2, store2 = _bookmarked_store()
+    st = collector.run(FakeRawGmail(msgs), store2, group="g", deadline=_time.monotonic() - 1)
+    check("past the time limit nothing new is started", st.fetched == 0 and st.stopped_by == "time limit",
+          st.line())
+
+
+def test_collector_errors_and_deletions() -> None:
+    """An outage is not an absence; a deletion is."""
+    print("collector: errors and deleted mail")
+    msgs = [raw_mail(f"e{i}", f"te{i}", f"Load 258910{i}", when_ms=1_758_600_000_000 + i) for i in range(3)]
+
+    gmail = FakeRawGmail(msgs)
+    gmail.gone.add("e1")
+    fake, store = _bookmarked_store()
+    st = collector.run(gmail, store, group="g")
+    check("a deleted message is counted and passed", st.vanished == 1 and st.mail_stored == 2 and not st.error,
+          st.line())
+    check("and the bookmark moves", collector.read_bookmark(store).history_id == "2000")
+
+    gmail = FakeRawGmail(msgs)
+    gmail.failing.add("e1")
+    fake, store = _bookmarked_store()
+    st = collector.run(gmail, store, group="g")
+    bm = collector.read_bookmark(store)
+    check("any other error stops the run", bool(st.error) and st.mail_stored == 1, st.line())
+    check("keeping what finished, and not moving past the failure",
+          bm.history_id == "1000" and bm.stored == ["e0"], str(bm))
+
+
+def test_collector_bookmark_is_guarded() -> None:
+    """The bookmark is the one thing every run depends on."""
+    print("collector: the bookmark")
+    fake = FakeS3()
+    store = s3store.Store("b", client=fake)
+    try:
+        collector.read_bookmark(store)
+    except Exception:                                            # noqa: BLE001
+        check("no bookmark is an error, never a blank start", True)
+    else:
+        check("no bookmark is an error, never a blank start", False)
+
+    bm = collector.Bookmark("1000", "2026-09-23T00:00:00+00:00")
+    collector.write_bookmark(store, bm, create=True)
+    try:
+        collector.write_bookmark(store, bm, create=True)
+    except collector.BookmarkChanged:
+        check("seeding refuses to replace a live bookmark", True)
+    else:
+        check("seeding refuses to replace a live bookmark", False)
+
+    held = collector.read_bookmark(store)
+    moved = collector.read_bookmark(store)
+    moved.history_id = "1500"
+    collector.write_bookmark(store, moved)
+    try:
+        collector.write_bookmark(store, held)
+    except collector.BookmarkChanged:
+        check("a run holding a stale bookmark cannot move it", True)
+    else:
+        check("a run holding a stale bookmark cannot move it", False)
+    check("and the newer one stands", collector.read_bookmark(store).history_id == "1500")
+
+    msgs = [raw_mail("x1", "tx", "Load 2589201", when_ms=1_758_600_000_000)]
+    gmail = FakeRawGmail(msgs)
+    gmail.expired = True
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=9)).isoformat(timespec="seconds")
+    fake, store = _bookmarked_store(taken_at=old)
+    st = collector.run(gmail, store, group="ratecon@circledelivers.com")
+    check("an expired bookmark re-walks the whole gap", "newer_than:10d" in gmail.searched, gmail.searched)
+    check("and restarts from the mailbox head", collector.read_bookmark(store).history_id == "3000"
+          and st.mail_stored == 1, st.line())
+
+
+def test_lambda_wiring() -> None:
+    """The handler reads its settings, runs one pass, and fails loudly only after saving the bookmark."""
+    print("lambda: wiring")
+    import os
+    import boto3
+    from intake import aws_lambda
+    msgs = [raw_mail("w1", "tw", "Load 2589300", when_ms=1_758_600_000_000)]
+    gmail = FakeRawGmail(msgs)
+    fake, store = _bookmarked_store()
+    saved = (boto3.client, aws_lambda._service_account, aws_lambda.gm.Delegated, dict(os.environ))
+    try:
+        boto3.client = lambda name, *a, **k: fake
+        aws_lambda._service_account = lambda secret_id: {"client_email": "x", "private_key": "y"}
+        aws_lambda.gm.Delegated = lambda info, subject: gmail
+        os.environ.update({"INTAKE_S3_BUCKET": "b", "INTAKE_GMAIL_SECRET": "s", "PAYBOT_GMAIL_USER": "u"})
+        out = aws_lambda.handler({}, None)
+        check("one pass runs and reports", "1 mail stored" in out["collect"], out["collect"])
+        gmail.failing.add("w2")
+        gmail._m["w2"] = raw_mail("w2", "tw2", "Load 2589301", when_ms=1_758_600_000_001)
+        try:
+            aws_lambda.handler({}, None)
+        except RuntimeError:
+            check("a failed run raises, so the Errors metric sees it", True)
+        else:
+            check("a failed run raises, so the Errors metric sees it", False)
+        check("after its bookmark was saved", collector.read_bookmark(store).stored == ["w1"],
+              str(collector.read_bookmark(store)))
+    finally:
+        boto3.client, aws_lambda._service_account, aws_lambda.gm.Delegated = saved[:3]
+        os.environ.clear()
+        os.environ.update(saved[3])
+
+
 def test_every_load_state_is_classified() -> None:
     """A new load state must be taught to state.shortfall(), or it silently becomes "not needed".
 
@@ -1562,6 +1951,13 @@ if __name__ == "__main__":
     test_archive_links_mail_to_its_documents()
     test_archive_withholds_personal_id_by_default()
     test_archive_records_what_landed()
+    test_a_deleted_message_does_not_stop_collection()
+    test_unread_documents_are_tagged_unchecked()
+    test_collector_stores_mail_and_documents_linked()
+    test_collector_resumes_where_it_stopped()
+    test_collector_errors_and_deletions()
+    test_collector_bookmark_is_guarded()
+    test_lambda_wiring()
     test_every_load_state_is_classified()
     test_filters()
     test_photo_stamp()

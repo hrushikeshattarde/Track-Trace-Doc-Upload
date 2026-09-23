@@ -183,6 +183,12 @@ class Delegated:
     def message(self, message_id: str, fmt: str = "full") -> dict:
         return self.get(f"/users/{self._me}/messages/{message_id}", {"format": fmt})
 
+    def thread(self, thread_id: str) -> dict:
+        """Every message of a thread, headers and snippet only - how the S3-only collector learns
+        which load a reply belongs to without a ledger to remember it."""
+        return self.get(f"/users/{self._me}/threads/{thread_id}",
+                        [("format", "metadata"), ("metadataHeaders", "Subject")])
+
     def attachment_bytes(self, message_id: str, attachment_id: str) -> bytes:
         data = self.get(f"/users/{self._me}/messages/{message_id}/attachments/{attachment_id}")
         return base64.urlsafe_b64decode(data["data"] + "==")
