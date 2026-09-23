@@ -1040,7 +1040,20 @@ def mark_backfilled(conn: sqlite3.Connection, load_id: int) -> None:
 
 
 def mark_in_view(conn: sqlite3.Connection, load_id: int) -> None:
-    conn.execute("UPDATE load SET in_view=1, view_checked_at=? WHERE load_id=?", (now_iso(), load_id))
+    """The sweep saw this load in the view. One that has no next check and is not finished is due
+    now: nothing else would ever schedule it.
+
+    A load only gets its first check scheduled when the sweep creates its row. A row that already
+    existed without a next check - left that way by an earlier version, or cleared when the load
+    dropped out of the view and later came back - was seen every run and checked never: on 23 Sep
+    2026 ten dashboard loads had sat as `new`, with no next check, since 15 Sep. complete and
+    in_review have no next check on purpose and keep it that way.
+    """
+    now = now_iso()
+    conn.execute(
+        "UPDATE load SET in_view=1, view_checked_at=?, "
+        "next_check_at = CASE WHEN next_check_at IS NULL AND COALESCE(state,'') NOT IN ('complete','in_review') "
+        "THEN ? ELSE next_check_at END WHERE load_id=?", (now, now, load_id))
 
 
 def clear_stale_out_of_view(conn: sqlite3.Connection) -> int:

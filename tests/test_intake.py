@@ -2158,6 +2158,27 @@ def test_worker_run() -> None:
         os.environ.update(saved[4])
 
 
+def test_a_load_the_sweep_sees_is_never_left_unscheduled() -> None:
+    """Seen every run and checked never: ten dashboard loads sat as `new` with no next check from
+    15 Sep to 23 Sep 2026, because only a sweep that CREATED a row scheduled its first check."""
+    print("load loop: nothing in the view goes unscheduled")
+    conn = fresh_db()
+    for lid, st_ in ((2559369, "new"), (2560001, "not_in_view"), (2560002, "complete"), (2560003, "in_review")):
+        conn.execute("INSERT INTO load (load_id, state, source, created_at, next_check_at) VALUES (?,?,?,?,NULL)",
+                     (lid, st_, "dashboard", "2026-09-15T18:23:45+00:00"))
+    for lid in (2559369, 2560001, 2560002, 2560003):
+        db.mark_in_view(conn, lid)
+    due = {int(r["load_id"]) for r in db.due_loads(conn, 100)}
+    check("a load with no next check is due once the sweep sees it", 2559369 in due, str(due))
+    check("so is one that dropped out of the view and came back", 2560001 in due, str(due))
+    check("a complete load stays unscheduled", 2560002 not in due)
+    check("and so does one a person owns", 2560003 not in due)
+    conn.execute("UPDATE load SET next_check_at='2099-01-01T00:00:00+00:00' WHERE load_id=2559369")
+    db.mark_in_view(conn, 2559369)
+    check("a load that already has a next check keeps it", conn.execute(
+        "SELECT next_check_at FROM load WHERE load_id=2559369").fetchone()[0] == "2099-01-01T00:00:00+00:00")
+
+
 def test_every_load_state_is_classified() -> None:
     """A new load state must be taught to state.shortfall(), or it silently becomes "not needed".
 
@@ -2215,6 +2236,7 @@ if __name__ == "__main__":
     test_the_ledger_goes_back_only_over_what_was_taken()
     test_working_hours()
     test_worker_run()
+    test_a_load_the_sweep_sees_is_never_left_unscheduled()
     test_every_load_state_is_classified()
     test_filters()
     test_photo_stamp()
