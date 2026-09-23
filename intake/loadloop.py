@@ -35,13 +35,16 @@ class ReconcileStats:
     left_view: int = 0
     wrong_level: int = 0
     stale_cleared: int = 0
+    doc_status_changed: int = 0
 
     def line(self) -> str:
         return (f"reconcile: {self.seen} load(s) in the Load Management view across "
                 f"{self.terminals} terminal(s) - {self.created} new to the ledger, "
                 f"{self.already} already there, {self.left_view} evicted from the view"
                 + (f"; {self.wrong_level} dropped by service level" if self.wrong_level else "")
-                + (f"; {self.stale_cleared} stale non-view rows tidied" if self.stale_cleared else ""))
+                + (f"; {self.stale_cleared} stale non-view rows tidied" if self.stale_cleared else "")
+                + (f"; {self.doc_status_changed} changed document status in TransportPro"
+                   if self.doc_status_changed else ""))
 
 
 @dataclass
@@ -50,10 +53,11 @@ class DrainStats:
     errors: int = 0
     states: dict[str, int] = field(default_factory=dict)
     tpro_calls: int = 0
+    label: str = "drain"
 
     def line(self) -> str:
         by = ", ".join(f"{k} {v}" for k, v in sorted(self.states.items(), key=lambda kv: -kv[1])) or "none"
-        return (f"drain: {self.checked} load(s) checked, {self.errors} deferred on error, "
+        return (f"{self.label}: {self.checked} load(s) checked, {self.errors} deferred on error, "
                 f"{self.tpro_calls} TransportPro calls | {by}")
 
 
@@ -87,7 +91,7 @@ def search_window(tpro: TransportPro, params: dict, start: dt.date, end: dt.date
 def reconcile(conn, tpro: TransportPro, *, terminals: list[int], days_back: int = 3,
               days_forward: int = 45, statuses: tuple[str, ...] = ("Dispatched",),
               scope_levels: set[str] | None = None, authoritative: bool = False,
-              verbose: bool = False) -> ReconcileStats:
+              changes: list[int] | None = None, verbose: bool = False) -> ReconcileStats:
     """Give every load in the dashboard view a ledger row.
 
     days_back is the knob that separates the hourly pass from the nightly audit: a narrow window
@@ -98,6 +102,13 @@ def reconcile(conn, tpro: TransportPro, *, terminals: list[int], days_back: int 
     pickup is older than the window, and evicting those would silently drop exactly the aged,
     still-moving freight this design exists to keep. Measured 15 Sep 2026: a 3-day sweep saw 456
     loads where the full window saw 527+.
+
+    `changes`, when given, collects the loads whose document status in TransportPro differs from
+    the one the last check recorded. The search rows carry it for free, and it is the only way the
+    service learns that somebody else filed a document: load 2535232 had its Bill Of Lading filed at
+    16:46 UTC on 23 Sep 2026 and was not looked at again until its hourly timer came round, which
+    a backlog pushed past 17:40. A load never checked has nothing to differ from and is not listed -
+    it is already due.
     """
     today = dt.date.today()
     start, end = today - dt.timedelta(days=days_back), today + dt.timedelta(days=days_forward)
@@ -124,7 +135,12 @@ def reconcile(conn, tpro: TransportPro, *, terminals: list[int], days_back: int 
                 continue
             kept += 1
             rs.seen += 1
-            existed = conn.execute("SELECT 1 FROM load WHERE load_id=?", (load_id,)).fetchone() is not None
+            prior = conn.execute("SELECT doc_status FROM load WHERE load_id=?", (load_id,)).fetchone()
+            existed = prior is not None
+            now_doc = (row.get("status") or {}).get("documentStatus")
+            if changes is not None and existed and prior[0] and now_doc and now_doc != prior[0]:
+                changes.append(load_id)
+                rs.doc_status_changed += 1
             # due_now on creation only: an existing row keeps the cadence drain() gave it, so
             # reconciling never resets the clock on work already scheduled.
             db.upsert_load(conn, load_id, source="dashboard", due_now=not existed)
@@ -146,30 +162,49 @@ def drain(conn, tpro: TransportPro, *, limit: int = 100, scope_levels: set[str] 
     ds = DrainStats()
     before = tpro.calls
     for row in db.due_loads(conn, limit):
-        load_id = int(row["load_id"])
-        try:
-            load = tpro.load(load_id)
-            dispatches = tpro.dispatches(load_id)
-            files = tpro.files(load_id)
-        except TProError as e:
-            # A load that cannot be read is pushed out and kept. It stays in the coverage count,
-            # so a systematic API failure shows up as queue lag rather than as loads quietly gone.
-            db.defer_load(conn, load_id, str(e))
-            ds.errors += 1
-            print(f"  ! load {load_id}: {e}")
-            continue
-        docs, unread = db.load_doc_evidence(conn, load_id)
-        dropped = db.load_dropped_evidence(conn, load_id)
-        assessment = st.assess(load_id, load, dispatches, files, ledger_docs=docs, ledger_unread=unread,
-                               ledger_dropped=dropped, pod_claims=db.filed_pod_claims(conn, load_id),
-                               scope_levels=scope_levels)
-        db.update_load(conn, load_id, assessment)
-        ds.checked += 1
-        ds.states[assessment["state"]] = ds.states.get(assessment["state"], 0) + 1
-        if verbose:
-            print(f"  {load_id}  {assessment['state']:22} {assessment['stage'] or '':13} {assessment['action'][:88]}")
+        _check_one(conn, tpro, int(row["load_id"]), ds, scope_levels=scope_levels, verbose=verbose)
     ds.tpro_calls = tpro.calls - before
     return ds
+
+
+def check_loads(conn, tpro: TransportPro, load_ids: list[int], *, scope_levels: set[str] | None = None,
+                verbose: bool = False) -> DrainStats:
+    """Check these loads now, whatever their timers say - the ones reconcile saw change.
+
+    The same check drain() makes, so a load checked here gets the same state and the same next
+    check; drain() then passes over it because its next check is in the future again.
+    """
+    ds = DrainStats(label="changed in TransportPro")
+    before = tpro.calls
+    for load_id in dict.fromkeys(load_ids):
+        _check_one(conn, tpro, int(load_id), ds, scope_levels=scope_levels, verbose=verbose)
+    ds.tpro_calls = tpro.calls - before
+    return ds
+
+
+def _check_one(conn, tpro: TransportPro, load_id: int, ds: DrainStats, *,
+               scope_levels: set[str] | None, verbose: bool) -> None:
+    try:
+        load = tpro.load(load_id)
+        dispatches = tpro.dispatches(load_id)
+        files = tpro.files(load_id)
+    except TProError as e:
+        # A load that cannot be read is pushed out and kept. It stays in the coverage count,
+        # so a systematic API failure shows up as queue lag rather than as loads quietly gone.
+        db.defer_load(conn, load_id, str(e))
+        ds.errors += 1
+        print(f"  ! load {load_id}: {e}")
+        return
+    docs, unread = db.load_doc_evidence(conn, load_id)
+    dropped = db.load_dropped_evidence(conn, load_id)
+    assessment = st.assess(load_id, load, dispatches, files, ledger_docs=docs, ledger_unread=unread,
+                           ledger_dropped=dropped, pod_claims=db.filed_pod_claims(conn, load_id),
+                           scope_levels=scope_levels)
+    db.update_load(conn, load_id, assessment)
+    ds.checked += 1
+    ds.states[assessment["state"]] = ds.states.get(assessment["state"], 0) + 1
+    if verbose:
+        print(f"  {load_id}  {assessment['state']:22} {assessment['stage'] or '':13} {assessment['action'][:88]}")
 
 
 def pod_terminals(path) -> tuple[list[int], set[str]]:

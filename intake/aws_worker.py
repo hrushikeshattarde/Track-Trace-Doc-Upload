@@ -5,9 +5,12 @@ One invocation:
     1. take the ledger from S3                      (ledger_s3 - one writer, If-Match on the way back)
     2. mail      record what the collector stored   (mailsync - S3 only, no Gmail, no TransportPro)
     3. loads     inside working hours only:
-                   the day's first run   full dashboard sweep, the audit that may drop loads from view
-                   hourly                narrow dashboard sweep, catches newly dispatched loads
-                   every run             check the loads whose next check has come round, capped
+                   sweep     the dashboard, every run. The day's first is the full audit, the only one
+                             that may drop loads from the view; the rest cover pickups 42 days back
+                   changed   loads whose document status in TransportPro moved since their last
+                             check - somebody else filed something - are checked straight away
+                   check     then the loads whose next check has come round, oldest first
+                 changed + check together stay within INTAKE_LOAD_LIMIT loads a run
     4. hand the ledger back
 
 Nothing is read by a model and nothing is written to TransportPro; those are later steps. The
@@ -34,9 +37,11 @@ from typing import Any
 from . import db, ledger_s3, loadloop, mailsync, store as s3store, tpro as tp
 
 FULL_SWEEP_DAYS_BACK = 350      # the nightly audit window `intake reconcile` documents
-HOURLY_DAYS_BACK = 3
+# The every-run sweep. /load/search takes a pickup-date window of at most 45 days, so the old 3-day
+# sweep already cost two windows per terminal; 42 days back fills the same two and sees the loads
+# picked up weeks ago that are still waiting on paperwork, for the same ~32 calls.
+STATUS_SWEEP_DAYS_BACK = 42
 DAYS_FORWARD = 45
-RECONCILE_EVERY_MIN = 55        # "hourly" on a 15-minute schedule, without drifting to 75
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 # Kept back from the timeout for handing the ledger back: a run killed before it uploads throws away
@@ -98,24 +103,30 @@ def handler(event: dict | None, context: Any) -> dict:
             tpro = None
     if tpro is not None:
         today = now_local.date().isoformat()
-        if db.get_state(conn, "full_sweep_day") != today:
-            # The day's first run is the audit. It is the only sweep allowed to decide a load has left
-            # the view, because it is the only one that looked at the whole window. It runs alone:
-            # together with a full check pass it can approach the timeout.
-            if step("full_sweep", lambda: loadloop.reconcile(
-                    conn, tpro, terminals=terminals, days_back=FULL_SWEEP_DAYS_BACK,
-                    days_forward=DAYS_FORWARD, scope_levels=levels, authoritative=True).line()):
+        limit = int(env.get("INTAKE_LOAD_LIMIT", "150"))
+        full = db.get_state(conn, "full_sweep_day") != today
+        changed: list[int] = []
+        # The day's first sweep is the audit: the only one allowed to decide a load has left the view,
+        # because it is the only one that looked at the whole window.
+        if step("full_sweep" if full else "sweep", lambda: loadloop.reconcile(
+                conn, tpro, terminals=terminals,
+                days_back=FULL_SWEEP_DAYS_BACK if full else STATUS_SWEEP_DAYS_BACK,
+                days_forward=DAYS_FORWARD, scope_levels=levels, authoritative=full,
+                changes=changed).line()):
+            db.set_state(conn, "reconcile_at", db.now_iso())
+            if full:
                 db.set_state(conn, "full_sweep_day", today)
-                db.set_state(conn, "reconcile_at", db.now_iso())
+        # A load whose status moved in TransportPro goes first, ahead of the timer queue: its timer
+        # can be an hour away, and a backlog can push it further.
+        first = changed[:limit]
+        if first:
+            step("changed", lambda: loadloop.check_loads(conn, tpro, first, scope_levels=levels).line())
+        if full:
+            # The audit runs without the regular checks: together they can approach the timeout.
             steps["check"] = "not this run: the day's full sweep ran; loads are checked from the next run"
         else:
-            if _older_than(db.get_state(conn, "reconcile_at"), RECONCILE_EVERY_MIN):
-                if step("reconcile", lambda: loadloop.reconcile(
-                        conn, tpro, terminals=terminals, days_back=HOURLY_DAYS_BACK,
-                        days_forward=DAYS_FORWARD, scope_levels=levels).line()):
-                    db.set_state(conn, "reconcile_at", db.now_iso())
             step("check", lambda: loadloop.drain(
-                conn, tpro, limit=int(env.get("INTAKE_LOAD_LIMIT", "100")), scope_levels=levels).line())
+                conn, tpro, limit=max(0, limit - len(first)), scope_levels=levels).line())
         steps["transportpro_calls"] = str(tpro.calls)
 
     states = dict(conn.execute("SELECT state, COUNT(*) FROM load WHERE in_view=1 GROUP BY state").fetchall())
@@ -163,13 +174,6 @@ def _days(spec: str) -> set[str]:
         else:
             out.add(part.strip()[:3])
     return out
-
-
-def _older_than(iso: str | None, minutes: int) -> bool:
-    if not iso:
-        return True
-    then = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
-    return dt.datetime.now(dt.timezone.utc) - then >= dt.timedelta(minutes=minutes)
 
 
 def _tpro_login(secret_id: str, env) -> dict:

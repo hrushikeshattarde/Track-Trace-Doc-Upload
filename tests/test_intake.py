@@ -2033,7 +2033,10 @@ def test_working_hours() -> None:
 
 
 class _WorkerTPro:
-    """TransportPro for the worker: one terminal with one in-scope load, reads only."""
+    """TransportPro for the worker: one terminal with one in-scope load, reads only. `doc` is the
+    load's document status, shared across instances so a test can change it between runs."""
+
+    doc = {"status": "Waiting for Documents"}
 
     def __init__(self, **login):
         self.login = login
@@ -2041,11 +2044,11 @@ class _WorkerTPro:
 
     def search_all_pages(self, params, max_pages=20):
         self.calls += 1
-        return [{**tp_load(), "id": 2589536}]
+        return [{**tp_load(doc_status=self.doc["status"]), "id": 2589536}]
 
     def load(self, load_id):
         self.calls += 1
-        return tp_load()
+        return tp_load(doc_status=self.doc["status"])
 
     def dispatches(self, load_id):
         self.calls += 1
@@ -2123,9 +2126,24 @@ def test_worker_run() -> None:
         out = aws_worker.handler({}, None)
         check("the next run checks the loads that are due", "checked" in out["worker"]["check"]
               and "full_sweep" not in out["worker"], str(out["worker"]))
-        check("and skips the hourly sweep it did minutes ago", "reconcile" not in out["worker"], str(out["worker"]))
+        check("and sweeps the dashboard every run, not hourly", "sweep" in out["worker"], str(out["worker"]))
         state_now = ledger_now().execute("SELECT state FROM load WHERE load_id=2589536").fetchone()[0]
         check("the load now has a real state", state_now not in ("new", None), str(state_now))
+        check("nothing changed yet, so nothing jumps the queue", "changed" not in out["worker"], str(out["worker"]))
+
+        # Somebody else files the paperwork in TransportPro - load 2535232, 23 Sep 2026. The load's
+        # timer is an hour away; the sweep sees the status move and it is checked in this run.
+        _WorkerTPro.doc["status"] = "Documents Received"
+        out = aws_worker.handler({}, None)
+        check("a load whose status changed in TransportPro is spotted by the sweep",
+              "1 changed document status" in out["worker"]["sweep"], out["worker"]["sweep"])
+        check("and checked in the same run, ahead of the queue",
+              out["worker"].get("changed", "").startswith("changed in TransportPro: 1 load(s) checked"),
+              str(out["worker"]))
+        check("and records what TransportPro says now", ledger_now().execute(
+            "SELECT doc_status FROM load WHERE load_id=2589536").fetchone()[0] == "Documents Received")
+        check("the regular checks do not check it twice", "drain: 0 load(s) checked" in out["worker"]["check"],
+              out["worker"]["check"])
 
         clock["now"] = dt.datetime(2026, 9, 26, 10, 0, tzinfo=et)     # a Saturday
         calls_before = len(made)
@@ -2133,6 +2151,7 @@ def test_worker_run() -> None:
         check("outside working hours TransportPro is not called", len(made) == calls_before
               and "not checked" in out["worker"]["loads"], str(out["worker"]))
     finally:
+        _WorkerTPro.doc["status"] = "Waiting for Documents"
         (boto3.client, aws_worker.tp.TransportPro, aws_worker.local_now,
          aws_worker.mailsync.ingest_recent) = saved[:4]
         os.environ.clear()

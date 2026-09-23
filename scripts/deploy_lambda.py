@@ -79,7 +79,9 @@ def _worker_env(env: dict) -> dict:
             "INTAKE_TPRO_SECRET": TPRO_SECRET, "INTAKE_TPRO_USERNAME": env["PAYBOT_TP_USERNAME"],
             "INTAKE_TPRO_BASE_URL": env["PAYBOT_TP_BASE_URL"], "INTAKE_TZ": "America/New_York",
             "INTAKE_ACTIVE_HOURS": "06-20", "INTAKE_ACTIVE_DAYS": "mon-fri",
-            "INTAKE_LOAD_LIMIT": "100", "INTAKE_MAIL_DAYS": "7"}
+            # 150, raised from 100 on 23 Sep 2026: at 100 the loads due each working hour matched the
+            # cap exactly, so any backlog made them late. TransportPro took 1,200 calls an hour cleanly.
+            "INTAKE_LOAD_LIMIT": "150", "INTAKE_MAIL_DAYS": "7"}
 
 
 def _collector_policy(b: str, secret_arn: str) -> dict:
