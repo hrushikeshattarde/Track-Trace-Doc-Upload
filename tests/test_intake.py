@@ -2179,6 +2179,72 @@ def test_a_load_the_sweep_sees_is_never_left_unscheduled() -> None:
         "SELECT next_check_at FROM load WHERE load_id=2559369").fetchone()[0] == "2099-01-01T00:00:00+00:00")
 
 
+def test_a_dropped_connection_is_retried_not_fatal() -> None:
+    """On 23 Sep 2026 TransportPro closed one connection without answering; the raw exception
+    skipped the client's retry and stopped a whole check pass."""
+    print("transportpro: a dropped connection")
+    import http.client
+    import io
+    from intake import tpro as tp_mod
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    script: list = []
+
+    def fake_urlopen(req, timeout=None):
+        step_ = script.pop(0)
+        if isinstance(step_, BaseException):
+            raise step_
+        return _Resp(step_)
+
+    saved = (tp_mod.urllib.request.urlopen, tp_mod.time.sleep)
+    try:
+        tp_mod.urllib.request.urlopen = fake_urlopen
+        tp_mod.time.sleep = lambda s: None
+        client = tp_mod.TransportPro("https://tp.example", "u", "p")
+        client._access = "token"                     # already logged in
+
+        script[:] = [http.client.RemoteDisconnected("Remote end closed connection without response"),
+                     b'{"id": 2591458}']
+        check("a dropped connection is retried", client.get("/load/2591458") == {"id": 2591458})
+
+        script[:] = [ConnectionResetError("reset")] * 3
+        try:
+            client.get("/load/2591458")
+        except tp_mod.TProError as e:
+            check("and if it keeps failing it is a TProError, which callers handle", "network" in str(e), str(e))
+        else:
+            check("and if it keeps failing it is a TProError, which callers handle", False)
+
+        class _Flaky:
+            calls = 0
+
+            def load(self, load_id):
+                if load_id == 2591458:
+                    raise tp_mod.TProError(0, "/load/2591458", "network: RemoteDisconnected")
+                return tp_load()
+
+            def dispatches(self, load_id):
+                return [{"id": 1, "status": "Loaded"}]
+
+            def files(self, load_id):
+                return []
+
+        conn = fresh_db()
+        for lid in (2591458, 2591459):
+            db.upsert_load(conn, lid, source="dashboard", due_now=True)
+            db.mark_in_view(conn, lid)
+        ds = loadloop.drain(conn, _Flaky(), limit=10)
+        check("one unreachable load is deferred and the pass carries on", ds.checked == 1 and ds.errors == 1, ds.line())
+    finally:
+        tp_mod.urllib.request.urlopen, tp_mod.time.sleep = saved
+
+
 def test_every_load_state_is_classified() -> None:
     """A new load state must be taught to state.shortfall(), or it silently becomes "not needed".
 
@@ -2237,6 +2303,7 @@ if __name__ == "__main__":
     test_working_hours()
     test_worker_run()
     test_a_load_the_sweep_sees_is_never_left_unscheduled()
+    test_a_dropped_connection_is_retried_not_fatal()
     test_every_load_state_is_classified()
     test_filters()
     test_photo_stamp()

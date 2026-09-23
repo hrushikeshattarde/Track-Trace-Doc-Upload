@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import http.client
 import json
 import os
 import time
@@ -36,6 +37,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
+
+# Failures of the connection itself rather than answers from TransportPro: a dropped or reset
+# connection, a timeout, a DNS blip. HTTPError is a URLError too, so every handler catches it first.
+NETWORK_ERRORS = (urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError)
 
 # Ask for an uncompressed body. TransportPro gzips its /auth and /load/search responses even when
 # urllib advertises no encoding (seen 15 Sep 2026: a gzip magic number where JSON was expected),
@@ -104,6 +109,8 @@ class TransportPro:
                 return json.loads(_body(r) or "{}")
         except urllib.error.HTTPError as e:
             raise TProError(e.code, path, e.read().decode("utf-8", "replace")) from None
+        except NETWORK_ERRORS as e:
+            raise TProError(0, path, f"network: {type(e).__name__}: {e}") from None
 
     # -- transport ---------------------------------------------------------
     def get(self, path: str, params: dict[str, str] | None = None) -> Any:
@@ -131,6 +138,17 @@ class TransportPro:
                     time.sleep(2 ** attempt)
                     continue
                 raise TProError(e.code, path, body) from None
+            except NETWORK_ERRORS as e:
+                # A dropped connection is not an answer, so it never reached the status handling
+                # above: on 23 Sep 2026 one "Remote end closed connection without response" escaped
+                # as a raw exception and stopped a whole check pass. Retried like a 503; if it
+                # persists it becomes a TProError, which callers already handle - drain() defers
+                # that one load and carries on.
+                self._last_call = time.time()
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise TProError(0, path, f"network: {type(e).__name__}: {e}") from None
         raise TProError(0, path, "retries exhausted")
 
     @staticmethod
