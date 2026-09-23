@@ -362,6 +362,75 @@ def cmd_bookmark(args) -> int:
     return 0
 
 
+def lifecycle_rules(prefix: str, keep_days: int, archive_after: int, pii_days: int, snapshot_days: int) -> list[dict]:
+    """How long the archive keeps things, as S3 lifecycle rules - S3 applies them itself, nightly.
+
+    Chosen 23 Sep 2026 over deleting a load's mail when the load completes: "complete" is not final
+    (loads reopen, POD disputes, billing corrections), claims arrive months later, a broker keeps
+    shipment records for three years (49 CFR 371.3 - confirm the period with compliance), and one
+    document can belong to more than one load.
+
+    Glacier Instant Retrieval, not Deep Archive: objects here average ~0.6 MB, and Deep Archive's
+    per-object transition fee costs more than its lower storage price saves at that size. GIR reads
+    are still instant, so nothing that later needs a document has to wait for a restore. Objects
+    under 128 KB are not transitioned at all - they would be billed as 128 KB there.
+
+    The personal-ID rule removes the separate page in doc/ only. The same attachment is inside its
+    archived email, which the mail rule keeps for the full period - stripping it from there is part
+    of the reading step, which is where a page is first known to be personal ID.
+    """
+    p = prefix
+    archive = {"Transitions": [{"Days": archive_after, "StorageClass": "GLACIER_IR"}], "Expiration": {"Days": keep_days}}
+    return [
+        {"ID": "intake-mail", "Status": "Enabled", "Filter": {"Prefix": f"{p}mail/"}, **archive},
+        {"ID": "intake-documents", "Status": "Enabled", "Filter": {"Prefix": f"{p}doc/"}, **archive},
+        {"ID": "intake-personal-id", "Status": "Enabled",
+         "Filter": {"And": {"Prefix": f"{p}doc/", "Tags": [{"Key": "pii", "Value": "true"}]}},
+         "Expiration": {"Days": pii_days}},
+        {"ID": "intake-ledger-snapshots", "Status": "Enabled", "Filter": {"Prefix": "ledger/snapshots/"},
+         "Expiration": {"Days": snapshot_days}},
+        {"ID": "intake-abandoned-uploads", "Status": "Enabled", "Filter": {"Prefix": ""},
+         "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7}},
+    ]
+
+
+def cmd_lifecycle(args) -> int:
+    """Show the retention rules; with --apply, put them on the bucket.
+
+    Refuses to replace lifecycle rules it did not write: a bucket's lifecycle configuration is one
+    document, and putting ours would silently delete anybody else's.
+    """
+    env = _env()
+    bucket = env["INTAKE_S3_BUCKET"]
+    prefix = (env.get("INTAKE_S3_PREFIX", "").strip("/") + "/") if env.get("INTAKE_S3_PREFIX", "").strip("/") else ""
+    rules = lifecycle_rules(prefix, args.keep_days, args.archive_after, args.pii_days, args.snapshot_days)
+    s3 = _aws().client("s3")
+    try:
+        current = s3.get_bucket_lifecycle_configuration(Bucket=bucket).get("Rules", [])
+    except s3.exceptions.ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "NoSuchLifecycleConfiguration":
+            raise
+        current = []
+    foreign = [r.get("ID") for r in current if not str(r.get("ID", "")).startswith("intake-")]
+    print(f"s3://{bucket}: {len(current)} lifecycle rule(s) now" + (f", not ours: {foreign}" if foreign else ""))
+    print(f"\n  mail/ and doc/        normal storage for {args.archive_after} days, then Glacier Instant Retrieval;"
+          f" deleted after {args.keep_days} days ({args.keep_days / 365:.1f} years)")
+    print(f"  doc/ tagged pii=true  deleted after {args.pii_days} days")
+    print(f"  ledger/snapshots/     deleted after {args.snapshot_days} days (the live ledger is never touched)")
+    print(f"  unfinished uploads    cleaned up after 7 days")
+    print("  state/, config/, ledger/intake.sqlite3, deploy/  kept as they are")
+    if not args.apply:
+        print("\nNothing changed. Run again with --apply to put these rules on the bucket.")
+        return 0
+    if foreign and not args.replace:
+        raise SystemExit(f"the bucket already has lifecycle rules this script did not write ({foreign}); "
+                         f"applying would delete them. Merge them by hand, or pass --replace if they can go.")
+    s3.put_bucket_lifecycle_configuration(Bucket=bucket, LifecycleConfiguration={"Rules": rules},
+                                          TransitionDefaultMinimumObjectSize="all_storage_classes_128K")
+    print(f"\napplied: {len(rules)} rule(s). S3 starts acting on them within a day.")
+    return 0
+
+
 def cmd_invoke(args) -> int:
     from botocore.config import Config
     name = FUNCS[args.target]["name"]
@@ -393,9 +462,19 @@ def cmd_status(args) -> int:
     c = sess.client("lambda").get_function(FunctionName=spec["name"])["Configuration"]
     print(f"function {spec['name']}: {c['State']}, last modified {c['LastModified']}")
     print(f"schedule {spec['schedule']}: {sess.client('scheduler').get_schedule(Name=spec['schedule'])['State']}")
-    events = sess.client("logs").filter_log_events(
-        logGroupName=f"/aws/lambda/{spec['name']}", filterPattern=spec["log_filter"],
-        startTime=int((time.time() - 6 * 3600) * 1000)).get("events", [])
+    # Every page, not the first: CloudWatch splits even a handful of matches across pages (one per
+    # log stream), and reading only the first showed runs an hour old as the latest on 23 Sep 2026.
+    logs = sess.client("logs")
+    kw = dict(logGroupName=f"/aws/lambda/{spec['name']}", filterPattern=spec["log_filter"],
+              startTime=int((time.time() - 6 * 3600) * 1000))
+    events: list[dict] = []
+    while True:
+        page = logs.filter_log_events(**kw)
+        events += page.get("events", [])
+        if not page.get("nextToken"):
+            break
+        kw["nextToken"] = page["nextToken"]
+    events.sort(key=lambda e: e["timestamp"])
     for e in events[-args.runs:]:
         print(" ", time.strftime("%Y-%m-%d %H:%M", time.gmtime(e["timestamp"] / 1000)), e["message"].strip()[:900])
     return 0
@@ -417,6 +496,15 @@ def main() -> int:
     bmk.add_argument("--db", default=str(HERE / "out" / "intake.sqlite3"))
     bmk.set_defaults(fn=cmd_bookmark)
     sub.add_parser("deploy", help="build, then create or update both functions").set_defaults(fn=cmd_deploy)
+    lc = sub.add_parser("lifecycle", help="show, or with --apply set, how long the archive keeps things")
+    lc.add_argument("--keep-days", type=int, default=1095, help="delete mail and documents after this many days "
+                    "(default 3 years - the usual broker record period; confirm with compliance)")
+    lc.add_argument("--archive-after", type=int, default=90, help="move to cheaper storage after this many days")
+    lc.add_argument("--pii-days", type=int, default=90, help="delete pages tagged as personal ID after this many days")
+    lc.add_argument("--snapshot-days", type=int, default=30, help="delete daily ledger snapshots after this many days")
+    lc.add_argument("--apply", action="store_true", help="put the rules on the bucket (default: only show them)")
+    lc.add_argument("--replace", action="store_true", help="also replace lifecycle rules this script did not write")
+    lc.set_defaults(fn=cmd_lifecycle)
     for name, fn, extra in (("invoke", cmd_invoke, None), ("schedule", cmd_schedule, "state"),
                             ("status", cmd_status, "runs")):
         p = sub.add_parser(name)
