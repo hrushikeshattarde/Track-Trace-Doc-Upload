@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Backoff for a failed read, by attempt. After the last one the file is left alone and reported as
 # a permanent failure: a .MOV or a corrupt part fails identically every time, and retrying it on a
@@ -394,6 +394,11 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.executescript(
             "CREATE INDEX IF NOT EXISTS ix_message_unarchived ON message (s3_key) WHERE s3_key IS NULL;"
             "CREATE INDEX IF NOT EXISTS ix_attachment_unarchived ON attachment (s3_key) WHERE s3_key IS NULL;")
+    if have < 13:
+        # What the scheduled worker has to remember between runs that is not a row of anything
+        # else: when it last swept the dashboard, and which day's full audit it has done. Kept in the
+        # ledger rather than beside it, so it travels in the same upload and cannot disagree with it.
+        conn.execute("CREATE TABLE IF NOT EXISTS worker_state (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -756,6 +761,17 @@ def mark_doc_archived(conn: sqlite3.Connection, sha256: str, key: str,
                       extraction_key: str | None = None) -> None:
     retry_write(conn, "UPDATE attachment SET s3_key=?, s3_extraction_key=COALESCE(?, s3_extraction_key) "
                       "WHERE sha256=?", (key, extraction_key, sha256))
+
+
+def get_state(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM worker_state WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("INSERT INTO worker_state (key, value, updated_at) VALUES (?,?,?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                 (key, value, now_iso()))
 
 
 def archive_counts(conn: sqlite3.Connection) -> dict[str, int]:

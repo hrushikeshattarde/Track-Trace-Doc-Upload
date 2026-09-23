@@ -19,8 +19,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from intake import (archive, collector, db, filing, filters, ingest, loadloop, review,  # noqa: E402
-                    routing, state, store as s3store)
+from intake import (archive, collector, db, filing, filters, ingest, ledger_s3, loadloop,  # noqa: E402
+                    mailsync, review, routing, state, store as s3store)
 
 PASSED = 0
 
@@ -1196,6 +1196,17 @@ class FakeS3:
         self.objects.pop(Key, None)
         return {}
 
+    def get_paginator(self, name):
+        assert name == "list_objects_v2", name
+        objects = self.objects
+
+        class _Pages:
+            def paginate(self, Bucket, Prefix=""):       # noqa: N803
+                keys = sorted(k for k in objects if k.startswith(Prefix))
+                for i in range(0, max(len(keys), 1), 1000):
+                    yield {"Contents": [{"Key": k} for k in keys[i:i + 1000]]}
+        return _Pages()
+
 
 
 def test_no_group_is_a_configuration_not_a_crash() -> None:
@@ -1905,6 +1916,229 @@ def test_lambda_wiring() -> None:
         os.environ.update(saved[3])
 
 
+def _collected_store():
+    """A FakeS3 holding what the collector stores for four messages, three routed and one not."""
+    page = png(1200, 1600, b"W")
+    msgs = [
+        raw_mail("k1", "tk", "Load 2589536 POD", when_ms=1_758_600_000_000,
+                 attachments=[("pod.png", page, "image/png")]),
+        raw_mail("k2", "tk", "RE: paperwork", when_ms=1_758_600_100_000,
+                 attachments=[("pod.png", page, "image/png")]),
+        raw_mail("k3", "tz", "Load 2589777 BOL", when_ms=1_758_600_200_000),
+        raw_mail("k4", "tq", "hello", when_ms=1_758_600_300_000,
+                 attachments=[("scan.png", png(1300, 1700, b"Q"), "image/png")]),
+    ]
+    fake, store = _bookmarked_store()
+    collector.run(FakeRawGmail(msgs), store, group="ratecon@circledelivers.com")
+    return fake, store, hashlib.sha256(page).hexdigest()
+
+
+def test_mail_from_s3_reaches_the_ledger() -> None:
+    """The load loop answers "is there paperwork for this load?" from the ledger, so what the
+    collector stores must land there - from S3 alone, with no Gmail call."""
+    print("worker: mail from S3 into the ledger")
+    import time as _time
+    fake, store, page_sha = _collected_store()
+    day = dt.date(2025, 9, 23)                                   # when_ms above is 23 Sep 2025 UTC
+    conn = fresh_db()
+
+    st = mailsync.ingest_recent(conn, store, days=2, today=day)
+    check("every stored message is recorded", st.ingested == 4, st.line())
+    check("routed ones on their load, the rest listed unresolved", st.bound == 3 and st.unresolved == 1, st.line())
+    m2 = conn.execute("SELECT * FROM message WHERE message_id='k2'").fetchone()
+    check("a reply keeps the load its thread gave it", m2["load_id"] == 2589536 and m2["routing_tier"] == "thread",
+          str(dict(m2)))
+    check("the thread is bound to that load", db.get_thread(conn, "tk")["load_id"] == 2589536)
+    check("its load is created and due now", conn.execute(
+        "SELECT COUNT(*) FROM load WHERE load_id IN (2589536, 2589777)").fetchone()[0] == 2)
+    docs, unread = db.load_doc_evidence(conn, 2589536)
+    check("the load now has paperwork on file, unread", docs >= 1 and unread >= 1, f"{docs}/{unread}")
+    att = db.get_attachment(conn, page_sha)
+    check("one document row for a page that came twice", att is not None and
+          conn.execute("SELECT COUNT(*) FROM attachment").fetchone()[0] == 1)
+    check("already marked as archived, so nothing re-uploads it", att["s3_key"] == s3store.doc_key(page_sha))
+    check("and the mail too", m2["s3_key"] is not None and m2["s3_key"].startswith("mail/"))
+    pend = conn.execute("SELECT decision FROM part WHERE message_id='k4'").fetchall()
+    check("an unrouted message's document waits as pending", [r[0] for r in pend] == [filters.PENDING],
+          str([r[0] for r in pend]))
+
+    st = mailsync.ingest_recent(conn, store, days=2, today=day)
+    check("a second pass records nothing twice", st.ingested == 0 and st.known == 4, st.line())
+
+    fake2, store2, _ = _collected_store()
+    st = mailsync.ingest_recent(fresh_db(), store2, days=2, today=day, deadline=_time.monotonic() - 1)
+    check("past its time limit it stops, and says so", st.out_of_time and st.ingested == 0, st.line())
+
+
+def test_the_ledger_goes_back_only_over_what_was_taken() -> None:
+    """In AWS the S3 copy is the only live ledger. A run may fail; it may never overwrite newer work."""
+    print("worker: handing the ledger back")
+    fake = FakeS3()
+    seed_conn = fresh_db()
+    seed_conn.execute("INSERT INTO message (message_id, thread_id) VALUES ('s1','t1')")
+    seed_path = Path(seed_conn.execute("PRAGMA database_list").fetchone()["file"])
+    seed_conn.close()
+    ledger_s3.seed(fake, "b", "ledger/intake.sqlite3", seed_path)
+    try:
+        ledger_s3.seed(fake, "b", "ledger/intake.sqlite3", seed_path)
+    except ledger_s3.LedgerChanged:
+        check("seeding refuses to replace a live ledger", True)
+    else:
+        check("seeding refuses to replace a live ledger", False)
+
+    work = Path(tempfile.mkdtemp(prefix="worker_test_")) / "intake.sqlite3"
+    etag = ledger_s3.take(fake, "b", "ledger/intake.sqlite3", work)
+    check("the ledger comes down with its ETag", work.exists() and etag.startswith('"'), etag)
+    snap = ledger_s3.snapshot(fake, "b", "ledger/intake.sqlite3", etag, today="2026-09-23")
+    check("the day's first run snapshots it", snap == "ledger/snapshots/intake-2026-09-23.sqlite3" and snap in fake.objects)
+    check("and only the first", ledger_s3.snapshot(fake, "b", "ledger/intake.sqlite3", etag, today="2026-09-23") is None)
+
+    conn = db.connect(work)
+    conn.execute("INSERT INTO message (message_id, thread_id) VALUES ('s2','t2')")
+    ledger_s3.give_back(fake, "b", "ledger/intake.sqlite3", conn, work, etag)
+    back = Path(tempfile.mkdtemp(prefix="worker_test_")) / "back.sqlite3"
+    back.write_bytes(fake.objects["ledger/intake.sqlite3"])
+    check("the run's work travels, WAL folded in",
+          db.connect(back).execute("SELECT COUNT(*) FROM message").fetchone()[0] == 2)
+
+    stale = Path(tempfile.mkdtemp(prefix="worker_test_")) / "intake.sqlite3"
+    stale.write_bytes(seed_path.read_bytes())
+    try:
+        ledger_s3.give_back(fake, "b", "ledger/intake.sqlite3", db.connect(stale), stale, etag)
+    except ledger_s3.LedgerChanged:
+        check("a stale hand-back is refused, not merged", True)
+    else:
+        check("a stale hand-back is refused, not merged", False)
+    try:
+        ledger_s3.take(fake, "b", "ledger/missing.sqlite3", work)
+    except Exception:                                            # noqa: BLE001
+        check("a missing ledger is an error, never an empty start", True)
+    else:
+        check("a missing ledger is an error, never an empty start", False)
+
+
+def test_working_hours() -> None:
+    """TransportPro is only called inside the configured window."""
+    print("worker: working hours")
+    from zoneinfo import ZoneInfo
+    from intake import aws_worker
+    et = ZoneInfo("America/New_York")
+    wed_10 = dt.datetime(2026, 9, 23, 10, 0, tzinfo=et)
+    check("a Wednesday morning is inside", aws_worker.working_hours(wed_10, "06-20", "mon-fri")[0])
+    check("20:00 is outside", not aws_worker.working_hours(wed_10.replace(hour=20), "06-20", "mon-fri")[0])
+    ok, why = aws_worker.working_hours(dt.datetime(2026, 9, 26, 10, 0, tzinfo=et), "06-20", "mon-fri")
+    check("a Saturday is outside, and says why", not ok and "sat" in why, why)
+    check("'all' covers the weekend", aws_worker.working_hours(dt.datetime(2026, 9, 26, 10, 0, tzinfo=et), "06-20", "all")[0])
+    check("a list of days works", aws_worker.working_hours(wed_10, "06-20", "mon,wed")[0])
+
+
+class _WorkerTPro:
+    """TransportPro for the worker: one terminal with one in-scope load, reads only."""
+
+    def __init__(self, **login):
+        self.login = login
+        self.calls = 0
+
+    def search_all_pages(self, params, max_pages=20):
+        self.calls += 1
+        return [{**tp_load(), "id": 2589536}]
+
+    def load(self, load_id):
+        self.calls += 1
+        return tp_load()
+
+    def dispatches(self, load_id):
+        self.calls += 1
+        return [{"id": 1, "status": "At Consignee"}]
+
+    def files(self, load_id):
+        self.calls += 1
+        return []
+
+
+def test_worker_run() -> None:
+    """One scheduled run end to end: ledger down, mail in, sweep or checks, ledger back."""
+    print("worker: one run")
+    import json as _json
+    import os
+    import boto3
+    from zoneinfo import ZoneInfo
+    from intake import aws_worker
+
+    fake, store, _ = _collected_store()
+    seed_conn = fresh_db()
+    seed_path = Path(seed_conn.execute("PRAGMA database_list").fetchone()["file"])
+    seed_conn.close()
+    ledger_s3.seed(fake, "b", "ledger/intake.sqlite3", seed_path)
+    fake.objects["config/pod_terminals.json"] = _json.dumps(
+        {"terminals": [{"id": 1088, "in_current_view": True}],
+         "dashboard_filter": {"service_level": ["Priority / OP8"]}}).encode()
+
+    class _Secrets:
+        def get_secret_value(self, SecretId):            # noqa: N803
+            return {"SecretString": "p"}                 # the pay-status bot's shape: the password alone
+
+    et = ZoneInfo("America/New_York")
+    clock = {"now": dt.datetime(2026, 9, 23, 10, 0, tzinfo=et)}
+    made: list[_WorkerTPro] = []
+    saved = (boto3.client, aws_worker.tp.TransportPro, aws_worker.local_now, aws_worker.mailsync.ingest_recent,
+             dict(os.environ))
+    real_ingest = aws_worker.mailsync.ingest_recent
+
+    def ledger_now():
+        back = Path(tempfile.mkdtemp(prefix="worker_test_")) / "l.sqlite3"
+        back.write_bytes(fake.objects["ledger/intake.sqlite3"])
+        return db.connect(back)
+
+    try:
+        boto3.client = lambda name, *a, **k: fake if name == "s3" else _Secrets()
+        aws_worker.tp.TransportPro = lambda **kw: made.append(_WorkerTPro(**kw)) or made[-1]
+        aws_worker.local_now = lambda tz: clock["now"]
+        aws_worker.mailsync.ingest_recent = lambda conn, store, **kw: real_ingest(
+            conn, store, **{**kw, "today": dt.date(2025, 9, 23)})
+        os.environ.update({"INTAKE_S3_BUCKET": "b", "INTAKE_TPRO_SECRET": "s",
+                           "INTAKE_TPRO_USERNAME": "u", "INTAKE_TPRO_BASE_URL": "https://tp.example"})
+
+        out = aws_worker.handler({}, None)
+        check("mail is recorded every run", "4 new" in out["worker"]["mail"], out["worker"]["mail"])
+        check("the day's first run is the full sweep", "full_sweep" in out["worker"] and
+              "not this run" in out["worker"]["check"], str(out["worker"]))
+        check("logged in with the secret's password and the settings' username",
+              made[-1].login == {"base_url": "https://tp.example", "username": "u", "password": "p"})
+        check("a JSON secret may carry all three", aws_worker.login_from(
+            _json.dumps({"base_url": "https://x", "username": "a", "password": "b"}), {}) ==
+            {"base_url": "https://x", "username": "a", "password": "b"})
+        try:
+            aws_worker.login_from("p", {})
+        except ValueError as e:
+            check("a password with no username is refused by name", "username" in str(e), str(e))
+        else:
+            check("a password with no username is refused by name", False)
+        conn = ledger_now()
+        check("the ledger went back with the mail in it",
+              conn.execute("SELECT COUNT(*) FROM message").fetchone()[0] == 4)
+        check("and the dashboard load in view", conn.execute(
+            "SELECT in_view FROM load WHERE load_id=2589536").fetchone()[0] == 1)
+
+        out = aws_worker.handler({}, None)
+        check("the next run checks the loads that are due", "checked" in out["worker"]["check"]
+              and "full_sweep" not in out["worker"], str(out["worker"]))
+        check("and skips the hourly sweep it did minutes ago", "reconcile" not in out["worker"], str(out["worker"]))
+        state_now = ledger_now().execute("SELECT state FROM load WHERE load_id=2589536").fetchone()[0]
+        check("the load now has a real state", state_now not in ("new", None), str(state_now))
+
+        clock["now"] = dt.datetime(2026, 9, 26, 10, 0, tzinfo=et)     # a Saturday
+        calls_before = len(made)
+        out = aws_worker.handler({}, None)
+        check("outside working hours TransportPro is not called", len(made) == calls_before
+              and "not checked" in out["worker"]["loads"], str(out["worker"]))
+    finally:
+        (boto3.client, aws_worker.tp.TransportPro, aws_worker.local_now,
+         aws_worker.mailsync.ingest_recent) = saved[:4]
+        os.environ.clear()
+        os.environ.update(saved[4])
+
+
 def test_every_load_state_is_classified() -> None:
     """A new load state must be taught to state.shortfall(), or it silently becomes "not needed".
 
@@ -1958,6 +2192,10 @@ if __name__ == "__main__":
     test_collector_errors_and_deletions()
     test_collector_bookmark_is_guarded()
     test_lambda_wiring()
+    test_mail_from_s3_reaches_the_ledger()
+    test_the_ledger_goes_back_only_over_what_was_taken()
+    test_working_hours()
+    test_worker_run()
     test_every_load_state_is_classified()
     test_filters()
     test_photo_stamp()
