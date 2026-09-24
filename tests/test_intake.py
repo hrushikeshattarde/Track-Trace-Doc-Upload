@@ -2338,6 +2338,13 @@ class _AutoLog:
     def __init__(self):
         self.rows: dict[str, list] = {}
         self.writes = 0
+        self.removed: set[str] = set()
+
+    def remove(self, refs):
+        for r in refs:
+            if self.rows.pop(r, None) is not None:
+                self.removed.add(r)
+        return len(refs)
 
     def write(self, entries):
         self.writes += 1
@@ -2528,8 +2535,11 @@ def test_auto_upload_pilot() -> None:
           and 2600006 not in {u["load"] for u in tpro.uploads})
     check("a load already showing Documents Received is not read", not any(r[0] == 2600007 for r in status))
     refs = set(log.rows)
-    check("the Upload log holds the uploads and the holds, one row each", len(refs) == 5
+    check("the Upload log holds one row per upload and one per hold", len(refs) == 4
           and {v[13].split(" ")[0] for v in log.rows.values()} == {"UPLOADED", "HELD"}, str(sorted(refs)))
+    b_rows = [v for v in log.rows.values() if v[1] == 2600002]
+    check("a two-page upload is one row, naming both pages", len(b_rows) == 1
+          and b_rows[0][4] == "mb_0.png + mb_1.png - one 2-page PDF", str(b_rows))
     check("already on file, not needed and waiting stay in the ledger, not the sheet", conn.execute(
         "SELECT COUNT(*) FROM autofile WHERE outcome IN ('on_file','not_needed','waiting') AND logged=1").fetchone()[0] == 4
           and not any(v[1] in (2600003, 2600004, 2600009) for v in log.rows.values()))
@@ -2565,7 +2575,7 @@ def test_auto_upload_pilot() -> None:
     check("the POD goes up once the truck is at the consignee", len(tpro.uploads) == n_uploads + 1
           and last["load"] == 2600003 and last["type"] == "Bill Of Lading", st3.line())
     check("and it reaches the sheet once it is uploaded", st3.logged == 1
-          and log.rows[autofile.ref(2600003, c_sha)][13].startswith("UPLOADED") and len(log.rows) == 6)
+          and log.rows[autofile.ref(2600003, c_sha)][13].startswith("UPLOADED") and len(log.rows) == 5)
 
     # A copy of the texted POD then arrives by email, and a second pickup BOL for B.
     mail(2600001, "ma2", [(_picture(1, "JPEG"), _reading(2600001, "proof_of_delivery", receiver=True))])
@@ -2608,8 +2618,10 @@ def test_auto_upload_pilot() -> None:
           and up["type"] == "Bill Of Lading" and len(autofile.picture_sig(up["data"])) == 2, str(up["comment"]))
     check("and the comment is the POD's", up["comment"] == "Doc Intake Bot: POD, signed by Kendyl 9/24/26, "
           "2 pages - load 2600010", up["comment"])
-    check("both pages' rows say uploaded", all(log.rows[autofile.ref(2600010, x)][13].startswith("UPLOADED")
-                                               for x in (j1, j2)))
+    check("the upload is one row, on the signed page, naming both pages",
+          autofile.ref(2600010, j1) not in log.rows and log.rows[autofile.ref(2600010, j2)][13].startswith("UPLOADED")
+          and log.rows[autofile.ref(2600010, j2)][4] == "mj_0.png + mj_1.png - one 2-page PDF"
+          and log.rows[autofile.ref(2600010, j2)][6].startswith("POD"))
     check("a POD with no signature or stamp is held, not uploaded",
           not any(u["load"] == 2600011 for u in tpro.uploads) and conn.execute(
               "SELECT outcome FROM autofile WHERE load_id=2600011").fetchone()[0] == "held")
@@ -2670,10 +2682,10 @@ def test_auto_upload_texted_pages() -> None:
     up = [u for u in tpro.uploads if u["load"] == 2600021]
     check("when its signed page arrives, both go up together", len(up) == 1
           and len(autofile.picture_sig(up[0]["data"])) == 2, str([u["comment"] for u in up]))
-    check("and the first page's row now says uploaded", conn.execute(
+    rows21 = [v for k, v in log.rows.items() if k.startswith("2600021-")]
+    check("the first page is recorded as uploaded, and the upload is one row naming both", conn.execute(
         "SELECT outcome FROM autofile WHERE source='tpro:611'").fetchone()[0] == "uploaded"
-          and next(v for k, v in log.rows.items() if k.startswith("2600021-") and v[4].startswith("611"))[13]
-          .startswith("UPLOADED"))
+          and len(rows21) == 1 and rows21[0][4].startswith("611") and "612" in rows21[0][4], str(rows21))
 
 
 def test_auto_upload_bol_sets() -> None:
@@ -2721,7 +2733,9 @@ def test_auto_upload_bol_sets() -> None:
           str(up.get(2600040, {}).get("comment")))
     check("and the comment says it was signed, from the sign-out side",
           up[2600040]["comment"] == "Doc Intake Bot: BOL, shipper signed, 2 pages - load 2600040", up[2600040]["comment"])
-    check("the sign-out side's row says uploaded", log.rows[autofile.ref(2600040, b40)][13].startswith("UPLOADED"))
+    check("the set is one row, on the front, naming the sign-out side too",
+          autofile.ref(2600040, b40) not in log.rows and log.rows[autofile.ref(2600040, f40)][4]
+          == "m40_0.png + m40_1.png - one 2-page PDF")
     check("a back page that names a different shipment does not join",
           len(autofile.picture_sig(up[2600041]["data"])) == 1 and conn.execute(
               "SELECT outcome FROM autofile WHERE load_id=2600041 AND source='email:m41' ORDER BY outcome").fetchall()[0][0] == "held")
@@ -2936,6 +2950,13 @@ def test_auto_upload_dry_run_and_off() -> None:
         "SELECT outcome FROM autofile").fetchone()[0] == "dry_run", dry.line())
     log = _AutoLog()
     check("and never puts a dry-run row in the sheet", autofile.flush_log(conn, log) == 0 and not log.rows)
+    # A page the sheet showed, that has since gone up inside another page's row, leaves the sheet.
+    conn.execute("INSERT INTO autofile (load_id, sha256, outcome, final, status, row_json, logged, logged_status, "
+                 "decided_at) VALUES (1, 'aa', 'uploaded', 1, 'UPLOADED x', '[]', 0, 'UPLOADED x', '2026-09-24')")
+    log.rows[autofile.ref(1, "aa")] = ["x"]
+    autofile.flush_log(conn, log)
+    check("a page folded into another page's upload row is taken off the sheet", autofile.ref(1, "aa") not in log.rows
+          and conn.execute("SELECT logged_status FROM autofile WHERE sha256='aa'").fetchone()[0] is None)
 
 
 def test_upload_log_sheet() -> None:
@@ -2987,6 +3008,24 @@ def test_upload_log_sheet() -> None:
     check("an update goes to the row carrying its Ref, wherever it now is",
           "'Upload log'!A3:N3" in ranges and "'Upload log'!A4:N4" in ranges, str(ranges))
     import re as _re
+    # Rows 3 and 4 go; row 4 carries a pod note, so it stays.
+    tab["O"] = [[""], [""], [""], ["g2g"]]
+    real_open = opener
+
+    def opener2(req, timeout=60):
+        url = unquote(req.full_url)
+        if req.get_method() == "GET" and url.endswith("!A:Q"):
+            rows_ = [[tab["A"][i][0] if i < len(tab["A"]) and tab["A"][i] else ""] + [""] * 13
+                     + [tab["O"][i][0] if i < len(tab["O"]) and tab["O"][i] else "", ""]
+                     + [tab["Q"][i][0] if i < len(tab["Q"]) and tab["Q"][i] else ""] for i in range(len(tab["Q"]))]
+            return _Resp(_json.dumps({"values": rows_}).encode())
+        return real_open(req, timeout)
+
+    log._open = opener2
+    gone_before = len(sent)
+    check("remove() deletes a row by its Ref, and never one the pod has marked",
+          log.remove({"L1-a", "L3-c"}) == 1 and [r["deleteDimension"]["range"]["startIndex"]
+                                                for r in sent[gone_before]["requests"]] == [2], str(sent[gone_before:]))
     check("and the pod's columns O and P are never written",
           all(_re.fullmatch(r"'Upload log'!(A\d+:N\d+|Q\d+)", r) for r in ranges), str(ranges))
 

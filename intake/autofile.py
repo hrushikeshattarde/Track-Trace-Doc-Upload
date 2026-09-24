@@ -1158,6 +1158,10 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
         m.doc.data = m.doc.data or doc_bytes(store, tpro, m.doc)
     data, filename, content_type = upload_payload([m.doc.data for m in members], kind, load_id)
     comment = upload_comment(members, kind, load_id)
+    # One row per upload in the sheet (24 Sep 2026): the page the upload is judged on carries it -
+    # the POD's signed page, a BOL set's front - and lists every page. The others are still recorded,
+    # page by page, in the ledger.
+    lead = next((m for m in members if m.kind == kind and not m.companion), members[0])
     if s.mode != ON:
         for m in members:
             m.outcome, m.final = DRY, False
@@ -1178,7 +1182,8 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
             else:
                 m.outcome, m.final = WAITING, False
                 m.status = f"WAITING - the upload failed ({str(e)[:90]}); tried again next run after a fresh File History check"
-            _record(conn, s, row, m, upload_as=upload_as, comment=comment, group=members, attempts=tries)
+            _record(conn, s, row, m, upload_as=upload_as, comment=comment, group=members, attempts=tries,
+                    sheet=m is lead)
         return
     file_id = uploaded_file_id(result)
     now = db.now_iso()
@@ -1198,7 +1203,7 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
     filed.append(OnFile(new_file, sha, store_sig(conn, sha, data), data))
     for m in members:
         m.outcome, m.status, m.tpro_file_id = UPLOADED, status, file_id
-        _record(conn, s, row, m, upload_as=upload_as, comment=comment, group=members)
+        _record(conn, s, row, m, upload_as=upload_as, comment=comment, group=members, sheet=m is lead)
         conn.execute("INSERT OR IGNORE INTO filing (load_id, sha256, tpro_file_id, document_type, comment, filed_at) "
                      "VALUES (?,?,?,?,?,?)", (load_id, m.doc.sha256, file_id, upload_as, comment, now))
         notify.record(conn, load_id=load_id, event=notify.FILED, sha256=m.doc.sha256, document_type=upload_as,
@@ -1297,11 +1302,11 @@ def upload_comment(members: list[Decision], kind: str, load_id: int) -> str:
 # ------------------------------------------------------------------------------ recording ----
 
 def _record(conn, s: Settings, row, dec: Decision, *, upload_as: str = "", comment: str = "",
-            group: list[Decision] | None = None, attempts: int | None = None) -> None:
+            group: list[Decision] | None = None, attempts: int | None = None, sheet: bool = True) -> None:
     """Write the decision. A final one is never overwritten, so nothing decided is decided twice -
     except by an upload: a page logged "already on file" that then goes up as part of its POD."""
     d = dec.doc
-    logged = 0 if dec.outcome in UNLOGGED else 1
+    logged = 0 if dec.outcome in UNLOGGED or not sheet else 1
     values = sheet_row(s, row, dec, upload_as=upload_as, comment=comment, group=group) if logged else None
     conn.execute(
         "INSERT INTO autofile (load_id, sha256, source, outcome, final, status, row_json, logged, tpro_file_id, "
@@ -1321,9 +1326,9 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
     d, ex = dec.doc, dec.ex
     name = d.filename
     if group and len(group) > 1:
-        others = [g.doc.filename for g in group if g.doc.sha256 != d.sha256]
-        pages = sum(max(1, len(g.ex.pages)) for g in group)
-        name += f" - combined with {', '.join(others)} into one {pages}-page PDF"
+        names = [g.doc.filename for g in sorted(group, key=lambda g: g.doc.order)]
+        pages = sum(max(1, len(g.ex.pages)) if g.ex is not None else 1 for g in group)
+        name = " + ".join(names) + f" - one {pages}-page PDF"
     read_as = dec.quick
     if ex is not None and dec.kind:
         pages = len(ex.pages)
@@ -1348,6 +1353,16 @@ def flush_log(conn, log) -> int:
     trail is complete - but the pod asked (24 Sep 2026) for the sheet to hold what the bot uploaded
     and what it held back and why, not the pages it found already on file or not needed."""
     marks = ",".join("?" * len(SHEET_OUTCOMES))
+    # Rows the sheet showed that it should not any more: a page that went up inside another page's
+    # row. Removed by Ref; a row the pod has marked (Correct? / Pod note) is never removed.
+    gone = conn.execute(
+        "SELECT load_id, sha256 FROM autofile WHERE logged_status IS NOT NULL "
+        f"AND (logged = 0 OR outcome NOT IN ({marks}))", SHEET_OUTCOMES).fetchall()
+    if gone and hasattr(log, "remove"):
+        log.remove({ref(r["load_id"], r["sha256"]) for r in gone})
+        for r in gone:
+            conn.execute("UPDATE autofile SET logged_status=NULL WHERE load_id=? AND sha256=?",
+                         (r["load_id"], r["sha256"]))
     rows = conn.execute(
         "SELECT load_id, sha256, status, row_json FROM autofile WHERE logged=1 AND row_json IS NOT NULL "
         f"AND outcome IN ({marks}) AND (logged_status IS NULL OR logged_status != status) "

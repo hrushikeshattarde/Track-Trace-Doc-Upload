@@ -101,6 +101,25 @@ class UploadLog:
         return len(entries)
 
 
+    def remove(self, refs: set[str]) -> int:
+        """Delete the rows carrying these Refs, bottom up so the row numbers stay right. A row the pod
+        has marked - anything in O (Correct?) or P (Pod note) - is kept: that is their work."""
+        if not refs:
+            return 0
+        sheet_id, _ = self._grid()
+        values = self._call("GET", f"/values/{self._a1('A:Q')}").get("values", [])
+        doomed = []
+        for i, row in enumerate(values):
+            row = row + [""] * (17 - len(row))
+            if i and row[16] in refs and not (str(row[14]).strip() or str(row[15]).strip()):
+                doomed.append(i)
+        if doomed and sheet_id is not None:
+            self._call("POST", ":batchUpdate", {"requests": [
+                {"deleteDimension": {"range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": i, "endIndex": i + 1}}}
+                for i in sorted(doomed, reverse=True)]})
+        return len(doomed)
+
+
 def _cell(v: Any) -> Any:
     return "" if v is None else v
 
