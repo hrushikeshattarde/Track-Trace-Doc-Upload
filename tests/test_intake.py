@@ -2676,6 +2676,59 @@ def test_auto_upload_texted_pages() -> None:
           .startswith("UPLOADED"))
 
 
+def test_auto_upload_bol_sets() -> None:
+    """Load 2576831 (24 Sep 2026): a pick slip photographed front and back. The front has the load
+    number and customer PO; the back, the driver's sign-out, has none - held on its own. Sent
+    together, they go up together."""
+    print("auto-upload: a BOL's pages sent together")
+    import time as _time
+    from intake import autofile
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    log = _AutoLog()
+
+    def page(load_id, *, conf, numbers, shipper_signed, city="Atlanta"):
+        r = _reading(load_id, conf=conf, numbers=[(lb, v) for lb, v, _ in numbers], city=city)
+        for n, (_, _, kind) in zip(r["numbers"], numbers):
+            n["kind"] = kind
+        r["signatures"].update({"shipper_signed": shipper_signed, "driver_signed": shipper_signed})
+        return r
+
+    def front(load_id):
+        return page(load_id, conf=0.9, numbers=[("Load Number", f"P{load_id}", "load_or_trip"), ("Customer PO", f"PO{load_id}", "po")],
+                    shipper_signed=False)
+
+    def back(load_id, extra=()):
+        return page(load_id, conf=0.72, numbers=[("Seal.", "1388444", "seal"), ("Trailer #", "147", "trailer"), *extra],
+                    shipper_signed=True, city=None)
+
+    run = lambda: autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)  # noqa: E731
+    load_row(2600040, "bol_expected", "loaded")
+    tpro.add(2600040)
+    f40, b40 = mail(2600040, "m40", [(_picture(40), front(2600040)), (_picture(41), back(2600040))])
+    load_row(2600041, "bol_expected", "loaded")                  # a back page naming another shipment
+    tpro.add(2600041)
+    mail(2600041, "m41", [(_picture(42), front(2600041)), (_picture(43), back(2600041, [("PO", "PO7777777", "po")]))])
+    load_row(2600042, "bol_expected", "loaded")                  # the back sent in a different email
+    tpro.add(2600042)
+    mail(2600042, "m42a", [(_picture(44), front(2600042))])
+    (b42,) = mail(2600042, "m42b", [(_picture(45), back(2600042))])
+    run()
+    up = {u["load"]: u for u in tpro.uploads}
+    check("the front and its sign-out side go up together, as Driver Supplied BOL",
+          up[2600040]["type"] == "Driver Supplied BOL" and len(autofile.picture_sig(up[2600040]["data"])) == 2,
+          str(up.get(2600040, {}).get("comment")))
+    check("and the comment says it was signed, from the sign-out side",
+          up[2600040]["comment"] == "Doc Intake Bot: BOL, shipper signed, 2 pages - load 2600040", up[2600040]["comment"])
+    check("the sign-out side's row says uploaded", log.rows[autofile.ref(2600040, b40)][13].startswith("UPLOADED"))
+    check("a back page that names a different shipment does not join",
+          len(autofile.picture_sig(up[2600041]["data"])) == 1 and conn.execute(
+              "SELECT outcome FROM autofile WHERE load_id=2600041 AND source='email:m41' ORDER BY outcome").fetchall()[0][0] == "held")
+    check("nor does one that came in another email", len(autofile.picture_sig(up[2600042]["data"])) == 1
+          and conn.execute("SELECT outcome FROM autofile WHERE sha256=?", (b42,)).fetchone()[0] == "held")
+
+
 def test_auto_upload_quick_look() -> None:
     """The cheap first look decides which pages get the full read (24 Sep 2026). It may set aside a
     photo, and a texted picture while the truck is not at the consignee; it is never trusted to say a
@@ -2967,6 +3020,7 @@ if __name__ == "__main__":
     test_auto_upload_facts_and_pictures()
     test_auto_upload_pilot()
     test_auto_upload_texted_pages()
+    test_auto_upload_bol_sets()
     test_auto_upload_quick_look()
     test_reader_is_brief_and_caches_the_schema()
     test_auto_upload_dry_run_and_off()

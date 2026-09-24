@@ -211,6 +211,7 @@ class Decision:
     final: bool = True
     tpro_file_id: str | None = None
     strong: list[str] = field(default_factory=list)   # the reference numbers among `facts`
+    why: set[str] = field(default_factory=set)        # which checks failed: confidence, facts, conflict, pod_evidence
     on_clearing: bool = False     # already on the load under a type that clears
     companion: bool = False       # another page of a POD from the same email, going up with it
     quick: str = ""               # "BOL (quick look, 95% sure)" when only the quick look saw the page
@@ -269,13 +270,20 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
             for dec in decisions:
                 if dec.ready:
                     groups.setdefault((dec.doc.batch or dec.doc.source, dec.kind), []).append(dec)
-            for (_, kind), group in groups.items():
-                if kind == "POD" and group[0].doc.batch:
-                    group.extend(companions(conn, decisions + _batch_mates(conn, store, tpro, s, row, load, filed,
-                                                                           docs, group[0].doc.batch), group, s))
-            for key in [k for k in groups if k[1] == "BOL"]:
-                # A page going up inside a POD does not also go up on its own.
-                groups[key] = [g for g in groups[key] if not g.companion]
+            # The other pages sent with each document join it - a POD's first, then a BOL's - and a
+            # page one set claims leaves every other, so nothing goes up twice.
+            claimed: dict[int, tuple] = {}
+            for key in sorted(groups, key=lambda k: 0 if k[1] == "POD" else 1):
+                group = groups[key]
+                if not group[0].doc.batch:
+                    continue
+                pool = [d for d in decisions + _batch_mates(conn, store, tpro, s, row, load, filed, docs, group[0].doc.batch)
+                        if id(d) not in claimed and not any(d is g for g in group)]
+                for d in companions(conn, pool, group, s):
+                    claimed[id(d)] = key
+                    group.append(d)
+            for key in list(groups):
+                groups[key] = [d for d in groups[key] if claimed.get(id(d), key) == key]
                 if not groups[key]:
                     del groups[key]
             for dec in decisions:
@@ -312,22 +320,50 @@ def _mark_looked(conn, load_id: int) -> None:
                  "ON CONFLICT(load_id) DO UPDATE SET looked_at=excluded.looked_at", (load_id, db.now_iso()))
 
 
+# The kinds of number that name a shipment. A page carrying none of them - only a seal, a trailer, a
+# handwritten weight - cannot contradict the set it arrived with.
+REFERENCE_KINDS = frozenset({"bol", "master_bill", "po", "pickup", "shipment", "delivery", "invoice",
+                             "load_or_trip", "order", "shipper_ref"})
+# How sure the AI must be of a sign-out side that joins a set. Its own checks cannot pass - it has no
+# reference number to match - so the set's lead page carries them; 2576831's read at 72%.
+SIGN_OUT_MIN_CONFIDENCE = 0.6
+
+
+def can_join(dec: Decision, refs: set[str], kind: str, s: Settings) -> bool:
+    """Whether a BOL-read page may go up inside a set of `kind` whose pages matched `refs`.
+
+    Either it passes on its own and shares a reference number with the set, or it is a sign-out
+    side: nothing on it names a shipment, so nothing can contradict the set, and its only failed
+    checks are the facts it cannot have and a confidence the set's lead page makes up for."""
+    if dec.kind != "BOL" or dec.on_clearing or dec.ex is None:
+        return False
+    if kind == "BOL" and dec.outcome == ON_FILE:
+        return False                          # already on the load as paperwork: a BOL set adds nothing by repeating it
+    if (dec.outcome in ("ready", ON_FILE, NOT_NEEDED) and not dec.failed
+            and (dec.conf or 0) >= s.min_confidence and refs & set(dec.strong)):
+        return True
+    own = [n for n in dec.ex.numbers if n.kind in REFERENCE_KINDS]
+    return (not own and dec.why <= {"facts", "confidence"} and (dec.conf or 0) >= SIGN_OUT_MIN_CONFIDENCE
+            and dec.outcome in ("ready", HELD, ON_FILE, NOT_NEEDED))
+
+
 def companions(conn, decisions: list[Decision], group: list[Decision], s: Settings) -> list[Decision]:
-    """The other pages of a POD from the same email or the same burst of texts: a driver photographs
-    the delivery copy page by page, and only the page the receiver signed reads as a POD. Load
-    2562005 (24 Sep 2026, email): page 1 read as an unsigned BOL, page 2 as the signed POD, and the
-    POD is both pages; load 2577917 the same, sent as two texts. A page joins when it reads as a BOL
-    at least as surely as the checks demand, shares a reference number with the POD, and is not
-    already on the load under a type that clears. A second shot of a page already in - 2560031's
-    driver texted the same two pages eight times over - stays out."""
+    """The other pages sent with a document - the same email, or the same burst of texts.
+
+    A POD: a driver photographs the delivery copy page by page, and only the page the receiver
+    signed reads as a POD. Load 2562005 (24 Sep 2026, email): page 1 read as an unsigned BOL, page 2
+    as the signed POD, and the POD is both pages; load 2577917 the same, sent as two texts.
+    A BOL: load 2576831's pick slip came as the front, with the load number and customer PO, and the
+    back, the driver's sign-out, with no reference number at all - held on its own, and the BOL is both.
+    Who may join is can_join(). A second shot of a page already in - 2560031's driver texted the same
+    two pages eight times over - stays out."""
     ids = {g.doc.sha256 for g in group}
     refs = {x for g in group for x in g.strong}
+    kind = group[0].kind
     kept = [cached_sig(conn, g.doc.sha256) or [] for g in group]
     out = []
     for dec in sorted(decisions, key=lambda x: x.doc.order):
-        if (dec.doc.batch == group[0].doc.batch and dec.doc.sha256 not in ids and dec.kind == "BOL"
-                and dec.outcome in ("ready", ON_FILE, NOT_NEEDED) and not dec.failed and not dec.on_clearing
-                and (dec.conf or 0) >= s.min_confidence and refs & set(dec.strong)):
+        if (dec.doc.batch == group[0].doc.batch and dec.doc.sha256 not in ids and can_join(dec, refs, kind, s)):
             mine = cached_sig(conn, dec.doc.sha256) or []
             if mine and any(sig and all(any(_diff(p, q) < SAME_PICTURE for q in sig) for p in mine) for sig in kept):
                 continue
@@ -802,20 +838,25 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
     # The checks.
     if ex.document_type_confidence < s.min_confidence:
         dec.failed.append(f"AI only {ex.document_type_confidence:.0%} sure (needs {s.min_confidence:.0%})")
+        dec.why.add("confidence")
     if len(dec.facts) < s.min_facts or strong < 1:
+        dec.why.add("facts")
         dec.failed.append(f"{len(dec.facts)} fact(s) match TransportPro, {strong} a reference number "
                           f"(needs {s.min_facts}, one a reference number)")
     if d.message_id:
         routing, conflicted = filing._routing_of(conn, int(row["load_id"]), d.sha256)
         if conflicted:
             dec.failed.append("a reply in the email thread named a different load")
+            dec.why.add("conflict")
     if kind == "BOL" and ex.document_type == "proof_of_delivery":
         dec.failed.append("the AI called it a POD but found no receiver signature, stamp or delivery time")
+        dec.why.add("pod_evidence")
     if kind == "POD" and not (ex.signatures.receiver_signed or ex.signatures.stamp_present):
         # Uploaded as Bill Of Lading, a POD clears the load for billing, so an in/out time alone is not
         # enough to do that unattended. Load 2562069 (24 Sep 2026): the "out 12:34" was the truck's
         # dashboard clock in the photo, on a BOL whose consignee lines were blank.
         dec.failed.append("no receiver signature or stamp - the only delivery evidence is an in/out time")
+        dec.why.add("pod_evidence")
     if dec.failed:
         dec.outcome = HELD
         dec.status = f"HELD - {'; '.join(dec.failed)}; not uploaded, a person should look"
@@ -1056,6 +1097,7 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
     filed.extend(of for of in fresh if str(of.file.get("id")) not in known)
     members = []
     pages_along = []
+    set_refs = {x for g in group if not g.companion for x in g.strong}
     for dec in sorted(group, key=lambda x: x.doc.order):
         if _docs_received(load):
             dec.outcome, dec.status = NOT_NEEDED, "NOT NEEDED - the load now shows Documents Received; nothing uploaded"
@@ -1065,8 +1107,8 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
         again = judge(conn, s, row, load, filed, dec.doc, json.loads(db.get_attachment(conn, dec.doc.sha256)["extraction_json"]),
                       sig=lambda d=dec.doc: doc_sig(conn, store, tpro, d))
         if dec.companion:
-            # Still only a page of this POD, and still not on the load under a type that clears.
-            if again is not None and again.kind == "BOL" and not again.on_clearing and not again.failed:
+            # Still only a page of this set, and still not on the load under a type that clears.
+            if again is not None and can_join(again, set_refs, kind, s):
                 again.companion = True
                 pages_along.append(again)
             elif again is not None:
@@ -1204,7 +1246,12 @@ def upload_comment(members: list[Decision], kind: str, load_id: int) -> str:
     """"Doc Intake Bot: POD, signed by Kendyl 9/24/26, 2 pages - load 2562005": what the page is,
     whatever type it went in under."""
     lead = next((m for m in members if m.kind == kind and not m.companion), members[0])
-    bits = [kind] + page_detail(lead.ex)
+    detail = page_detail(lead.ex)
+    if kind == "BOL" and not any("signed" in d and "unsigned" not in d for d in detail):
+        # The sign-out side carries the signatures on a pick slip; say so rather than "unsigned".
+        signed = next((d for m in members for d in page_detail(m.ex) if "signed" in d and "unsigned" not in d), None)
+        detail = [signed] + [d for d in detail if d != "unsigned"] if signed else detail
+    bits = [kind] + detail
     pages = sum(max(1, len(m.ex.pages)) for m in members)
     if pages > 1:
         bits.append(f"{pages} pages")
