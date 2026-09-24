@@ -11,11 +11,16 @@ One invocation:
                              check - somebody else filed something - are checked straight away
                    check     then the loads whose next check has come round, oldest first
                  changed + check together stay within INTAKE_LOAD_LIMIT loads a run
+                 auto_upload  for the pilot terminals only (INTAKE_AUTO_TERMINALS, the Frankie Saiz
+                             pod from 24 Sep 2026): read new BOLs and PODs with the AI, upload what
+                             passes every check, log every decision to the pod's Upload log sheet -
+                             see autofile.py. INTAKE_AUTO_UPLOAD off / dry-run / on switches it
     4. hand the ledger back
 
-Nothing is read by a model and nothing is written to TransportPro; those are later steps. The
-TransportPro calls are all reads: /load/search for the sweeps, and /load, /dispatch/search and
-/files/search per load checked.
+Outside auto_upload nothing is read by a model and nothing is written to TransportPro. The load
+checks' calls are all reads: /load/search for the sweeps, and /load, /dispatch/search and
+/files/search per load checked. auto_upload adds /load, /files/search and /files/{id} reads on the
+pilot loads and POST /files/upload, the only write.
 
 WHY WORKING HOURS AND A CAP
 ---------------------------
@@ -34,7 +39,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import db, ledger_s3, loadloop, mailsync, store as s3store, tpro as tp
+from . import autofile, db, ledger_s3, loadloop, mailsync, store as s3store, tpro as tp
 
 FULL_SWEEP_DAYS_BACK = 350      # the nightly audit window `intake reconcile` documents
 # The every-run sweep. /load/search takes a pickup-date window of at most 45 days, so the old 3-day
@@ -127,6 +132,14 @@ def handler(event: dict | None, context: Any) -> dict:
         else:
             step("check", lambda: loadloop.drain(
                 conn, tpro, limit=max(0, limit - len(first)), scope_levels=levels).line())
+        try:
+            auto = autofile.Settings.from_env(env, pods=_pod_names(work))
+        except ValueError as e:
+            auto = None
+            failed.append("auto_upload")
+            steps["auto_upload"] = f"FAILED to start: {e}"
+        if auto is not None and auto.mode != autofile.OFF and auto.terminals:
+            step("auto_upload", lambda: _auto_upload(conn, tpro, store, auto, env, deadline, failed))
         steps["transportpro_calls"] = str(tpro.calls)
 
     states = dict(conn.execute("SELECT state, COUNT(*) FROM load WHERE in_view=1 GROUP BY state").fetchall())
@@ -201,6 +214,36 @@ def login_from(secret: str, env) -> dict:
         raise ValueError(f"TransportPro login is missing {missing}: set it in the secret or as "
                          f"INTAKE_TPRO_{'/'.join(m.upper() for m in missing)}")
     return login
+
+
+def _auto_upload(conn, tpro, store, auto: autofile.Settings, env, deadline: float, failed: list[str]) -> str:
+    """Step 4 for the pilot terminals: read, upload what passes, log every BOL and POD."""
+    from . import aws_lambda, ingest, sheets
+    read = ingest.make_reader(env.get("INTAKE_READ_MODEL", "claude-opus-5"), timeout=autofile.READ_TIMEOUT_S)
+    log = None
+    if auto.mode == autofile.ON:
+        # The sheet is written as the Gmail service account itself, the key the collector already uses.
+        log = sheets.from_service_account(env["INTAKE_UPLOAD_SHEET_ID"],
+                                          aws_lambda._service_account(env["INTAKE_GMAIL_SECRET"]))
+    uploader = tpro
+    if env.get("INTAKE_TPRO_UPLOAD_SECRET"):
+        # The bot's own TransportPro login, once one exists, so File History shows "Doc Intake Bot" as
+        # the uploader. Its secret must name the user: the reading login's username is not borrowed.
+        import boto3
+        secret = boto3.client("secretsmanager").get_secret_value(
+            SecretId=env["INTAKE_TPRO_UPLOAD_SECRET"])["SecretString"]
+        uploader = tp.TransportPro(**login_from(secret, {"INTAKE_TPRO_BASE_URL": env.get("INTAKE_TPRO_BASE_URL", "")}))
+    stats = autofile.run(conn, tpro, store, read, log, auto, deadline=deadline, uploader=uploader)
+    if stats.sheet_error:
+        failed.append("upload_log")         # the rows stay pending and go with the next run
+    return stats.line()
+
+
+def _pod_names(work: Path) -> dict[int, str]:
+    try:
+        return autofile.pod_names(json.loads((work / "pod_terminals.json").read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return {}
 
 
 def _pod_config(s3, bucket: str, key: str, work: Path) -> tuple[list[int], set[str]]:

@@ -80,9 +80,14 @@ AUTO = "auto"
 # wrong_doc_type - correctly, because that is what they are. The policy buys human control over
 # billing status and pays for it in loads that stay open.
 #
+# Revised 24 Sep 2026 on the manager's feedback: a BOL is still uploaded as Driver Supplied BOL, and a
+# POD - the receiver-signed delivery copy - is uploaded as Bill Of Lading. Bill Of Lading (type 12) is
+# a clearing type, so a POD filed by the bot is what moves a load to Documents Received; a pickup BOL
+# alone still leaves it waiting, as it should. The comment on every upload says which it really is.
+#
 # Emptying this dict restores filing under the type the document actually is. Nothing else needs to
 # change: the mapping is applied at the upload boundary only.
-FILE_AS: dict[str, str] = {"Bill Of Lading": "Driver Supplied BOL"}
+FILE_AS: dict[str, str] = {"Bill Of Lading": "Driver Supplied BOL", "Proof of Delivery": "Bill Of Lading"}
 
 
 def file_as(document_type: str | None) -> str | None:
@@ -456,7 +461,8 @@ def execute(conn: sqlite3.Connection, tpro, gmail, proposal: Proposal, *, dry_ru
                               document_type=uploaded_as, comments=proposal.comment or "",
                               filename=filename, data=data,
                               content_type=mimetypes.guess_type(filename)[0] or "application/octet-stream")
-    file_id = str((result or {}).get("id") or (result or {}).get("fileId") or "")
+    from .tpro import uploaded_file_id
+    file_id = uploaded_file_id(result)
     # The type it was UPLOADED as is what the filing record keeps, because that is what a later
     # reader of File History will see, and what decides whether the status cleared. What the
     # document reads as is already on the attachment row.

@@ -8,6 +8,7 @@
     python scripts/deploy_lambda.py invoke [--fn worker]         run one now and print what it did
     python scripts/deploy_lambda.py schedule on [--fn worker]    start its 15-minute schedule (or: off)
     python scripts/deploy_lambda.py status [--fn worker]         what exists, and the last few runs
+    python scripts/deploy_lambda.py autoupload on|off|dry-run    switch the worker's auto-upload, nothing else
 
 --fn defaults to the collector. Every step is create-or-update, so `deploy` is safe to re-run after
 a code change. `deploy` never touches Secrets Manager: the Gmail key is placed by `secret`, run by
@@ -16,12 +17,20 @@ is the pay-status bot's own secret, which this script only ever grants read acce
 `seed-ledger` and `bookmark` refuse to replace what is already in S3: once a function is running,
 its ledger or bookmark is its own and only it moves it.
 
+The worker's auto-upload (intake/autofile.py) is ON after a deploy, for the terminals in
+AUTO_TERMINALS. It reads these from .env: INTAKE_UPLOAD_SHEET_ID, the Google Sheet whose Upload log
+tab it writes (shared with the service account as an editor); INTAKE_AUTO_UPLOAD, to deploy it
+`dry-run` or `off` instead; and INTAKE_TPRO_UPLOAD_SECRET, the name of a Secrets Manager secret
+holding the bot's own TransportPro login as JSON {username, password}, once one exists. `autoupload
+off` stops uploads within one run without a redeploy.
+
 What it creates, all in the account and region the .env's AWS_PROFILE points at:
 
     secrets     circle-doc-intake/gmail-service-account   the Gmail service-account key
                 paybot/prod/tp-password                   the TransportPro password - the pay-status bot's, read only
     roles       circle-doc-intake-collector               S3 mail/ doc/ state/, the Gmail key, logs
-                circle-doc-intake-worker                  S3 ledger/ (read+write), mail/ config/ (read), the TransportPro login, logs
+                circle-doc-intake-worker                  S3 ledger/ (read+write), mail/ doc/ config/ (read), the TransportPro
+                                                          login, the Gmail key (for the Upload log sheet), Bedrock reads, logs
                 circle-doc-intake-scheduler               may invoke the circle-doc-intake-* functions
     functions   circle-doc-intake-collector               python3.12, 10 min, 512 MB, concurrency 1, no retries
                 circle-doc-intake-worker                  python3.12, 10 min, 1 GB, concurrency 1, no retries
@@ -60,8 +69,13 @@ BUILD = HERE / "build" / "lambda"
 # The versions the offline suite ran against, pinned so the Lambdas run what was tested. boto3 is
 # bundled rather than taken from the runtime because the bookmark and ledger writes depend on S3
 # If-Match, and a runtime's bundled boto3 lags behind. tzdata because the worker's working hours
-# are Eastern and the runtime ships no time-zone database.
-DEPS = ["boto3==1.43.98", "google-auth==2.58.0", "cryptography==50.0.1", "tzdata==2026.4"]
+# are Eastern and the runtime ships no time-zone database. The second line is the worker's
+# auto-upload: the AI reader (anthropic, pydantic), PDFs and page images (pymupdf, pillow), and
+# iPhone HEIC photos (pillow-heif). With it the unpacked package is ~200 MB of Lambda's 250.
+DEPS = ["boto3==1.43.98", "google-auth==2.58.0", "cryptography==50.0.1", "tzdata==2026.4",
+        "anthropic==1.5.0", "pydantic==2.13.5", "pymupdf==1.28.2", "pillow==12.3.0", "pillow-heif==1.7.0"]
+# The auto-upload pilot's pods, by TransportPro terminal: Frankie Saiz, 24 Sep 2026.
+AUTO_TERMINALS = "1160"
 
 
 def _collector_env(env: dict) -> dict:
@@ -81,41 +95,60 @@ def _worker_env(env: dict) -> dict:
             "INTAKE_ACTIVE_HOURS": "06-20", "INTAKE_ACTIVE_DAYS": "mon-fri",
             # 150, raised from 100 on 23 Sep 2026: at 100 the loads due each working hour matched the
             # cap exactly, so any backlog made them late. TransportPro took 1,200 calls an hour cleanly.
-            "INTAKE_LOAD_LIMIT": "150", "INTAKE_MAIL_DAYS": "7"}
+            "INTAKE_LOAD_LIMIT": "150", "INTAKE_MAIL_DAYS": "7",
+            # Auto-upload (intake/autofile.py). `autoupload off` stops it without a redeploy. The
+            # sheet id is Circle's and lives in .env, not in this public repository.
+            "INTAKE_AUTO_UPLOAD": env.get("INTAKE_AUTO_UPLOAD", "on"), "INTAKE_AUTO_TERMINALS": AUTO_TERMINALS,
+            "INTAKE_AUTO_DAILY_USD": "10", "INTAKE_AUTO_MAX_READS": "60",
+            "INTAKE_MODEL_PROVIDER": "bedrock", "INTAKE_READ_MODEL": "claude-opus-5",
+            "INTAKE_GMAIL_SECRET": GMAIL_SECRET, "INTAKE_UPLOAD_SHEET_ID": env["INTAKE_UPLOAD_SHEET_ID"],
+            # The bot's own TransportPro login, once an admin has made one and somebody has put it in
+            # Secrets Manager as JSON {username, password}. Until then uploads go in as the reading login.
+            **({"INTAKE_TPRO_UPLOAD_SECRET": env["INTAKE_TPRO_UPLOAD_SECRET"]}
+               if env.get("INTAKE_TPRO_UPLOAD_SECRET") else {})}
 
 
-def _collector_policy(b: str, secret_arn: str) -> dict:
+def _collector_policy(b: str, secret_arns: list[str], region: str, account: str) -> dict:
     return {"Version": "2012-10-17", "Statement": [
         {"Sid": "Archive", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:PutObjectTagging"],
          "Resource": [f"{b}/mail/*", f"{b}/doc/*", f"{b}/state/*"]},
         # Without ListBucket a HEAD on a missing key answers 403, not 404, and every "is it already
         # there" check would read as an error instead of a no.
         {"Sid": "TellMissingFromForbidden", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": b},
-        {"Sid": "GmailKey", "Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": secret_arn}]}
+        {"Sid": "GmailKey", "Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": secret_arns}]}
 
 
-def _worker_policy(b: str, secret_arn: str) -> dict:
+def _worker_policy(b: str, secret_arns: list[str], region: str, account: str) -> dict:
     return {"Version": "2012-10-17", "Statement": [
         {"Sid": "Ledger", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": f"{b}/ledger/*"},
-        {"Sid": "ReadMailAndConfig", "Effect": "Allow", "Action": "s3:GetObject",
-         "Resource": [f"{b}/mail/*", f"{b}/config/*"]},
+        {"Sid": "ReadMailDocumentsAndConfig", "Effect": "Allow", "Action": "s3:GetObject",
+         "Resource": [f"{b}/mail/*", f"{b}/doc/*", f"{b}/config/*"]},
         {"Sid": "ListNewMail", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": b},
-        {"Sid": "TransportProLogin", "Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": secret_arn}]}
+        # The TransportPro login(s), and the Gmail key - used here only to write the Upload log sheet.
+        {"Sid": "Logins", "Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": secret_arns},
+        # The AI reader: the inference statement of AWS's AmazonBedrockMantleInferenceAccess, confined to
+        # this account and region. Its web-search and marketplace-subscribe statements are left out.
+        {"Sid": "ReadDocuments", "Effect": "Allow",
+         "Action": ["bedrock-mantle:CreateInference", "bedrock-mantle:Get*", "bedrock-mantle:List*"],
+         "Resource": f"arn:aws:bedrock-mantle:{region}:{account}:project/*"}]}
 
 
 FUNCS = {
     "collector": {
         "name": "circle-doc-intake-collector", "schedule": "circle-doc-intake-every-15-min",
-        "handler": "intake.aws_lambda.handler", "memory": 512, "secret": GMAIL_SECRET,
+        "handler": "intake.aws_lambda.handler", "memory": 512, "secrets": lambda env: [GMAIL_SECRET],
         "env": _collector_env, "policy": _collector_policy, "log_filter": '"collect"',
         "description": "Every 15 min: new Gmail messages and their documents to S3, linked. "
                        "Never reads with a model, never touches TransportPro."},
     "worker": {
         "name": "circle-doc-intake-worker", "schedule": "circle-doc-intake-worker-every-15-min",
-        "handler": "intake.aws_worker.handler", "memory": 1024, "secret": TPRO_SECRET,
+        "handler": "intake.aws_worker.handler", "memory": 1024,
+        "secrets": lambda env: [TPRO_SECRET, GMAIL_SECRET] + ([env["INTAKE_TPRO_UPLOAD_SECRET"]]
+                                                           if env.get("INTAKE_TPRO_UPLOAD_SECRET") else []),
         "env": _worker_env, "policy": _worker_policy, "log_filter": '"worker"',
         "description": "Every 15 min: new mail from S3 into the ledger; in working hours, dashboard sweep and "
-                       "load checks against TransportPro (reads only). No model calls, no uploads."},
+                       "load checks against TransportPro; for the pilot pod, AI reads and BOL/POD uploads "
+                       "logged to the Upload log sheet."},
 }
 
 
@@ -141,13 +174,18 @@ def build() -> Path:
     BUILD.mkdir(parents=True)
     # Linux wheels, fetched from Windows: cryptography is compiled, and the one pip would pick for
     # this machine does not load on Lambda.
+    # manylinux_2_28 as well: pymupdf publishes no manylinux2014 wheel after 1.26. Lambda's python3.12
+    # runtime is Amazon Linux 2023, glibc 2.34, which runs both.
     subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--target", str(BUILD),
-                    "--platform", "manylinux2014_x86_64", "--implementation", "cp",
+                    "--platform", "manylinux2014_x86_64", "--platform", "manylinux_2_28_x86_64",
+                    "--implementation", "cp",
                     "--python-version", "3.12", "--only-binary=:all:", *DEPS], check=True)
-    # Only the intake package: neither function needs pod_intake, which would bring pydantic. One
-    # zip serves both; each function's handler picks its entry point.
+    # The intake package, and pod_intake for the worker's AI reader. One zip serves both; each
+    # function's handler picks its entry point.
     shutil.copytree(HERE / "intake", BUILD / "intake",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "__main__.py"))
+    shutil.copytree(HERE / "pod_intake", BUILD / "pod_intake",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "reader_openai.py"))
     zpath = BUILD.parent / "collector.zip"
     zpath.unlink(missing_ok=True)
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
@@ -209,7 +247,9 @@ def ensure_function(sess, key: str, account: str, env: dict) -> str:
     name = spec["name"]
     bucket = env["INTAKE_S3_BUCKET"]
     role = _ensure_role(sess.client("iam"), name, "lambda.amazonaws.com",
-                        spec["policy"](f"arn:aws:s3:::{bucket}", secret_arn_pattern(sess, account, spec["secret"])),
+                        spec["policy"](f"arn:aws:s3:::{bucket}",
+                                       [secret_arn_pattern(sess, account, x) for x in spec["secrets"](env)],
+                                       sess.region_name, account),
                         ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"], account, key)
     lam = sess.client("lambda")
     # 10 minutes, not the 15 allowed: a run must end before the next one is due.
@@ -284,7 +324,7 @@ def ensure_schedule(sess, key: str, fn_arn: str, account: str) -> None:
 # --------------------------------------------------------------------------------- commands ----
 
 def cmd_deploy(args) -> int:
-    env = _env("PAYBOT_GMAIL_USER", "PAYBOT_TP_USERNAME", "PAYBOT_TP_BASE_URL")
+    env = _env("PAYBOT_GMAIL_USER", "PAYBOT_TP_USERNAME", "PAYBOT_TP_BASE_URL", "INTAKE_UPLOAD_SHEET_ID")
     sess = _aws()
     account = sess.client("sts").get_caller_identity()["Account"]
     print(f"account {account}, region {sess.region_name}")
@@ -444,6 +484,20 @@ def cmd_invoke(args) -> int:
     return 1 if r.get("FunctionError") else 0
 
 
+def cmd_autoupload(args) -> int:
+    """Switch the worker's auto-upload without a redeploy: only INTAKE_AUTO_UPLOAD changes."""
+    lam = _aws().client("lambda")
+    name = FUNCS["worker"]["name"]
+    variables = lam.get_function_configuration(FunctionName=name)["Environment"]["Variables"]
+    was = variables.get("INTAKE_AUTO_UPLOAD", "off")
+    variables["INTAKE_AUTO_UPLOAD"] = args.mode
+    lam.update_function_configuration(FunctionName=name, Environment={"Variables": variables})
+    lam.get_waiter("function_updated_v2").wait(FunctionName=name)
+    print(f"{name}: auto-upload {was} -> {args.mode} (terminals {variables.get('INTAKE_AUTO_TERMINALS', '-')}); "
+          f"the next run uses it")
+    return 0
+
+
 def cmd_schedule(args) -> int:
     name = FUNCS[args.target]["schedule"]
     sch = _aws().client("scheduler")
@@ -505,6 +559,9 @@ def main() -> int:
     lc.add_argument("--apply", action="store_true", help="put the rules on the bucket (default: only show them)")
     lc.add_argument("--replace", action="store_true", help="also replace lifecycle rules this script did not write")
     lc.set_defaults(fn=cmd_lifecycle)
+    au = sub.add_parser("autoupload", help="switch the worker's auto-upload: on, off or dry-run")
+    au.add_argument("mode", choices=["on", "off", "dry-run"])
+    au.set_defaults(fn=cmd_autoupload)
     for name, fn, extra in (("invoke", cmd_invoke, None), ("schedule", cmd_schedule, "state"),
                             ("status", cmd_status, "runs")):
         p = sub.add_parser(name)

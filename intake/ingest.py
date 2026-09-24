@@ -625,16 +625,21 @@ def _load_is_satisfied(conn, load_id) -> bool:
     return (row["state"] or "") in _st.SATISFIED_STATES
 
 
-def make_reader(model: str) -> Reader:
+def make_reader(model: str, timeout: float | None = None) -> Reader:
     """Adapter over pod_intake.reader. Bytes go to a temp file because normalize.load_document
     works on paths (PyMuPDF opens PDFs and images the same way), and the file is deleted straight
-    after - the ledger keeps the hash and the extraction, never the document."""
+    after - the ledger keeps the hash and the extraction, never the document.
+
+    `timeout` bounds one read, retries included. The SDK's own default is ten minutes, which is the
+    whole of a Lambda run: one stuck read there would stop the worker before it hands its ledger back."""
     from pod_intake import provider, reader as claude_reader
     from pod_intake.localenv import load_local_env
     from pod_intake.normalize import load_document
 
     load_local_env()
     client, which = provider.make_client()
+    if timeout:
+        client = client.with_options(timeout=timeout, max_retries=1)
     print(f"  reader: {model} via {provider.describe()}")
 
     def read(data: bytes, filename: str) -> tuple[dict, str, str, float]:

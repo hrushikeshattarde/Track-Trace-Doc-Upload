@@ -8,8 +8,9 @@ paystatus bot's, which is proven against the live API:
   every other call            ->  Authorization: Bearer <access_token>
   on 401                      ->  refresh once, else re-login, then replay the request once
 
-Only GETs are exposed. The upload path is deliberately absent: this loop decides what *should* be
-filed and records it, and nothing in the service writes to TransportPro yet.
+GETs, plus one write: upload_file, the POST /files/upload that intake/autofile.py and
+filing.execute() file documents with. There is no call here that edits or deletes a file - the
+Public API has none.
 
 Endpoints, from the Public API Postman collection, with the quirks readiness.py established on
 14 Sep 2026:
@@ -247,16 +248,36 @@ class TransportPro:
             {"recordType": record_type, "recordId": str(record_id),
              "documentType": document_type, "comments": comments},
             file_field="file", filename=filename, data=data, file_content_type=content_type)
-        req = urllib.request.Request(
-            f"{self.base}/files/upload", data=body, method="POST",
-            headers={"Accept": "application/json", "Authorization": f"Bearer {self._access}",
-                     "Content-Type": content_type_header, "Accept-Encoding": "identity"})
-        try:
-            with urllib.request.urlopen(req, timeout=max(self._timeout, 120)) as r:
-                self.calls += 1
-                return json.loads(_body(r) or "{}")
-        except urllib.error.HTTPError as e:
-            raise TProError(e.code, "/files/upload", _body(e)) from None
+        for attempt in range(2):
+            req = urllib.request.Request(
+                f"{self.base}/files/upload", data=body, method="POST",
+                headers={"Accept": "application/json", "Authorization": f"Bearer {self._access}",
+                         "Content-Type": content_type_header, "Accept-Encoding": "identity"})
+            try:
+                with urllib.request.urlopen(req, timeout=max(self._timeout, 120)) as r:
+                    self.calls += 1
+                    return json.loads(_body(r) or "{}")
+            except urllib.error.HTTPError as e:
+                # The one retry allowed here: a 401 is TransportPro refusing the token before it
+                # looks at the file, so nothing was stored and sending it again cannot file it twice.
+                # A worker run is long enough for its token to expire between the reads and this.
+                if e.code == 401 and attempt == 0:
+                    if not self._refresh():
+                        self._login()
+                    continue
+                raise TProError(e.code, "/files/upload", _body(e)) from None
+            except NETWORK_ERRORS as e:
+                raise TProError(0, "/files/upload", f"network: {type(e).__name__}: {e}") from None
+        raise TProError(401, "/files/upload", "refused after signing in again")
+
+
+def uploaded_file_id(result: Any) -> str:
+    """The new file's id from an upload's answer. TransportPro nests it:
+    {"STATUS": "SUCCESS", "MESSAGE": "File uploaded", "result": {"id": 31447880}} (24 Sep 2026)."""
+    if not isinstance(result, dict):
+        return ""
+    inner = result.get("result") if isinstance(result.get("result"), dict) else {}
+    return str(inner.get("id") or inner.get("fileId") or result.get("id") or result.get("fileId") or "")
 
 
 def _multipart(fields: dict[str, str], *, file_field: str, filename: str, data: bytes,

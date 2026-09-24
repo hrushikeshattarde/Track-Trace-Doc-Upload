@@ -85,8 +85,11 @@ class Delegated:
         payload = {
             "iss": self.info["client_email"], "scope": " ".join(self.scopes),
             "aud": self.token_uri, "iat": int(now), "exp": int(now) + TOKEN_LIFETIME,
-            "sub": self.subject,
         }
+        if self.subject:
+            # No subject is the service account acting as itself - how the Upload log sheet is
+            # written, since that sheet is shared with the account's own address, not a mailbox's.
+            payload["sub"] = self.subject
         assertion = google_jwt.encode(RSASigner.from_service_account_info(self.info), payload)
         body = urllib.parse.urlencode({"grant_type": JWT_BEARER,
                                        "assertion": assertion.decode("ascii") if isinstance(assertion, bytes) else assertion}).encode()

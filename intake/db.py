@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 # Backoff for a failed read, by attempt. After the last one the file is left alone and reported as
 # a permanent failure: a .MOV or a corrupt part fails identically every time, and retrying it on a
@@ -399,6 +399,21 @@ def migrate(conn: sqlite3.Connection) -> None:
         # else: when it last swept the dashboard, and which day's full audit it has done. Kept in the
         # ledger rather than beside it, so it travels in the same upload and cannot disagree with it.
         conn.execute("CREATE TABLE IF NOT EXISTS worker_state (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
+    if have < 14:
+        # The auto-upload pilot (intake/autofile.py, 24 Sep 2026). One row per document the bot made
+        # a decision about on a load - uploaded, already on file, held and why - with the words its
+        # Upload log row carries. `final` 0 is a decision the bot will look at again (a POD waiting
+        # for the truck to reach the consignee, an upload that failed); `logged_status` is what the
+        # sheet last showed, so a row is written again only when its status actually changes.
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS autofile ("
+            " load_id INTEGER NOT NULL, sha256 TEXT NOT NULL, source TEXT, outcome TEXT NOT NULL,"
+            " final INTEGER NOT NULL DEFAULT 1, status TEXT, row_json TEXT,"
+            " logged INTEGER NOT NULL DEFAULT 1, logged_status TEXT, tpro_file_id TEXT,"
+            " attempts INTEGER NOT NULL DEFAULT 0, decided_at TEXT, PRIMARY KEY (load_id, sha256));"
+            "CREATE TABLE IF NOT EXISTS autofile_load (load_id INTEGER PRIMARY KEY, looked_at TEXT);"
+            # A 32x32 greyscale thumbnail per page, by file hash: what 'the same picture' is judged on.
+            "CREATE TABLE IF NOT EXISTS picture_sig (sha256 TEXT PRIMARY KEY, sig TEXT);")
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 

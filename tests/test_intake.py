@@ -866,8 +866,12 @@ def test_execute_is_off_unless_asked() -> None:
     out = filing.execute(conn, RefuseToBeCalled(), None, p)          # dry_run defaults to True
     check("execute is a dry run by default", out["dry_run"] and not out["filed"], str(out))
     check("but it says exactly what it would send",
-          out["would"]["recordType"] == "Loads" and out["would"]["recordId"] == 2578456
-          and out["would"]["documentType"] == "Proof of Delivery", str(out["would"]))
+          out["would"]["recordType"] == "Loads" and out["would"]["recordId"] == 2578456, str(out["would"]))
+    # House rule since 24 Sep 2026 (manager's feedback): a POD is uploaded as Bill Of Lading, a BOL as
+    # Driver Supplied BOL. What it IS stays on the row; only the upload type follows the rule.
+    check("a POD is uploaded as Bill Of Lading", out["would"]["documentType"] == "Bill Of Lading"
+          and out["would"].get("readAs") == "Proof of Delivery", str(out["would"]))
+    check("and a BOL as Driver Supplied BOL", filing.file_as("Bill Of Lading") == "Driver Supplied BOL")
     check("nothing was recorded as filed", db.counts(conn)["filings"] == 0)
 
     blocked = filing.propose(conn, 2578456, sha, allow_auto=True)
@@ -2245,6 +2249,492 @@ def test_a_dropped_connection_is_retried_not_fatal() -> None:
         tp_mod.urllib.request.urlopen, tp_mod.time.sleep = saved
 
 
+# ------------------------------------------------------------------ auto-upload (the pilot pod) ----
+
+def _picture(seed: int, fmt: str = "PNG") -> bytes:
+    """A page-sized image unlike any other seed's: a scatter of grey blocks on white."""
+    import io
+    from PIL import Image, ImageDraw
+    im = Image.new("L", (400, 520), 255)
+    d = ImageDraw.Draw(im)
+    for i in range(14):
+        x, y = (seed * 37 + i * 53) % 340, (seed * 91 + i * 41) % 460
+        d.rectangle([x, y, x + 60, y + 50], fill=(seed * 29 + i * 17) % 180)
+    buf = io.BytesIO()
+    im.convert("RGB").save(buf, format=fmt, quality=90) if fmt == "JPEG" else im.save(buf, format=fmt)
+    return buf.getvalue()
+
+
+def _reading(load_id: int, doc_type: str = "bill_of_lading", *, receiver: bool = False, conf: float = 0.95,
+             numbers: list[tuple[str, str]] | None = None, notes: str = "", city: str | None = "Atlanta") -> dict:
+    numbers = [("Pickup #", f"P{load_id}"), ("PO", f"PO{load_id}")] if numbers is None else numbers
+    return _extraction(doc_type, document_type_confidence=conf, notes=notes,
+                       numbers=[{"label": lb, "kind": "other", "value": v, "handwritten": False, "confidence": 0.9}
+                                for lb, v in numbers],
+                       consignee={"city": city} if city else {},
+                       signatures={"shipper_signed": True, "driver_signed": True, "receiver_signed": receiver,
+                                   "receiver_name": "Kendyl" if receiver else None,
+                                   "receiver_date": "9/24/26" if receiver else None, "stamp_present": False},
+                       pages=[{"page": 1, "role": "pod" if receiver else "bol", "legibility": 0.9}])
+
+
+def _tp_auto(load_id: int, doc: str = "Waiting for Documents") -> dict:
+    return {"id": load_id, "status": {"documentStatus": doc},
+            "reference": {"pickupNumber": f"P{load_id}", "poNumber": f"PO{load_id}", "numberOfPieces": 2180,
+                          "weight": 42992.2, "equipmentType": "Van or Reefer"},
+            "waypoints": [{"type": "SH", "location": {"city": "Tarrs"},
+                           "reference": [{"type": "SERVICE_LEVEL", "value": "Priority / OP8"}]},
+                          {"type": "CN", "location": {"city": "Atlanta"}}]}
+
+
+class _AutoTPro:
+    """TransportPro for the auto-upload: loads, File History with bytes, and an upload that files."""
+
+    def __init__(self):
+        self.loads: dict[int, dict] = {}
+        self.uploads: list[dict] = []
+        self.next_id = 900
+        self.fail_uploads = 0
+        self.calls = 0
+
+    def add(self, load_id, doc="Waiting for Documents", files=()):
+        self.loads[load_id] = {"load": _tp_auto(load_id, doc), "files": [], "bytes": {}}
+        for f, data in files:
+            self.loads[load_id]["files"].append(f)
+            self.loads[load_id]["bytes"][f["id"]] = data
+
+    def load(self, load_id):
+        self.calls += 1
+        return self.loads[load_id]["load"]
+
+    def files(self, load_id):
+        self.calls += 1
+        return [dict(f) for f in self.loads[load_id]["files"]]
+
+    def download_file(self, file_id):
+        self.calls += 1
+        for v in self.loads.values():
+            if file_id in v["bytes"]:
+                return v["bytes"][file_id], {}
+        raise KeyError(file_id)
+
+    def upload_file(self, *, record_type, record_id, document_type, comments, filename, data, content_type):
+        from intake.tpro import TProError
+        if self.fail_uploads:
+            self.fail_uploads -= 1
+            raise TProError(500, "/files/upload", "backend hiccup")
+        self.next_id += 1
+        f = {"id": self.next_id, "fileTypeId": {"Bill Of Lading": 12, "Driver Supplied BOL": 363}[document_type],
+             "fileTypeName": document_type, "comments": comments, "uploadById": 4211,
+             "dateCreated": "2026-09-24T15:00:00Z", "fileName": filename}
+        self.loads[record_id]["files"].append(f)
+        self.loads[record_id]["bytes"][self.next_id] = data
+        self.uploads.append({"load": record_id, "type": document_type, "comment": comments,
+                             "filename": filename, "data": data, "content_type": content_type})
+        return {"STATUS": "SUCCESS", "MESSAGE": "File uploaded", "result": {"id": self.next_id}}
+
+
+class _AutoLog:
+    def __init__(self):
+        self.rows: dict[str, list] = {}
+        self.writes = 0
+
+    def write(self, entries):
+        self.writes += 1
+        for ref, values in entries:
+            self.rows[ref] = values
+        return len(entries)
+
+
+def _auto_world():
+    """A ledger, an S3 archive, TransportPro and a reader for the Frankie Saiz pod's loads."""
+    import hashlib as _h
+    conn = fresh_db()
+    fake = FakeS3()
+    store = s3store.Store("b", "", client=fake)
+    tpro = _AutoTPro()
+    readings: dict[str, dict] = {}
+    reads: list[str] = []
+
+    def read(data, filename):
+        sha = _h.sha256(data).hexdigest()
+        reads.append(sha)
+        ex = readings[sha]
+        return ex, ex["document_type"], "claude-opus-5", 0.05
+
+    def load_row(load_id, state_, stage, terminal=1160):
+        conn.execute("INSERT INTO load (load_id, state, stage, terminal, customer, in_view, last_checked_at, "
+                     "next_check_at, source) VALUES (?,?,?,?,?,1,?,?,'dashboard')",
+                     (load_id, state_, stage, terminal, "Spindrift Beverage Co Inc.", db.now_iso(), db.now_iso()))
+
+    def mail(load_id, mid, pages: list[tuple[bytes, dict]]):
+        conn.execute("INSERT INTO message (message_id, thread_id, internal_date, from_domain, load_id, "
+                     "routing_tier, part_count) VALUES (?,?,?,?,?,?,?)",
+                     (mid, "t" + mid, "2026-09-24T12:00:00+00:00", "shipwell.com", load_id, "subject", len(pages)))
+        shas = []
+        for i, (data, reading) in enumerate(pages):
+            sha = _h.sha256(data).hexdigest()
+            conn.execute("INSERT INTO part (message_id, part_id, attachment_id, filename, sha256, decision) "
+                         "VALUES (?,?,?,?,?,'keep')", (mid, str(i), f"a{i}", f"{mid}_{i}.png", sha))
+            fake.objects[s3store.doc_key(sha)] = data
+            readings[sha] = reading
+            shas.append(sha)
+        return shas
+
+    def on_load(data, reading):
+        readings[_h.sha256(data).hexdigest()] = reading
+
+    return conn, store, tpro, read, reads, load_row, mail, on_load
+
+
+def test_auto_upload_facts_and_pictures() -> None:
+    print("auto-upload: facts and pictures")
+    from intake import autofile
+    from pod_intake.schema import Extraction
+
+    load = _tp_auto(2600001)
+    ex = Extraction.model_validate(_reading(2600001))
+    facts, strong = autofile.match_facts(ex, load)
+    check("reference numbers on the page match the load", strong == 2 and "pickup # P2600001" in facts, str(facts))
+    check("and the consignee city is a fact, but a weak one", "consignee city Atlanta" in facts, str(facts))
+    ex = Extraction.model_validate(_reading(2600001, numbers=[("Cases", "2180")]))
+    facts, strong = autofile.match_facts(ex, load)
+    check("a piece count and a city are two facts with no reference number", len(facts) == 2 and strong == 0,
+          str(facts))
+    ex = Extraction.model_validate(_reading(2600001, numbers=[("Year", "2026"), ("Ref", "26000")]))
+    check("a year or a fragment is not a reference number", autofile.match_facts(ex, load)[1] == 0)
+    # Load 2562069: the BOL says "Cust PO 18650", TransportPro says PO18650; its reference block also
+    # carries reeferTemperatureMode "Continuous", which is a setting, not a number anybody prints.
+    reefer = {**_tp_auto(2562069), "reference": {"poNumber": "PO18650", "reeferTemperatureMode": "Continuous"}}
+    ex = Extraction.model_validate(_reading(2562069, numbers=[("Cust PO", "18650")]))
+    facts, strong = autofile.match_facts(ex, reefer)
+    check("the same digits with TransportPro's letters round them match", strong == 1 and "PO # PO18650" in facts,
+          str(facts))
+    check("a setting in the reference block is never a fact",
+          not any(f[3] == "Continuous" for f in autofile.load_facts(reefer)))
+
+    a, b = autofile.picture_sig(_picture(1)), autofile.picture_sig(_picture(2))
+    again = autofile.picture_sig(_picture(1, "JPEG"))
+    check("two different pages are different pictures", autofile._diff(a[0], b[0]) > autofile.SAME_PICTURE * 3,
+          f"{autofile._diff(a[0], b[0]):.1f}")
+    check("the same page re-saved as JPEG is the same picture", autofile._diff(a[0], again[0]) < autofile.SAME_PICTURE,
+          f"{autofile._diff(a[0], again[0]):.1f}")
+    pdf = autofile.combine_pdf([_picture(1), _picture(2)], "BOL - load 1")
+    check("pages combine into one PDF, one page each", pdf[:5] == b"%PDF-" and len(autofile.picture_sig(pdf)) == 2)
+    check("and its pages are still the same pictures",
+          autofile._diff(autofile.picture_sig(pdf)[1], b[0]) < autofile.SAME_PICTURE)
+
+    s = autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_AUTO_TERMINALS": "1160, 1088"})
+    check("settings: mode and terminals", s.mode == "on" and s.terminals == {1160, 1088})
+    check("settings: off unless set", autofile.Settings.from_env({}).mode == "off")
+    try:
+        autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "yes"})
+    except ValueError:
+        check("settings: a mode that is not off/dry-run/on is refused", True)
+    else:
+        check("settings: a mode that is not off/dry-run/on is refused", False)
+    check("the pod's name comes from its terminal",
+          autofile.pod_names({"terminals": [{"id": 1160, "name": "POD (Frankie Saiz)"}]}) == {1160: "Frankie Saiz"})
+
+
+def test_auto_upload_pilot() -> None:
+    """The Frankie Saiz pilot end to end: what is uploaded, as what, and what is only logged."""
+    print("auto-upload: the pilot pod")
+    import time as _time
+    from intake import autofile
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    texted = {"id": 501, "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL", "uploadById": 1,
+              "comments": "Driver Supplied Image - 2600001", "dateCreated": "2026-09-24T11:00:00Z"}
+    by_rep = {"id": 502, "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL", "uploadById": 2756,
+              "comments": "bol in em", "dateCreated": "2026-09-23T14:25:38Z"}
+    proper_pod = {"id": 503, "fileTypeId": 360, "fileTypeName": "Proof of Delivery", "uploadById": 4985,
+                  "comments": "", "dateCreated": "2026-09-24T09:00:00Z"}
+
+    # A: the driver texted the signed POD; TransportPro filed it as Driver Supplied BOL.
+    load_row(2600001, "wrong_doc_type", "delivered")
+    tpro.add(2600001, files=[(texted, _picture(1))])
+    on_load(_picture(1), _reading(2600001, "proof_of_delivery", receiver=True))
+    # B: two emailed pages of one pickup BOL.
+    load_row(2600002, "bol_expected", "loaded")
+    tpro.add(2600002)
+    mail(2600002, "mb", [(_picture(2), _reading(2600002)), (_picture(3), _reading(2600002))])
+    # C: a signed POD emailed while TransportPro still has the truck loaded.
+    load_row(2600003, "pod_expected", "loaded")
+    tpro.add(2600003)
+    (c_sha,) = mail(2600003, "mc", [(_picture(4), _reading(2600003, "proof_of_delivery", receiver=True))])
+    # D: the BOL a rep already filed, and the same page emailed as a JPEG.
+    load_row(2600004, "wrong_doc_type", "delivered")
+    tpro.add(2600004, files=[(by_rep, _picture(5))])
+    on_load(_picture(5), _reading(2600004))
+    mail(2600004, "md", [(_picture(5, "JPEG"), _reading(2600004))])
+    # E: a BOL the AI is unsure of, one that matches only on a city, a freight photo, a licence.
+    load_row(2600005, "bol_expected", "at shipper")
+    tpro.add(2600005)
+    mail(2600005, "me", [(_picture(6), _reading(2600005, conf=0.6)),
+                         (_picture(7), _reading(2600005, numbers=[])),
+                         (_picture(8), _reading(2600005, "photo")),
+                         (_picture(9), _reading(2600005, notes="a photo of the driver's license"))])
+    # F: another pod's load. G: already Documents Received. I: a proper POD already on file.
+    load_row(2600006, "bol_expected", "loaded", terminal=1088)
+    tpro.add(2600006)
+    mail(2600006, "mf", [(_picture(10), _reading(2600006))])
+    load_row(2600007, "bol_expected", "delivered")
+    tpro.add(2600007, doc="Documents Received")
+    mail(2600007, "mg", [(_picture(11), _reading(2600007))])
+    load_row(2600009, "pod_expected", "delivered")
+    tpro.add(2600009, files=[(proper_pod, _picture(12))])
+    mail(2600009, "mi", [(_picture(13), _reading(2600009, "proof_of_delivery", receiver=True))])
+
+    log = _AutoLog()
+    run = lambda: autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)  # noqa: E731
+    st1 = run()
+    ups = {u["load"]: u for u in tpro.uploads}
+    check("two uploads: the texted POD and the two-page BOL", sorted(ups) == [2600001, 2600002], str(st1.line()))
+    check("a POD goes in as Bill Of Lading", ups[2600001]["type"] == "Bill Of Lading", ups[2600001]["type"])
+    check("its comment says what it is, and which copy it re-files",
+          ups[2600001]["comment"] == "Doc Intake Bot: POD, signed by Kendyl 9/24/26, copy of Driver Supplied BOL 501 "
+                                     "- load 2600001", ups[2600001]["comment"])
+    check("a single page goes up as it is", ups[2600001]["data"] == _picture(1)
+          and ups[2600001]["content_type"] == "image/png")
+    check("a BOL goes in as Driver Supplied BOL", ups[2600002]["type"] == "Driver Supplied BOL")
+    check("its two pages as one PDF", ups[2600002]["data"][:5] == b"%PDF-"
+          and len(autofile.picture_sig(ups[2600002]["data"])) == 2)
+    check("with a comment that starts with the bot's name",
+          ups[2600002]["comment"] == "Doc Intake Bot: BOL, shipper signed, 2 pages - load 2600002",
+          ups[2600002]["comment"])
+    status = {(r["load_id"], r["outcome"]) for r in conn.execute("SELECT load_id, outcome FROM autofile")}
+    check("the early POD waits for the consignee", (2600003, "waiting") in status, str(status))
+    check("a page already on the load is not uploaded again", (2600004, "on_file") in status
+          and not any(u["load"] == 2600004 for u in tpro.uploads), str(status))
+    check("an unsure read and a city-only match are held for a person",
+          conn.execute("SELECT COUNT(*) FROM autofile WHERE load_id=2600005 AND outcome='held'").fetchone()[0] == 2)
+    check("a POD is not uploaded over a proper POD already on file", (2600009, "not_needed") in status, str(status))
+    check("another pod's load is never touched", not any(r[0] == 2600006 for r in status)
+          and 2600006 not in {u["load"] for u in tpro.uploads})
+    check("a load already showing Documents Received is not read", not any(r[0] == 2600007 for r in status))
+    refs = set(log.rows)
+    check("every BOL/POD decision has a row in the Upload log", len(refs) == 9, str(sorted(refs)))
+    logged_loads = {v[1] for v in log.rows.values()}
+    check("the freight photo and the licence are not in it", conn.execute(
+        "SELECT COUNT(*) FROM autofile WHERE load_id=2600005 AND logged=0").fetchone()[0] == 2
+          and 2600006 not in logged_loads)
+    row_a = next(v for v in log.rows.values() if v[1] == 2600001)
+    check("a row says who, what, how sure, the checks and the upload",
+          row_a[3] == "Frankie Saiz" and row_a[6].startswith("POD") and row_a[7] == "95%"
+          and row_a[9] == "all passed" and row_a[10] == "Bill Of Lading" and row_a[12] == "901"
+          and row_a[13].startswith("UPLOADED") and "Text message from the driver" in row_a[5], str(row_a))
+    check("the upload is recorded as filed", conn.execute(
+        "SELECT COUNT(*) FROM filing WHERE load_id IN (2600001, 2600002)").fetchone()[0] == 3)
+    check("and the load is due for a check straight away",
+          conn.execute("SELECT next_check_at <= ? FROM load WHERE load_id=2600001", (db.now_iso(),)).fetchone()[0] == 1)
+    check("the day's AI spend is kept", float(db.get_state(
+        conn, f"ai_spend:{dt.datetime.now(dt.timezone.utc).date().isoformat()}")) > 0)
+
+    n_reads, n_uploads, n_writes = len(reads), len(tpro.uploads), log.writes
+    st2 = run()
+    check("a second run uploads nothing and reads nothing", len(tpro.uploads) == n_uploads
+          and len(reads) == n_reads, st2.line())
+    check("and rewrites no sheet row", st2.logged == 0, st2.line())
+
+    # The truck reaches the consignee: the load check records it, and the waiting POD goes up.
+    conn.execute("UPDATE load SET stage='at consignee', last_checked_at=? WHERE load_id=2600003",
+                 ("9999-01-01T00:00:00+00:00",))
+    st3 = run()
+    last = tpro.uploads[-1]
+    check("the POD goes up once the truck is at the consignee", len(tpro.uploads) == n_uploads + 1
+          and last["load"] == 2600003 and last["type"] == "Bill Of Lading", st3.line())
+    check("and its sheet row is updated in place, not added", st3.logged == 1
+          and log.rows[autofile.ref(2600003, c_sha)][13].startswith("UPLOADED") and len(log.rows) == 9)
+
+    # A copy of the texted POD then arrives by email, and a second pickup BOL for B.
+    mail(2600001, "ma2", [(_picture(1, "JPEG"), _reading(2600001, "proof_of_delivery", receiver=True))])
+    mail(2600002, "mb2", [(_picture(14), _reading(2600002))])
+    before = len(tpro.uploads)
+    run()
+    status = {(r["load_id"], r["source"]): (r["outcome"], r["status"]) for r in conn.execute(
+        "SELECT load_id, source, outcome, status FROM autofile")}
+    check("the emailed copy of a POD the bot already filed is not uploaded again", len(tpro.uploads) == before
+          and status[(2600001, "email:ma2")][0] == "on_file", str(status.get((2600001, "email:ma2"))))
+    check("a second BOL for a load that has one is not needed",
+          status[(2600002, "email:mb2")][0] == "not_needed", str(status.get((2600002, "email:mb2"))))
+
+    # An upload that fails is tried again next run, after a fresh look at File History.
+    load_row(2600008, "bol_expected", "loaded")
+    tpro.add(2600008)
+    (h_sha,) = mail(2600008, "mh", [(_picture(15), _reading(2600008))])
+    tpro.fail_uploads = 1
+    run()
+    check("a failed upload waits and is retried", conn.execute(
+        "SELECT outcome, attempts FROM autofile WHERE load_id=2600008").fetchone()[:] == ("waiting", 1))
+    run()
+    check("and goes up on the next run, once", sum(u["load"] == 2600008 for u in tpro.uploads) == 1
+          and conn.execute("SELECT outcome FROM autofile WHERE load_id=2600008").fetchone()[0] == "uploaded")
+
+    # J: the delivery copy photographed page by page - only the page the receiver signed reads as a
+    # POD (load 2562005). K: a "POD" whose only delivery evidence is a time (load 2562069's dash clock).
+    load_row(2600010, "wrong_doc_type", "delivered")
+    tpro.add(2600010)
+    j1, j2 = mail(2600010, "mj", [(_picture(16), _reading(2600010, conf=0.93)),
+                                  (_picture(17), _reading(2600010, "proof_of_delivery", receiver=True))])
+    load_row(2600011, "wrong_doc_type", "delivered")
+    tpro.add(2600011)
+    clock = _reading(2600011)
+    clock["times"] = {"check_out": "12:34", "source": "handwritten", "at_stop": "unknown"}
+    mail(2600011, "mk", [(_picture(18), clock)])
+    run()
+    up = tpro.uploads[-1]
+    check("the POD's other pages from the same email go up with it, as one PDF", up["load"] == 2600010
+          and up["type"] == "Bill Of Lading" and len(autofile.picture_sig(up["data"])) == 2, str(up["comment"]))
+    check("and the comment is the POD's", up["comment"] == "Doc Intake Bot: POD, signed by Kendyl 9/24/26, "
+          "2 pages - load 2600010", up["comment"])
+    check("both pages' rows say uploaded", all(log.rows[autofile.ref(2600010, x)][13].startswith("UPLOADED")
+                                               for x in (j1, j2)))
+    check("a POD with no signature or stamp is held, not uploaded",
+          not any(u["load"] == 2600011 for u in tpro.uploads) and conn.execute(
+              "SELECT outcome FROM autofile WHERE load_id=2600011").fetchone()[0] == "held")
+
+
+def test_auto_upload_texted_pages() -> None:
+    """Load 2577917 (24 Sep 2026): the delivery copy texted as two pictures 11 seconds apart. Both
+    pages go up together, as they would from one email - and a page logged before its POD arrived
+    still joins it."""
+    print("auto-upload: pages texted one by one")
+    import time as _time
+    from intake import autofile
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    log = _AutoLog()
+
+    def text(fid, when):
+        return {"id": fid, "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL", "uploadById": 1,
+                "comments": "Driver Supplied Image - load", "dateCreated": when}
+
+    run = lambda: autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)  # noqa: E731
+
+    load_row(2600020, "wrong_doc_type", "delivered")
+    tpro.add(2600020, files=[(text(600, "2026-09-23T20:09:15Z"), _picture(20)),      # the pickup BOL, hours before
+                             (text(601, "2026-09-24T11:13:28Z"), _picture(21)),      # page 1 of the delivery copy
+                             (text(603, "2026-09-24T11:13:33Z"), _picture(21, "JPEG")),   # page 1 again
+                             (text(602, "2026-09-24T11:13:39Z"), _picture(22))])     # page 2, signed
+    on_load(_picture(21, "JPEG"), _reading(2600020, conf=0.93))
+    on_load(_picture(20), _reading(2600020))
+    on_load(_picture(21), _reading(2600020, conf=0.93))
+    on_load(_picture(22), _reading(2600020, "proof_of_delivery", receiver=True))
+    run()
+    up = [u for u in tpro.uploads if u["load"] == 2600020]
+    check("the texted pages of the delivery copy go up as one PDF", len(up) == 1
+          and len(autofile.picture_sig(up[0]["data"])) == 2, str([u["comment"] for u in up]))
+    check("as Bill Of Lading, naming both texts it copies", up[0]["type"] == "Bill Of Lading" and up[0]["comment"] ==
+          "Doc Intake Bot: POD, signed by Kendyl 9/24/26, 2 pages, copy of Driver Supplied BOL 601 + 602 - load 2600020",
+          up[0]["comment"])
+    check("the pickup BOL sent hours earlier is not part of it", conn.execute(
+        "SELECT outcome FROM autofile WHERE source='tpro:600'").fetchone()[0] == "on_file")
+    check("nor is a second shot of page 1", conn.execute(
+        "SELECT outcome FROM autofile WHERE source='tpro:603'").fetchone()[0] == "on_file")
+
+    # Page 1 arrives and is logged; page 2 comes in 20 seconds later, after that run.
+    load_row(2600021, "wrong_doc_type", "delivered")
+    tpro.add(2600021, files=[(text(611, "2026-09-24T12:00:00Z"), _picture(23))])
+    on_load(_picture(23), _reading(2600021, conf=0.93))
+    run()
+    check("a lone first page is only logged", conn.execute(
+        "SELECT outcome FROM autofile WHERE source='tpro:611'").fetchone()[0] == "on_file"
+          and not any(u["load"] == 2600021 for u in tpro.uploads))
+    tpro.loads[2600021]["files"].append(text(612, "2026-09-24T12:00:20Z"))
+    tpro.loads[2600021]["bytes"][612] = _picture(24)
+    on_load(_picture(24), _reading(2600021, "proof_of_delivery", receiver=True))
+    conn.execute("UPDATE load SET last_checked_at=? WHERE load_id=2600021", ("9999-01-01T00:00:00+00:00",))
+    run()
+    up = [u for u in tpro.uploads if u["load"] == 2600021]
+    check("when its signed page arrives, both go up together", len(up) == 1
+          and len(autofile.picture_sig(up[0]["data"])) == 2, str([u["comment"] for u in up]))
+    check("and the first page's row now says uploaded", conn.execute(
+        "SELECT outcome FROM autofile WHERE source='tpro:611'").fetchone()[0] == "uploaded"
+          and next(v for k, v in log.rows.items() if k.startswith("2600021-") and v[4].startswith("611"))[13]
+          .startswith("UPLOADED"))
+
+
+def test_auto_upload_dry_run_and_off() -> None:
+    print("auto-upload: dry run and off")
+    import time as _time
+    from intake import autofile
+
+    class NoUploads(_AutoTPro):
+        def upload_file(self, **kw):
+            raise AssertionError("a dry run must never upload")
+
+    conn, store, _, read, reads, load_row, mail, _on = _auto_world()
+    tpro = NoUploads()
+    load_row(2600002, "bol_expected", "loaded")
+    tpro.add(2600002)
+    mail(2600002, "mb", [(_picture(2), _reading(2600002))])
+    off = autofile.run(conn, tpro, store, read, None, autofile.Settings(terminals=frozenset({1160})),
+                       deadline=_time.monotonic() + 600)
+    check("off does nothing at all", off.line() == "auto-upload: off" and tpro.calls == 0 and not reads)
+    s = autofile.Settings(terminals=frozenset({1160}), mode="dry-run")
+    dry = autofile.run(conn, tpro, store, read, None, s, deadline=_time.monotonic() + 600)
+    check("a dry run reads and decides", len(reads) == 1 and conn.execute(
+        "SELECT outcome FROM autofile").fetchone()[0] == "dry_run", dry.line())
+    log = _AutoLog()
+    check("and never puts a dry-run row in the sheet", autofile.flush_log(conn, log) == 0 and not log.rows)
+
+
+def test_upload_log_sheet() -> None:
+    """Rows are found by their Ref, so a sorted tab is never overwritten in the wrong place, and the
+    pod's own columns are never written."""
+    print("auto-upload: the Upload log sheet")
+    import io
+    import json as _json
+    from urllib.parse import unquote
+    from intake import sheets
+
+    tab = {"Q": [["Ref"]], "A": [["Logged (UTC)"]]}
+    sent: list[dict] = []
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def opener(req, timeout=60):
+        url = unquote(req.full_url)
+        if "fields=sheets.properties" in url:
+            body = {"sheets": [{"properties": {"title": "Upload log", "sheetId": 7,
+                                                "gridProperties": {"rowCount": 1000}}}]}
+        elif req.get_method() == "GET":
+            body = {"values": tab["Q" if url.endswith("!Q:Q") else "A"]}
+        else:
+            body = _json.loads(req.data)
+            sent.append(body)
+            for d in body.get("data", []):
+                cell, values = d["range"].split("!")[1], d["values"][0]
+                row = int("".join(ch for ch in cell.split(":")[0] if ch.isdigit()))
+                col = "Q" if cell.startswith("Q") else "A"
+                while len(tab[col]) < row:
+                    tab[col].append([])
+                tab[col][row - 1] = [values[0]]
+            body = {}
+        return _Resp(_json.dumps(body).encode())
+
+    log = sheets.UploadLog("sheet", lambda: "token", opener=opener)
+    log.write([("L1-a", ["t", 1] + [""] * 12), ("L2-b", ["t", 2] + [""] * 12)])
+    check("new rows go under the header", tab["Q"][1] == ["L1-a"] and tab["Q"][2] == ["L2-b"], str(tab["Q"]))
+    # A pod lead sorts the tab: L2 is now on row 2 and L1 on row 3.
+    tab["Q"][1], tab["Q"][2] = ["L2-b"], ["L1-a"]
+    log.write([("L1-a", ["t2", 1] + [""] * 12), ("L3-c", ["t", 3] + [""] * 12)])
+    ranges = [d["range"] for d in sent[-1]["data"]]
+    check("an update goes to the row carrying its Ref, wherever it now is",
+          "'Upload log'!A3:N3" in ranges and "'Upload log'!A4:N4" in ranges, str(ranges))
+    import re as _re
+    check("and the pod's columns O and P are never written",
+          all(_re.fullmatch(r"'Upload log'!(A\d+:N\d+|Q\d+)", r) for r in ranges), str(ranges))
+
+
 def test_every_load_state_is_classified() -> None:
     """A new load state must be taught to state.shortfall(), or it silently becomes "not needed".
 
@@ -2304,6 +2794,11 @@ if __name__ == "__main__":
     test_worker_run()
     test_a_load_the_sweep_sees_is_never_left_unscheduled()
     test_a_dropped_connection_is_retried_not_fatal()
+    test_auto_upload_facts_and_pictures()
+    test_auto_upload_pilot()
+    test_auto_upload_texted_pages()
+    test_auto_upload_dry_run_and_off()
+    test_upload_log_sheet()
     test_every_load_state_is_classified()
     test_filters()
     test_photo_stamp()
