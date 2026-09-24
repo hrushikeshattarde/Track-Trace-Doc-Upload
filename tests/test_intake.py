@@ -2524,7 +2524,13 @@ def test_auto_upload_pilot() -> None:
           and 2600006 not in {u["load"] for u in tpro.uploads})
     check("a load already showing Documents Received is not read", not any(r[0] == 2600007 for r in status))
     refs = set(log.rows)
-    check("every BOL/POD decision has a row in the Upload log", len(refs) == 9, str(sorted(refs)))
+    check("the Upload log holds the uploads and the holds, one row each", len(refs) == 5
+          and {v[13].split(" ")[0] for v in log.rows.values()} == {"UPLOADED", "HELD"}, str(sorted(refs)))
+    check("already on file, not needed and waiting stay in the ledger, not the sheet", conn.execute(
+        "SELECT COUNT(*) FROM autofile WHERE outcome IN ('on_file','not_needed','waiting') AND logged=1").fetchone()[0] == 4
+          and not any(v[1] in (2600003, 2600004, 2600009) for v in log.rows.values()))
+    held = next(v for v in log.rows.values() if v[13].startswith("HELD"))
+    check("a held row says which check failed", held[9].startswith("FAILED: "), held[9])
     logged_loads = {v[1] for v in log.rows.values()}
     check("the freight photo and the licence are not in it", conn.execute(
         "SELECT COUNT(*) FROM autofile WHERE load_id=2600005 AND logged=0").fetchone()[0] == 2
@@ -2554,8 +2560,8 @@ def test_auto_upload_pilot() -> None:
     last = tpro.uploads[-1]
     check("the POD goes up once the truck is at the consignee", len(tpro.uploads) == n_uploads + 1
           and last["load"] == 2600003 and last["type"] == "Bill Of Lading", st3.line())
-    check("and its sheet row is updated in place, not added", st3.logged == 1
-          and log.rows[autofile.ref(2600003, c_sha)][13].startswith("UPLOADED") and len(log.rows) == 9)
+    check("and it reaches the sheet once it is uploaded", st3.logged == 1
+          and log.rows[autofile.ref(2600003, c_sha)][13].startswith("UPLOADED") and len(log.rows) == 6)
 
     # A copy of the texted POD then arrives by email, and a second pickup BOL for B.
     mail(2600001, "ma2", [(_picture(1, "JPEG"), _reading(2600001, "proof_of_delivery", receiver=True))])
@@ -2672,6 +2678,7 @@ def test_auto_upload_quick_look() -> None:
     page at the consignee is not a POD - it called 2577917's signed page 2 an unsigned BOL."""
     print("auto-upload: the quick look")
     import hashlib as _h
+    import json
     import time as _time
     from intake import autofile
 
@@ -2719,9 +2726,10 @@ def test_auto_upload_quick_look() -> None:
     check("a photo the quick look is sure of gets no full read", sha(_picture(31)) not in full
           and conn.execute("SELECT outcome FROM autofile WHERE sha256=?", (sha(_picture(31)),)).fetchone()[0] == "not_bol_pod")
     check("one it is unsure of does", sha(_picture(32)) in full)
-    check("a BOL texted before the consignee is only looked at, and logged as on file", sha(_picture(30)) not in full
+    check("a BOL texted before the consignee is only looked at, and recorded as on file", sha(_picture(30)) not in full
           and conn.execute("SELECT outcome FROM autofile WHERE sha256=?", (sha(_picture(30)),)).fetchone()[0] == "on_file"
-          and log.rows[autofile.ref(2600030, sha(_picture(30)))][6].startswith("BOL (quick look"))
+          and json.loads(conn.execute("SELECT row_json FROM autofile WHERE sha256=?", (sha(_picture(30)),)).fetchone()[0])[6]
+          .startswith("BOL (quick look"))
     check("at the consignee a texted page gets the full read, whatever the quick look said",
           sha(_picture(33)) in full and any(u["load"] == 2600031 and u["type"] == "Bill Of Lading" for u in tpro.uploads))
     reads_before = len(reads)

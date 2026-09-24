@@ -12,8 +12,9 @@ Frankie Saiz pod (1160) from 24 Sep 2026. For each of their loads that is not ye
              one document from one email - or from one burst of texts, which TransportPro files one
              picture at a time - go up as one PDF. Every upload's comment starts "Doc Intake Bot:"
              and says what the page really is
-    log      every decision - uploaded, already on file, not needed, held and why - to the pod's
-             Upload log sheet, one row per document, updated in place when its status changes
+    log      what it uploaded, and what it held back and which check failed, to the pod's Upload log
+             sheet - one row per document, updated in place when its status changes. Every other
+             decision (already on file, not needed, waiting) is kept in the ledger only
 
 A document is uploaded only when all of these hold:
 
@@ -96,6 +97,9 @@ UPLOADED, ON_FILE, NOT_NEEDED, HELD, WAITING, DRY = ("uploaded", "on_file", "not
                                                     "waiting", "dry_run")
 NOT_PAPERWORK, PERSONAL_ID, UNREADABLE = "not_bol_pod", "personal_id", "unreadable"
 UNLOGGED = (NOT_PAPERWORK, PERSONAL_ID, UNREADABLE)
+# What goes to the Upload log sheet: what the bot uploaded, and what it held back with the check that
+# failed. Already on file, not needed and waiting stay in the ledger only (the pod's ask, 24 Sep 2026).
+SHEET_OUTCOMES = (UPLOADED, HELD)
 
 
 # ------------------------------------------------------------------------------ settings ----
@@ -1249,7 +1253,7 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
         detail = ", ".join(page_detail(ex) + ([f"{pages} pages"] if pages > 1 else []))
         read_as = dec.kind + (f" - {detail}" if detail else "")
     facts = (f"{len(dec.facts)} fact(s): " + "; ".join(dec.facts)) if dec.facts else "nothing on the page matches"
-    checks = ("failed: " + "; ".join(dec.failed)) if dec.failed else (
+    checks = ("FAILED: " + "; ".join(dec.failed)) if dec.failed else (
         "all passed" if dec.outcome in (UPLOADED, DRY) else "")
     shows_upload = dec.outcome in (UPLOADED, DRY) or (dec.outcome in (WAITING, HELD) and upload_as)
     return [db.now_iso()[:16].replace("T", " "), int(row["load_id"]), row["customer"] or "",
@@ -1260,11 +1264,16 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
 
 
 def flush_log(conn, log) -> int:
-    """Send every row whose status the sheet does not show yet. A failure leaves them pending."""
+    """Send every row whose status the sheet does not show yet. A failure leaves them pending.
+
+    Only SHEET_OUTCOMES reach the sheet. Every decision is still recorded in the ledger - the audit
+    trail is complete - but the pod asked (24 Sep 2026) for the sheet to hold what the bot uploaded
+    and what it held back and why, not the pages it found already on file or not needed."""
+    marks = ",".join("?" * len(SHEET_OUTCOMES))
     rows = conn.execute(
         "SELECT load_id, sha256, status, row_json FROM autofile WHERE logged=1 AND row_json IS NOT NULL "
-        "AND outcome != ? AND (logged_status IS NULL OR logged_status != status) ORDER BY decided_at, load_id",
-        (DRY,)).fetchall()
+        f"AND outcome IN ({marks}) AND (logged_status IS NULL OR logged_status != status) "
+        "ORDER BY decided_at, load_id", SHEET_OUTCOMES).fetchall()
     if not rows:
         return 0
     n = log.write([(ref(r["load_id"], r["sha256"]), json.loads(r["row_json"])) for r in rows])
