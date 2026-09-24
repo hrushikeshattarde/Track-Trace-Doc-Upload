@@ -33,7 +33,7 @@ What it creates, all in the account and region the .env's AWS_PROFILE points at:
                                                           login, the Gmail key (for the Upload log sheet), Bedrock reads, logs
                 circle-doc-intake-scheduler               may invoke the circle-doc-intake-* functions
     functions   circle-doc-intake-collector               python3.12, 10 min, 512 MB, concurrency 1, no retries
-                circle-doc-intake-worker                  python3.12, 10 min, 1 GB, concurrency 1, no retries
+                circle-doc-intake-worker                  python3.12, 10 min, 1.5 GB, concurrency 1, no retries
     logs        /aws/lambda/<function>                    90-day retention
     schedules   circle-doc-intake-every-15-min            the collector; rate(15 minutes)
                 circle-doc-intake-worker-every-15-min     the worker; rate(15 minutes); created DISABLED
@@ -145,7 +145,8 @@ FUNCS = {
                        "Never reads with a model, never touches TransportPro."},
     "worker": {
         "name": "circle-doc-intake-worker", "schedule": "circle-doc-intake-worker-every-15-min",
-        "handler": "intake.aws_worker.handler", "memory": 1024,
+        # 1.5 GB since 24 Sep 2026: the AI reads render page images, and a 27-page scan ran 1 GB out.
+        "handler": "intake.aws_worker.handler", "memory": 1536,
         "secrets": lambda env: [TPRO_SECRET, GMAIL_SECRET] + ([env["INTAKE_TPRO_UPLOAD_SECRET"]]
                                                            if env.get("INTAKE_TPRO_UPLOAD_SECRET") else []),
         "env": _worker_env, "policy": _worker_policy, "log_filter": '"worker"',

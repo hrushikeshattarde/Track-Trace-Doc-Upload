@@ -85,6 +85,13 @@ LOOK_UNTIL_S = 240           # stop looking at more loads this long before the d
 READ_UNTIL_S = 120           # ...stop waiting for reads
 UPLOAD_NEEDS_S = 45          # ...and do not start an upload with less than this left
 MAX_UPLOAD_ATTEMPTS = 3
+# The longest document the bot reads. Load 2571670 (24 Sep 2026): a 27-page, 10.6 MB CamScanner
+# packet sent every page to the AI - too large a request, and the rendering ran the 1 GB worker out
+# of memory, which lost the whole run and would have lost every run after it. A longer file is held
+# for a person, unread: uploading pages the bot never looked at could put anything into File History.
+MAX_READ_PAGES = 10
+MAX_READ_MB = 20
+TOO_LONG = "too long for the bot"
 # Pictures a driver texts this close together are one sending, the way one email is. Load 2577917
 # (24 Sep 2026): the delivery copy came as two texts 11 seconds apart - page 1 at 11:13:28, the
 # signed page 2 at 11:13:39 - and TransportPro filed each as its own Driver Supplied BOL. On the
@@ -587,6 +594,13 @@ def _read(conn, store, tpro, read, quick, s: Settings, stats: Stats, plans, dead
             print(f"  ! auto-upload: {d.filename} on load {row['load_id']}: {type(e).__name__}: {str(e)[:120]}")
             unread.add(int(row["load_id"]))
             continue
+        pages, mb = page_count(d.data), len(d.data) / 1e6
+        if pages > MAX_READ_PAGES or mb > MAX_READ_MB:
+            mid = d.message_id or f"tpro-file:{d.source.split(':', 1)[1]}"
+            db.put_attachment(conn, d.sha256, message_id=mid, filename=d.filename, size=len(d.data), extraction=None,
+                              document_type=None, model=None, cost_usd=None, permanent=True,
+                              error=f"{TOO_LONG}: {pages} pages, {mb:.1f} MB (it reads up to {MAX_READ_PAGES} pages)")
+            continue
         ready.append((row, filed, d))
 
     # 1. the same picture, already read
@@ -680,6 +694,17 @@ def _save_spend(conn, stats: Stats, day: str) -> None:
     db.set_state(conn, f"ai_spend:{day}", f"{stats.spent_today:.4f}")
 
 
+def page_count(data: bytes) -> int:
+    """Pages in a file without rendering any: a PDF's page count, 1 for a picture."""
+    if data[:5] != b"%PDF-":
+        return 1
+    try:
+        import pymupdf
+        return pymupdf.open(stream=data, filetype="pdf").page_count
+    except Exception:                                            # noqa: BLE001 - an unopenable PDF fails in the reader, as before
+        return 1
+
+
 def needs_full_read(d: Doc, q: tuple[str, float] | None, stage: str) -> bool:
     """Whether a page needs the full read, given its quick look. No quick look, or one that is
     unsure: always."""
@@ -755,6 +780,10 @@ def doc_bytes(store, tpro, d: Doc) -> bytes:
 
 def _decide(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnFile], d: Doc) -> Decision | None:
     att = db.get_attachment(conn, d.sha256)
+    if att is not None and att["extraction_json"] is None and str(att["error"] or "").startswith(TOO_LONG):
+        # Not read, so what it is is unknown - it is logged, for a person, rather than dropped as not paperwork.
+        return Decision(d, HELD, f"HELD - {att['error']}; not read or uploaded, a person should look",
+                        kind="BOL/POD?", quick="not read (too long for the bot)", failed=[att["error"]])
     if att is None or att["extraction_json"] is None:
         if db.read_blocked(att):
             return Decision(d, UNREADABLE, "the file cannot be read")
@@ -1300,7 +1329,8 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
         pages = len(ex.pages)
         detail = ", ".join(page_detail(ex) + ([f"{pages} pages"] if pages > 1 else []))
         read_as = dec.kind + (f" - {detail}" if detail else "")
-    facts = (f"{len(dec.facts)} fact(s): " + "; ".join(dec.facts)) if dec.facts else "nothing on the page matches"
+    facts = ((f"{len(dec.facts)} fact(s): " + "; ".join(dec.facts)) if dec.facts
+             else "not checked - not read in full" if ex is None else "nothing on the page matches")
     checks = ("FAILED: " + "; ".join(dec.failed)) if dec.failed else (
         "all passed" if dec.outcome in (UPLOADED, DRY) else "")
     shows_upload = dec.outcome in (UPLOADED, DRY) or (dec.outcome in (WAITING, HELD) and upload_as)

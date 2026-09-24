@@ -222,7 +222,8 @@ def _auto_upload(conn, tpro, store, auto: autofile.Settings, env, deadline: floa
     # The brief full read (short notes, low effort) and the quick look that decides which pages need
     # it: measured 24 Sep 2026, the same decisions for about a third of the cost.
     read = ingest.make_reader(env.get("INTAKE_READ_MODEL", "claude-opus-5"), timeout=autofile.READ_TIMEOUT_S,
-                              effort=env.get("INTAKE_READ_EFFORT", "low") or None, brief=True)
+                              effort=env.get("INTAKE_READ_EFFORT", "low") or None, brief=True,
+                              max_pages=autofile.MAX_READ_PAGES)
     quick = None
     if env.get("INTAKE_QUICK_LOOK", "on") != "off":
         quick = ingest.make_quick_reader(env.get("INTAKE_QUICK_MODEL", "claude-haiku-4-5"), timeout=60)

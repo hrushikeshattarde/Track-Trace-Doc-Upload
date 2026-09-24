@@ -625,7 +625,8 @@ def _load_is_satisfied(conn, load_id) -> bool:
     return (row["state"] or "") in _st.SATISFIED_STATES
 
 
-def make_reader(model: str, timeout: float | None = None, effort: str | None = None, brief: bool = False) -> Reader:
+def make_reader(model: str, timeout: float | None = None, effort: str | None = None, brief: bool = False,
+                max_pages: int | None = None) -> Reader:
     """Adapter over pod_intake.reader. Bytes go to a temp file because normalize.load_document
     works on paths (PyMuPDF opens PDFs and images the same way), and the file is deleted straight
     after - the ledger keeps the hash and the extraction, never the document.
@@ -647,7 +648,7 @@ def make_reader(model: str, timeout: float | None = None, effort: str | None = N
         tmp = Path(tempfile.mkdtemp(prefix="intake_")) / f"doc{suffix}"
         try:
             tmp.write_bytes(data)
-            doc = load_document(tmp)
+            doc = load_document(tmp, max_pages=max_pages)
             extraction, usage = claude_reader.read_document(client, doc, model, effort=effort, brief=brief)
             return extraction.model_dump(), extraction.document_type, model, round(usage.cost_usd, 5)
         finally:
@@ -663,10 +664,11 @@ def make_reader(model: str, timeout: float | None = None, effort: str | None = N
     return read
 
 
-def make_quick_reader(model: str, timeout: float | None = None, max_edge: int = 1100):
+def make_quick_reader(model: str, timeout: float | None = None, max_edge: int = 1100, max_pages: int = 3):
     """The cheap first look (pod_intake.reader.quick_look): read(data, filename) -> (kind, confidence,
     model, cost). Pages go at 1,100 px - enough to tell a freight photo from paperwork, and about 40%
-    fewer image tokens than the full read's 1,568."""
+    fewer image tokens than the full read's 1,568 - and only the first `max_pages`: which of five things a
+    file is shows on its first pages, and all 27 pages of one scan were too large a request (HTTP 413)."""
     from pod_intake import provider, reader as claude_reader
     from pod_intake.localenv import load_local_env
     from pod_intake.normalize import load_document
@@ -681,7 +683,8 @@ def make_quick_reader(model: str, timeout: float | None = None, max_edge: int = 
         tmp = Path(tempfile.mkdtemp(prefix="intake_")) / f"doc{suffix}"
         try:
             tmp.write_bytes(data)
-            kind, confidence, usage = claude_reader.quick_look(client, load_document(tmp, max_edge=max_edge), model)
+            kind, confidence, usage = claude_reader.quick_look(
+                client, load_document(tmp, max_edge=max_edge, max_pages=max_pages), model)
             return kind, confidence, model, round(usage.cost_usd, 5)
         finally:
             try:

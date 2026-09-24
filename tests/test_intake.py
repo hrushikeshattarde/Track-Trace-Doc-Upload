@@ -2729,6 +2729,39 @@ def test_auto_upload_bol_sets() -> None:
           and conn.execute("SELECT outcome FROM autofile WHERE sha256=?", (b42,)).fetchone()[0] == "held")
 
 
+def test_auto_upload_holds_a_long_packet_unread() -> None:
+    """Load 2571670 (24 Sep 2026): a 27-page scan sent every page to the AI, which refused the request
+    and ran the worker out of memory. A file longer than the bot reads is held for a person, unread."""
+    print("auto-upload: a packet too long to read")
+    import tempfile as _tf
+    import time as _time
+    from intake import autofile
+    from pod_intake.normalize import load_document
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    looked: list[str] = []
+
+    def quick(data, filename):
+        looked.append(filename)
+        return "bol", 0.9, "claude-haiku-4-5", 0.002
+
+    log = _AutoLog()
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    packet = autofile.combine_pdf([_picture(50 + i) for i in range(12)], "packet")
+    load_row(2600050, "bol_expected", "loaded")
+    tpro.add(2600050)
+    (sha,) = mail(2600050, "m50", [(packet, _reading(2600050))])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600, quick=quick)
+    check("a 12-page file is sent to neither AI", not reads and not looked)
+    row = log.rows.get(autofile.ref(2600050, sha))
+    check("it is held for a person, and says why", row is not None and row[13].startswith("HELD - too long for the bot: 12 pages")
+          and not tpro.uploads, str(row and row[13]))
+    tmp = Path(_tf.mkdtemp()) / "p.pdf"
+    tmp.write_bytes(packet)
+    doc = load_document(tmp, max_edge=400, max_pages=3)
+    check("a quick look renders only the pages it sends", len(doc.pages) == 3 and doc.total_pages == 12)
+
+
 def test_auto_upload_quick_look() -> None:
     """The cheap first look decides which pages get the full read (24 Sep 2026). It may set aside a
     photo, and a texted picture while the truck is not at the consignee; it is never trusted to say a
@@ -3021,6 +3054,7 @@ if __name__ == "__main__":
     test_auto_upload_pilot()
     test_auto_upload_texted_pages()
     test_auto_upload_bol_sets()
+    test_auto_upload_holds_a_long_packet_unread()
     test_auto_upload_quick_look()
     test_reader_is_brief_and_caches_the_schema()
     test_auto_upload_dry_run_and_off()

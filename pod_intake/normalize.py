@@ -40,6 +40,7 @@ class Document:
     sha256: str
     producer: str
     pages: list[PageImage] = field(default_factory=list)
+    total_pages: int = 0          # pages in the file; more than len(pages) when max_pages cut it short
 
     @property
     def text_layer(self) -> str:
@@ -67,7 +68,7 @@ def hamming(a: str, b: str) -> int:
     return bin(int(a, 16) ^ int(b, 16)).count("1")
 
 
-def load_document(path: str | Path, max_edge: int = MAX_EDGE_PX) -> Document:
+def load_document(path: str | Path, max_edge: int = MAX_EDGE_PX, max_pages: int | None = None) -> Document:
     """max_edge: long-edge pixel size of the page images sent to the model. 1,568 is Anthropic's recommended
     ceiling; raise it to test whether a model's digit errors on long numbers come from resolution."""
     path = Path(path)
@@ -84,8 +85,11 @@ def load_document(path: str | Path, max_edge: int = MAX_EDGE_PX) -> Document:
     else:
         doc = pymupdf.open(path)                  # PDFs and images alike
     meta = doc.metadata or {}
-    out = Document(path=path, sha256=hashlib.sha256(raw).hexdigest(), producer=(meta.get("producer") or meta.get("creator") or "").strip())
+    out = Document(path=path, sha256=hashlib.sha256(raw).hexdigest(), producer=(meta.get("producer") or meta.get("creator") or "").strip(),
+                   total_pages=doc.page_count)
     for i, page in enumerate(doc, start=1):
+        if max_pages is not None and len(out.pages) >= max_pages:
+            break                                 # rendering every page of a 27-page scan ran a 1 GB worker out of memory
         rect = page.rect
         long_edge = max(rect.width, rect.height)
         if long_edge < MIN_LOGO_PX and doc.is_pdf is False:
