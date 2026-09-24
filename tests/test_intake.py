@@ -2419,6 +2419,9 @@ def test_auto_upload_facts_and_pictures() -> None:
           f"{autofile._diff(a[0], b[0]):.1f}")
     check("the same page re-saved as JPEG is the same picture", autofile._diff(a[0], again[0]) < autofile.SAME_PICTURE,
           f"{autofile._diff(a[0], again[0]):.1f}")
+    one = autofile.upload_payload([_picture(1, "JPEG")], "POD", 1)
+    check("every upload is a PDF, a lone JPEG included", one[0][:5] == b"%PDF-" and one[1] == "POD_1.pdf"
+          and autofile._diff(autofile.picture_sig(one[0])[0], autofile.picture_sig(_picture(1, "JPEG"))[0]) < autofile.SAME_PICTURE)
     pdf = autofile.combine_pdf([_picture(1), _picture(2)], "BOL - load 1")
     check("pages combine into one PDF, one page each", pdf[:5] == b"%PDF-" and len(autofile.picture_sig(pdf)) == 2)
     check("and its pages are still the same pictures",
@@ -2505,8 +2508,9 @@ def test_auto_upload_pilot() -> None:
     check("its comment says what it is, and which copy it re-files",
           ups[2600001]["comment"] == "Doc Intake Bot: POD, signed by Kendyl 9/24/26, copy of Driver Supplied BOL 501 "
                                      "- load 2600001", ups[2600001]["comment"])
-    check("a single page goes up as it is", ups[2600001]["data"] == _picture(1)
-          and ups[2600001]["content_type"] == "image/png")
+    check("a single photo goes up as a one-page PDF", ups[2600001]["data"][:5] == b"%PDF-"
+          and ups[2600001]["content_type"] == "application/pdf" and ups[2600001]["filename"].endswith(".pdf")
+          and len(autofile.picture_sig(ups[2600001]["data"])) == 1)
     check("a BOL goes in as Driver Supplied BOL", ups[2600002]["type"] == "Driver Supplied BOL")
     check("its two pages as one PDF", ups[2600002]["data"][:5] == b"%PDF-"
           and len(autofile.picture_sig(ups[2600002]["data"])) == 2)

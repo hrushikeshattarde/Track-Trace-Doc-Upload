@@ -1154,11 +1154,12 @@ def _kind_of(data: bytes) -> str:
 
 
 def upload_payload(parts: list[bytes], kind: str, load_id: int) -> tuple[bytes, str, str]:
-    """(bytes, filename, content type). One PDF, JPEG or PNG goes up as it is; several pages, or a
-    format TransportPro may not show (HEIC), are combined into one PDF."""
-    if len(parts) == 1 and _kind_of(parts[0]) != "other":
-        ext = _kind_of(parts[0])
-        return parts[0], f"{kind}_{load_id}.{ext}", {"pdf": "application/pdf", "jpg": "image/jpeg", "png": "image/png"}[ext]
+    """(bytes, filename, content type) - always one PDF. A PDF that arrives on its own goes up as it
+    is; a photo, several pages, or an iPhone HEIC are made into one PDF first. File History is PDFs -
+    TransportPro turns even a driver's texted picture into one - and the pod asked for the bot's
+    uploads to match (2535235's emailed photo went up as a JPEG, 24 Sep 2026)."""
+    if len(parts) == 1 and _kind_of(parts[0]) == "pdf":
+        return parts[0], f"{kind}_{load_id}.pdf", "application/pdf"
     return combine_pdf(parts, f"{kind} - load {load_id}"), f"{kind}_{load_id}.pdf", "application/pdf"
 
 
