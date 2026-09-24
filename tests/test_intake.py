@@ -2433,6 +2433,15 @@ def test_auto_upload_facts_and_pictures() -> None:
         check("settings: a mode that is not off/dry-run/on is refused", True)
     else:
         check("settings: a mode that is not off/dry-run/on is refused", False)
+    # Load 2573776: the reader's aside on the year went into the comment, and a word cap left a stray "3".
+    messy = _reading(2573776, "proof_of_delivery", receiver=True)
+    messy["signatures"]["receiver_date"] = "9/24/24 (as written; likely 9/24/26)"
+    messy["pages"] = [{"page": i, "role": "pod", "legibility": 0.9} for i in (1, 2, 3)]
+    dec = autofile.Decision(autofile.Doc("x", "f.pdf", "email:m", "Email"), "ready", kind="POD",
+                            ex=Extraction.model_validate(messy))
+    check("a comment carries what is on the page, not the reader's asides",
+          autofile.upload_comment([dec], "POD", 2573776) == "Doc Intake Bot: POD, signed by Kendyl 9/24/24, 3 pages - load 2573776",
+          autofile.upload_comment([dec], "POD", 2573776))
     check("the pod's name comes from its terminal",
           autofile.pod_names({"terminals": [{"id": 1160, "name": "POD (Frankie Saiz)"}]}) == {1160: "Frankie Saiz"})
 

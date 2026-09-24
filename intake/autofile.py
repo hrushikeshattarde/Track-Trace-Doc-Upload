@@ -1031,13 +1031,24 @@ def combine_pdf(parts: list[bytes], title: str) -> bytes:
     return out.tobytes(garbage=3, deflate=True)
 
 
+def page_detail(ex) -> list[str]:
+    """What the page shows beyond its kind - ["signed by Kendyl 9/24/26"] - for the comment and the sheet.
+
+    The reader's own asides are dropped, and nothing is cut to a word count. Load 2573776 (24 Sep
+    2026) went up as "POD, signed 9/24/24 (as written; likely 9/24/26), 3, 3 pages": the receiver
+    date carried the reader's note on the year, and trimming the text to eight words left the "3" of
+    "3 pages" behind. The page count is the caller's, from every page actually uploaded.
+    """
+    from pod_intake.matcher import brief_page_comment
+    text = re.sub(r"\s*\([^)]*\)", "", brief_page_comment(ex, max_words=60))
+    return [b.strip() for b in text.split(", ")[1:] if b.strip() and not re.fullmatch(r"\d+ pages?", b.strip())]
+
+
 def upload_comment(members: list[Decision], kind: str, load_id: int) -> str:
     """"Doc Intake Bot: POD, signed by Kendyl 9/24/26, 2 pages - load 2562005": what the page is,
     whatever type it went in under."""
-    from pod_intake.matcher import brief_page_comment
     lead = next((m for m in members if m.kind == kind and not m.companion), members[0])
-    bits = [b for b in brief_page_comment(lead.ex, max_words=8).split(", ") if not b.endswith(" pages")]
-    bits[0] = kind
+    bits = [kind] + page_detail(lead.ex)
     pages = sum(max(1, len(m.ex.pages)) for m in members)
     if pages > 1:
         bits.append(f"{pages} pages")
@@ -1083,8 +1094,8 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
         name += f" - combined with {', '.join(others)} into one {pages}-page PDF"
     read_as = ""
     if ex is not None and dec.kind:
-        from pod_intake.matcher import brief_page_comment
-        detail = ", ".join(brief_page_comment(ex, max_words=8).split(", ")[1:])
+        pages = len(ex.pages)
+        detail = ", ".join(page_detail(ex) + ([f"{pages} pages"] if pages > 1 else []))
         read_as = dec.kind + (f" - {detail}" if detail else "")
     facts = (f"{len(dec.facts)} fact(s): " + "; ".join(dec.facts)) if dec.facts else "nothing on the page matches"
     checks = ("failed: " + "; ".join(dec.failed)) if dec.failed else (
