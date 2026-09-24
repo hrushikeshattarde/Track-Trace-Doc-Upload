@@ -73,9 +73,13 @@ POD_COMMENT = re.compile(r"\bpod\b|proof|deliver", re.I)
 # measured boundary.
 SAME_PICTURE = 3.0
 
-READERS = 3                  # reads in parallel
+READERS = 3                  # full reads in parallel
+QUICK_LOOKERS = 4            # quick looks in parallel
 READ_TIMEOUT_S = 120         # one read, in the SDK
-EST_READ_USD = 0.06          # for the daily cap; the recorded cost is the real one
+EST_READ_USD = 0.04          # a brief full read, for the safety limit; the recorded cost is the real one
+# How sure the quick look must be that a page is a photo before the full read is skipped. On the 24 Sep
+# 2026 pages it never called a BOL or POD a photo at any confidence; 0.8 keeps a margin.
+QUICK_TRUST = 0.8
 LOOK_UNTIL_S = 240           # stop looking at more loads this long before the deadline
 READ_UNTIL_S = 120           # ...stop waiting for reads
 UPLOAD_NEEDS_S = 45          # ...and do not start an upload with less than this left
@@ -102,7 +106,7 @@ class Settings:
     mode: str = OFF
     min_confidence: float = 0.85
     min_facts: int = 2
-    daily_usd: float = 10.0
+    daily_usd: float = 50.0      # a safety limit against a runaway, not a budget: a normal day is ~$1
     max_reads: int = 60
     pods: dict[int, str] = field(default_factory=dict)
 
@@ -115,7 +119,7 @@ class Settings:
         return cls(terminals=terminals, mode=mode,
                    min_confidence=float(env.get("INTAKE_AUTO_MIN_CONFIDENCE") or 0.85),
                    min_facts=int(env.get("INTAKE_AUTO_MIN_FACTS") or 2),
-                   daily_usd=float(env.get("INTAKE_AUTO_DAILY_USD") or 10),
+                   daily_usd=float(env.get("INTAKE_AUTO_DAILY_USD") or 50),
                    max_reads=int(env.get("INTAKE_AUTO_MAX_READS") or 60), pods=pods or {})
 
 
@@ -129,6 +133,8 @@ class Stats:
     spent_today: float = 0.0
     uploads: int = 0
     uploaded: int = 0
+    quick: int = 0
+    reused: int = 0
     outcomes: dict[str, int] = field(default_factory=dict)
     logged: int = 0
     errors: int = 0
@@ -140,7 +146,8 @@ class Stats:
         if self.mode == OFF:
             return "auto-upload: off"
         by = ", ".join(f"{k.replace('_', ' ')} {v}" for k, v in sorted(self.outcomes.items())) or "no decisions"
-        return (f"auto-upload ({self.mode}): {self.looked} load(s) looked at, {self.read} document(s) read "
+        return (f"auto-upload ({self.mode}): {self.looked} load(s) looked at, {self.quick} quick look(s), "
+                f"{self.read} full read(s), {self.reused} reading(s) reused "
                 f"(${self.spent:.2f}; ${self.spent_today:.2f} today), {self.uploads} upload(s) of "
                 f"{self.uploaded} document(s) | {by} | {self.logged} sheet row(s) written"
                 + (f" | {self.read_failed} read(s) failed" if self.read_failed else "")
@@ -202,6 +209,7 @@ class Decision:
     strong: list[str] = field(default_factory=list)   # the reference numbers among `facts`
     on_clearing: bool = False     # already on the load under a type that clears
     companion: bool = False       # another page of a POD from the same email, going up with it
+    quick: str = ""               # "BOL (quick look, 95% sure)" when only the quick look saw the page
 
     @property
     def ready(self) -> bool:
@@ -211,10 +219,11 @@ class Decision:
 # ------------------------------------------------------------------------------------ run ----
 
 def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Settings, *,
-        deadline: float, uploader=None) -> Stats:
+        deadline: float, uploader=None, quick: Callable | None = None) -> Stats:
     """One pass over the pilot terminals' loads. `read` is ingest.make_reader's callable; `log` an
     sheets.UploadLog, or None in dry-run; `uploader` the TransportPro client that uploads (the bot's
-    own login when it has one), defaulting to `tpro`."""
+    own login when it has one), defaulting to `tpro`; `quick` ingest.make_quick_reader's callable, or
+    None to give every page the full read."""
     stats = Stats(mode=s.mode, started=db.now_iso())
     if s.mode == OFF or not s.terminals:
         stats.mode = OFF
@@ -242,7 +251,7 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
             plans.append(plan)
 
     # 2. read
-    unread = _read(conn, store, tpro, read, s, stats, plans, deadline, day)
+    unread = _read(conn, store, tpro, read, quick, s, stats, plans, deadline, day)
 
     # 3. decide and upload
     for row, load, filed, docs in plans:
@@ -501,11 +510,25 @@ def on_file(conn, tpro, load_id: int, files: list[dict]) -> list[OnFile]:
 
 # ------------------------------------------------------------------------------- reading ----
 
-def _read(conn, store, tpro, read, s: Settings, stats: Stats, plans, deadline: float, day: str) -> set[int]:
-    """Read every document that has no reading yet, within the caps. Returns the loads left with
-    something unread, so they are looked at again next run."""
-    jobs, unread = [], set()
-    for row, _, _, docs in plans:
+def _read(conn, store, tpro, read, quick, s: Settings, stats: Stats, plans, deadline: float, day: str) -> set[int]:
+    """Give every document the reading it needs, as cheaply as that can be had:
+
+        1. the same picture already read on this load: its reading is reused, for nothing
+        2. a quick look (Claude Haiku, ~$0.002 a page): a photo is set aside, and so is a picture
+           the driver texted while the truck is not at the consignee yet - TransportPro has already
+           filed it as Driver Supplied BOL, which is where a BOL belongs, and no POD can be uploaded
+           before the consignee anyway
+        3. the full read (brief, ~$0.04) for everything else: every page that could be a POD or a
+           BOL a load still needs, and every page the quick look is unsure of
+
+    Measured on the 162 pages of 24 Sep 2026: this would have made 84 full reads instead of 162,
+    skipping no POD and nothing the bot uploaded or held. The quick look is never trusted to say a
+    page is NOT a POD - it called 2577917's signed page 2 an unsigned BOL - only that it is a photo.
+
+    Returns the loads left with something unread, so they are looked at again next run."""
+    unread: set[int] = set()
+    todo = []
+    for row, _, filed, docs in plans:
         for d in docs:
             att = db.get_attachment(conn, d.sha256)
             if att is not None and (att["extraction_json"] is not None or db.read_blocked(att)):
@@ -513,31 +536,76 @@ def _read(conn, store, tpro, read, s: Settings, stats: Stats, plans, deadline: f
             if att is not None and att["next_read_at"] and att["next_read_at"] > db.now_iso():
                 unread.add(int(row["load_id"]))
                 continue                                   # waiting out a failed read's backoff
-            jobs.append((int(row["load_id"]), d))
-    if not jobs:
+            todo.append((row, filed, d))
+    if not todo:
         return unread
-    allowed = min(s.max_reads, max(0, int((s.daily_usd - stats.spent_today) / EST_READ_USD)))
+    ready = []
+    for row, filed, d in todo:
+        try:
+            d.data = d.data or doc_bytes(store, tpro, d)   # here, not in the pool: the TransportPro client is not thread-safe
+        except Exception as e:                             # noqa: BLE001 - one missing file stops nothing
+            print(f"  ! auto-upload: {d.filename} on load {row['load_id']}: {type(e).__name__}: {str(e)[:120]}")
+            unread.add(int(row["load_id"]))
+            continue
+        ready.append((row, filed, d))
+
+    # 1. the same picture, already read
+    left = []
+    for row, filed, d in ready:
+        if reuse_reading(conn, store, tpro, int(row["load_id"]), filed, d):
+            stats.reused += 1
+        else:
+            left.append((row, filed, d))
+
+    # 2. the quick look
+    if quick is not None:
+        _quick_looks(conn, quick, stats, [x for x in left if quick_of(conn, x[2].sha256) is None], deadline)
+    full, shas = [], set()
+    for row, filed, d in left:
+        q = quick_of(conn, d.sha256) if quick is not None else None
+        if needs_full_read(d, q, (row["stage"] or "").lower()):
+            full.append((row, filed, d))
+            shas.add(d.sha256)
+    # A texted POD takes its other pages into the full read, even ones only looked at before - page 1
+    # can be set aside as a BOL while the truck's stage still says loaded, and page 2 arrive signed.
+    for row, filed, d in list(full):
+        q = quick_of(conn, d.sha256) if quick is not None else None
+        if not (d.batch or "").startswith("text:") or (q is not None and q[0] != "pod"):
+            continue
+        for of in filed:
+            mq = quick_of(conn, of.sha256)
+            if (of.sha256 in shas or text_batches(filed).get(str(of.file.get("id"))) != d.batch
+                    or db.get_attachment(conn, of.sha256) is not None and db.get_attachment(conn, of.sha256)["extraction_json"]
+                    or mq is not None and mq[0] in ("photo", "not_freight") and mq[1] >= QUICK_TRUST):
+                continue
+            mate = file_doc(of, filed)
+            try:
+                mate.data = mate.data or doc_bytes(store, tpro, mate)
+            except Exception:                              # noqa: BLE001 - the POD still goes, alone
+                continue
+            full.append((row, filed, mate))
+            shas.add(mate.sha256)
+
+    # 3. the full read
+    jobs = [(int(row["load_id"]), d) for row, _, d in full]
+    if not jobs:
+        _save_spend(conn, stats, day)
+        return unread
+    allowed = min(s.max_reads, max(0, int((s.daily_usd - stats.spent_today - stats.spent) / EST_READ_USD)))
     if read is None:
         allowed = 0
     if len(jobs) > allowed:
         stats.stopped = (f"read cap: {len(jobs) - allowed} document(s) left for later "
-                         + (f"(daily ${s.daily_usd:.0f} reached)" if allowed < s.max_reads else f"({s.max_reads} a run)"))
+                         + (f"(daily ${s.daily_usd:.0f} safety limit reached)" if allowed < s.max_reads
+                            else f"({s.max_reads} a run)"))
         for load_id, _ in jobs[allowed:]:
             unread.add(load_id)
         jobs = jobs[:allowed]
-    todo = []
-    for load_id, d in jobs:
-        try:
-            d.data = d.data or doc_bytes(store, tpro, d)
-        except Exception as e:                                   # noqa: BLE001 - one missing file stops nothing
-            print(f"  ! auto-upload: {d.filename} on load {load_id}: {type(e).__name__}: {str(e)[:120]}")
-            unread.add(load_id)
-            continue
-        todo.append((load_id, d))
-    if not todo:
+    if not jobs:
+        _save_spend(conn, stats, day)
         return unread
     pool = ThreadPoolExecutor(max_workers=READERS)
-    futures = {pool.submit(read, d.data, d.filename): (load_id, d) for load_id, d in todo}
+    futures = {pool.submit(read, d.data, d.filename): (load_id, d) for load_id, d in jobs}
     done, late = wait(futures, timeout=max(1.0, deadline - READ_UNTIL_S - time.monotonic()))
     # Not `with`: its exit waits for every read, and a stuck one must not hold the ledger past the
     # timeout. Reads not started are cancelled; one still running is abandoned and tried next run.
@@ -563,9 +631,75 @@ def _read(conn, store, tpro, read, s: Settings, stats: Stats, plans, deadline: f
                           extraction=ex, document_type=dtype, model=model, cost_usd=cost)
         stats.read += 1
         stats.spent += cost or 0
+    _save_spend(conn, stats, day)
+    return unread
+
+
+def _save_spend(conn, stats: Stats, day: str) -> None:
     stats.spent_today += stats.spent
     db.set_state(conn, f"ai_spend:{day}", f"{stats.spent_today:.4f}")
-    return unread
+
+
+def needs_full_read(d: Doc, q: tuple[str, float] | None, stage: str) -> bool:
+    """Whether a page needs the full read, given its quick look. No quick look, or one that is
+    unsure: always."""
+    if q is None:
+        return True
+    kind, confidence = q
+    if kind in ("photo", "not_freight") and confidence >= QUICK_TRUST:
+        return False
+    if d.on_file is not None and stage not in AT_CONSIGNEE and kind in ("bol", "other_paperwork", "photo", "not_freight"):
+        return False
+    return True
+
+
+def quick_of(conn, sha: str) -> tuple[str, float] | None:
+    got = conn.execute("SELECT kind, confidence FROM quicklook WHERE sha256=?", (sha,)).fetchone()
+    return (got[0], float(got[1] or 0)) if got else None
+
+
+def _quick_looks(conn, quick, stats: Stats, items: list, deadline: float) -> None:
+    if not items:
+        return
+    pool = ThreadPoolExecutor(max_workers=QUICK_LOOKERS)
+    futures = {pool.submit(quick, d.data, d.filename): d for _, _, d in items}
+    done, _late = wait(futures, timeout=max(1.0, deadline - LOOK_UNTIL_S / 2 - time.monotonic()))
+    pool.shutdown(wait=False, cancel_futures=True)
+    for fut in done:
+        d = futures[fut]
+        try:
+            kind, confidence, model, cost = fut.result()
+        except Exception as e:                                   # noqa: BLE001 - no quick look: the full read decides
+            print(f"  ! auto-upload: quick look on {d.filename}: {type(e).__name__}: {str(e)[:120]}")
+            continue
+        conn.execute("INSERT OR REPLACE INTO quicklook (sha256, kind, confidence, model, cost_usd, looked_at) "
+                     "VALUES (?,?,?,?,?,?)", (d.sha256, kind, confidence, model, cost, db.now_iso()))
+        stats.quick += 1
+        stats.spent += cost or 0
+
+
+def reuse_reading(conn, store, tpro, load_id: int, filed: list[OnFile], d: Doc) -> bool:
+    """Copy the reading of a document already read on this load when this one is the same picture,
+    page for page - a photo texted AND emailed, or re-saved by a scanning app. 13 of the 162 pages
+    read on 24 Sep 2026 were such copies."""
+    mine = doc_sig(conn, store, tpro, d)
+    if not mine:
+        return False
+    shas = {of.sha256 for of in filed} | {r[0] for r in conn.execute(
+        "SELECT DISTINCT p.sha256 FROM part p JOIN message m ON m.message_id = p.message_id "
+        "WHERE m.load_id=? AND p.decision='keep' AND p.sha256 IS NOT NULL", (load_id,))}
+    for sha in shas - {d.sha256}:
+        src = db.get_attachment(conn, sha)
+        theirs = cached_sig(conn, sha)
+        if src is None or src["extraction_json"] is None or not theirs or len(theirs) != len(mine):
+            continue
+        if all(any(_diff(p, q) < SAME_PICTURE for q in theirs) for p in mine):
+            mid = d.message_id or f"tpro-file:{d.source.split(':', 1)[1]}"
+            db.put_attachment(conn, d.sha256, message_id=mid, filename=d.filename, size=len(d.data or b""),
+                              extraction=json.loads(src["extraction_json"]), document_type=src["document_type"],
+                              model=f"reused from {sha[:12]}", cost_usd=0.0)
+            return True
+    return False
 
 
 def doc_bytes(store, tpro, d: Doc) -> bytes:
@@ -584,9 +718,23 @@ def _decide(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnFile]
     if att is None or att["extraction_json"] is None:
         if db.read_blocked(att):
             return Decision(d, UNREADABLE, "the file cannot be read")
+        q = quick_of(conn, d.sha256)
+        if q is not None and not needs_full_read(d, q, (row["stage"] or "").lower()):
+            return quick_decision(d, q)
         return None                                   # not read yet: next run
     return judge(conn, s, row, load, filed, d, json.loads(att["extraction_json"]),
                  sig=lambda: doc_sig(conn, store, tpro, d))
+
+
+def quick_decision(d: Doc, q: tuple[str, float]) -> Decision:
+    """The decision for a page the quick look settled. A photo is never logged; a BOL the driver
+    texted is on the load already, as Driver Supplied BOL, and is logged as that."""
+    kind, confidence = q
+    if kind == "bol" and d.on_file is not None:
+        return Decision(d, ON_FILE, f"ALREADY ON FILE - {d.on_file.named()}, same file; nothing uploaded "
+                                    f"(checked by quick look)", kind="BOL",
+                        quick=f"BOL (quick look, {confidence:.0%} sure)")
+    return Decision(d, NOT_PAPERWORK, f"quick look: {kind}")
 
 
 def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, reading: dict, *,
@@ -699,6 +847,9 @@ def _reads_as(conn, of: OnFile) -> str | None:
     att = db.get_attachment(conn, of.sha256)
     if att is not None and att["extraction_json"] is not None:
         return att["document_type"]
+    q = quick_of(conn, of.sha256)
+    if q is not None:
+        return {"bol": "bill_of_lading", "pod": "proof_of_delivery"}.get(q[0], "other")
     return "unreadable" if db.read_blocked(att) else None
 
 
@@ -1092,7 +1243,7 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
         others = [g.doc.filename for g in group if g.doc.sha256 != d.sha256]
         pages = sum(max(1, len(g.ex.pages)) for g in group)
         name += f" - combined with {', '.join(others)} into one {pages}-page PDF"
-    read_as = ""
+    read_as = dec.quick
     if ex is not None and dec.kind:
         pages = len(ex.pages)
         detail = ", ".join(page_detail(ex) + ([f"{pages} pages"] if pages > 1 else []))

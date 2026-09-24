@@ -625,7 +625,7 @@ def _load_is_satisfied(conn, load_id) -> bool:
     return (row["state"] or "") in _st.SATISFIED_STATES
 
 
-def make_reader(model: str, timeout: float | None = None) -> Reader:
+def make_reader(model: str, timeout: float | None = None, effort: str | None = None, brief: bool = False) -> Reader:
     """Adapter over pod_intake.reader. Bytes go to a temp file because normalize.load_document
     works on paths (PyMuPDF opens PDFs and images the same way), and the file is deleted straight
     after - the ledger keeps the hash and the extraction, never the document.
@@ -648,7 +648,7 @@ def make_reader(model: str, timeout: float | None = None) -> Reader:
         try:
             tmp.write_bytes(data)
             doc = load_document(tmp)
-            extraction, usage = claude_reader.read_document(client, doc, model)
+            extraction, usage = claude_reader.read_document(client, doc, model, effort=effort, brief=brief)
             return extraction.model_dump(), extraction.document_type, model, round(usage.cost_usd, 5)
         finally:
             # Best-effort. On Windows PyMuPDF keeps a handle on the file it opened, so the unlink
@@ -661,3 +661,33 @@ def make_reader(model: str, timeout: float | None = None) -> Reader:
                 pass
 
     return read
+
+
+def make_quick_reader(model: str, timeout: float | None = None, max_edge: int = 1100):
+    """The cheap first look (pod_intake.reader.quick_look): read(data, filename) -> (kind, confidence,
+    model, cost). Pages go at 1,100 px - enough to tell a freight photo from paperwork, and about 40%
+    fewer image tokens than the full read's 1,568."""
+    from pod_intake import provider, reader as claude_reader
+    from pod_intake.localenv import load_local_env
+    from pod_intake.normalize import load_document
+
+    load_local_env()
+    client, _ = provider.make_client()
+    if timeout:
+        client = client.with_options(timeout=timeout, max_retries=1)
+
+    def look(data: bytes, filename: str) -> tuple[str, float, str, float]:
+        suffix = Path(filename).suffix or (".pdf" if data[:5] == b"%PDF-" else ".png")
+        tmp = Path(tempfile.mkdtemp(prefix="intake_")) / f"doc{suffix}"
+        try:
+            tmp.write_bytes(data)
+            kind, confidence, usage = claude_reader.quick_look(client, load_document(tmp, max_edge=max_edge), model)
+            return kind, confidence, model, round(usage.cost_usd, 5)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+                tmp.parent.rmdir()
+            except OSError:
+                pass
+
+    return look

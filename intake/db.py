@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # Backoff for a failed read, by attempt. After the last one the file is left alone and reported as
 # a permanent failure: a .MOV or a corrupt part fails identically every time, and retrying it on a
@@ -414,6 +414,12 @@ def migrate(conn: sqlite3.Connection) -> None:
             "CREATE TABLE IF NOT EXISTS autofile_load (load_id INTEGER PRIMARY KEY, looked_at TEXT);"
             # A 32x32 greyscale thumbnail per page, by file hash: what 'the same picture' is judged on.
             "CREATE TABLE IF NOT EXISTS picture_sig (sha256 TEXT PRIMARY KEY, sig TEXT);")
+    if have < 15:
+        # The auto-upload's quick look (24 Sep 2026): what the cheap model called a page - pod, bol,
+        # other_paperwork, photo, not_freight - so a page is looked at once, and the full read is
+        # spent only where it can change what is uploaded.
+        conn.execute("CREATE TABLE IF NOT EXISTS quicklook (sha256 TEXT PRIMARY KEY, kind TEXT, confidence REAL, "
+                     "model TEXT, cost_usd REAL, looked_at TEXT)")
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 

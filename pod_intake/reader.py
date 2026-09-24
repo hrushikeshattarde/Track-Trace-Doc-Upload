@@ -6,6 +6,7 @@ The system prompt is cached; only the document content changes per call.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 import anthropic
@@ -124,9 +125,19 @@ def _extract_json(text: str) -> str:
 # Process-scoped on purpose: a new run re-checks, so moving to an endpoint that gained
 # support costs one request to discover rather than a code change.
 _NO_STRUCTURED_OUTPUT: dict[str, bool] = {}
+# ...and the same for the effort setting on its own, which Bedrock accepts where it refuses a schema.
+_NO_EFFORT: dict[str, bool] = {}
+
+# The brief reading the auto-upload asks for. Measured 24 Sep 2026 on 10 of the Frankie Saiz pod's
+# pages: the answer is most of what a read costs (1,450-3,150 output tokens at five times the input
+# price), and the notes alone averaged 885 characters that nothing downstream reads in full. Short
+# notes and low effort gave the same filing decision on all 10 pages for 42% less.
+BRIEF_NOTES = ("\n\nKeep notes to two short sentences at most: what the page is, and anything a reviewer "
+               "must know (a personal ID on the page, a page that is cut off or unreadable).")
 
 
-def _structured_call(client, model: str, system: str, content: list[dict], schema_model, effort: str | None = None):
+def _structured_call(client, model: str, system: str, content: list[dict], schema_model, effort: str | None = None,
+                     brief: bool = False):
     """One call, schema-constrained where the endpoint supports it, tolerant where it does not.
 
     Against the Anthropic API, output_config.format guarantees valid JSON. Other endpoints - OpenRouter's
@@ -136,14 +147,32 @@ def _structured_call(client, model: str, system: str, content: list[dict], schem
     in advance whether structured outputs are available there.
 
     effort ("low" | "medium" | "high") trades thinking depth for cost on Opus 5 / Sonnet 5. It is not sent
-    for Haiku 4.5, which rejects the parameter.
+    for Haiku 4.5, which rejects the parameter. brief asks for short notes.
+
+    Where the schema has to travel in the prompt (Bedrock), it goes at the end of the SYSTEM block,
+    which is cached, not after the page images, which are not. It is ~2,000 tokens, and until
+    24 Sep 2026 every read on Bedrock paid for it in full.
     """
+    system = system + (BRIEF_NOTES if brief else "")
     system_blocks = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
     messages = [{"role": "user", "content": content}]
-    schema_hint = {"type": "text", "text": "Respond with ONLY a JSON object that validates against this JSON schema. No prose, no code fences.\n" + json.dumps(reader_json_schema(schema_model))}
+    schema_text = "Respond with ONLY a JSON object that validates against this JSON schema. No prose, no code fences.\n" + json.dumps(reader_json_schema(schema_model))
+    schema_system = [{"type": "text", "text": system + "\n\n" + schema_text, "cache_control": {"type": "ephemeral"}}]
     output_config: dict = {"format": _output_format(schema_model)}
-    if effort and "haiku" not in model.lower():
+    use_effort = bool(effort) and "haiku" not in model.lower()
+    if use_effort:
         output_config["effort"] = effort
+
+    def schema_in_prompt():
+        kw = dict(model=model, max_tokens=8000, system=schema_system, messages=messages)
+        if use_effort and not _NO_EFFORT.get(model):
+            try:
+                return client.messages.create(**kw, output_config={"effort": effort})
+            except anthropic.BadRequestError as e:
+                if "effort" not in str(e).lower():
+                    raise
+                _NO_EFFORT[model] = True
+        return client.messages.create(**kw)
 
     # An endpoint either supports structured outputs or it does not, and that answer does not change
     # between documents. Learning it once per PROCESS rather than once per document is the whole
@@ -152,10 +181,7 @@ def _structured_call(client, model: str, system: str, content: list[dict], schem
     # of log noise each that buried anything worth reading. Keyed by model, because the answer is a
     # property of the endpoint serving it.
     if _NO_STRUCTURED_OUTPUT.get(model):
-        response = client.messages.create(
-            model=model, max_tokens=8000, system=system_blocks,
-            messages=[{"role": "user", "content": content + [schema_hint]}],
-        )
+        response = schema_in_prompt()
     else:
         try:
             response = client.messages.create(
@@ -168,10 +194,7 @@ def _structured_call(client, model: str, system: str, content: list[dict], schem
             _NO_STRUCTURED_OUTPUT[model] = True
             print(f"   note: this endpoint does not support structured outputs for {model}; "
                   f"sending the schema in the prompt for the rest of this run")
-            response = client.messages.create(
-                model=model, max_tokens=8000, system=system_blocks,
-                messages=[{"role": "user", "content": content + [schema_hint]}],
-            )
+            response = schema_in_prompt()
     _check_stop(response)
     text = next((b.text for b in response.content if b.type == "text"), "")
     try:
@@ -199,7 +222,8 @@ def _structured_call(client, model: str, system: str, content: list[dict], schem
     return parsed, _usage(model, response)
 
 
-def read_document(client, doc: Document, model: str, effort: str | None = None) -> tuple[Extraction, Usage]:
+def read_document(client, doc: Document, model: str, effort: str | None = None,
+                  brief: bool = False) -> tuple[Extraction, Usage]:
     """`client` is whichever platform client provider.make_client() built - the Messages surface is
     identical across Anthropic, Bedrock (AnthropicBedrockMantle) and the OpenRouter proxy, so
     nothing below this line needs to know which one it is."""
@@ -210,7 +234,46 @@ def read_document(client, doc: Document, model: str, effort: str | None = None) 
     if doc.text_layer:
         content.append({"type": "text", "text": f"The file also carries this typed text layer (likely an app stamp, not part of the printed form):\n{doc.text_layer}"})
     content.append({"type": "text", "text": f"File name: {doc.path.name}. {len(doc.pages)} page(s). Extract the document per the schema."})
-    return _structured_call(client, model, READER_SYSTEM, content, Extraction, effort=effort)
+    return _structured_call(client, model, READER_SYSTEM, content, Extraction, effort=effort, brief=brief)
+
+
+# The cheap first look: which of five things a page is, for about $0.002 on Claude Haiku 4.5.
+# Measured 24 Sep 2026 against the full reading of the 162 pages the auto-upload read that day: it
+# never called a BOL or a POD a photo, but it did call one signed POD (2577917's texted page 2) an
+# unsigned BOL - so it is trusted to set aside photos, never to decide a page is not a POD.
+QUICK_SYSTEM = """You sort pictures and scans that truck drivers send a freight brokerage. Look at the page(s) and answer with ONLY a JSON object, no prose:
+{"kind": "pod" | "bol" | "other_paperwork" | "photo" | "not_freight", "confidence": 0.0-1.0}
+
+- pod: a bill of lading or delivery receipt that the RECEIVER (consignee) has signed, stamped, or written received / in / out times on at the delivery. If ANY page of the file is like this, answer pod.
+- bol: a bill of lading (straight, short form, pickup copy, continuation or detail page) with nothing from the receiver on it. A shipper or driver signature alone is still bol.
+- other_paperwork: lumper receipt, scale ticket, packing list, invoice, rate confirmation, trailer inspection form, reefer log, any other freight paperwork that is not a BOL.
+- photo: a picture of freight, pallets, a trailer, a seal, a truck, a dock.
+- not_freight: a logo, an email signature, a screenshot of something else, an ID card, a selfie.
+If you are unsure whether the receiver signed, answer pod. confidence is how sure you are of kind."""
+QUICK_KINDS = ("pod", "bol", "other_paperwork", "photo", "not_freight")
+
+
+def quick_look(client, doc: Document, model: str) -> tuple[str, float, Usage]:
+    """(kind, confidence, usage). A kind outside QUICK_KINDS comes back as "unknown", which callers
+    treat as a page that needs the full read."""
+    from .provider import model_id
+
+    model = model_id(model)
+    content = _page_blocks(doc) + [{"type": "text", "text": f"{len(doc.pages)} page(s). JSON only."}]
+    response = client.messages.create(model=model, max_tokens=60, system=QUICK_SYSTEM,
+                                      messages=[{"role": "user", "content": content}])
+    text = next((b.text for b in response.content if b.type == "text"), "")
+    found = re.search(r"\{.*\}", text, re.S)
+    try:
+        answer = json.loads(found.group(0)) if found else {}
+    except ValueError:
+        answer = {}
+    kind = answer.get("kind") if answer.get("kind") in QUICK_KINDS else "unknown"
+    try:
+        confidence = float(answer.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return kind, confidence, _usage(model, response)
 
 
 def adjudicate(client, doc: Document, extraction: Extraction, candidates: list[dict], model: str, effort: str | None = None) -> tuple[Adjudication, Usage]:

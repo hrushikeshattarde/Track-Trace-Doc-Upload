@@ -2666,6 +2666,155 @@ def test_auto_upload_texted_pages() -> None:
           .startswith("UPLOADED"))
 
 
+def test_auto_upload_quick_look() -> None:
+    """The cheap first look decides which pages get the full read (24 Sep 2026). It may set aside a
+    photo, and a texted picture while the truck is not at the consignee; it is never trusted to say a
+    page at the consignee is not a POD - it called 2577917's signed page 2 an unsigned BOL."""
+    print("auto-upload: the quick look")
+    import hashlib as _h
+    import time as _time
+    from intake import autofile
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    log = _AutoLog()
+    said: dict[str, tuple[str, float]] = {}
+    looked: list[str] = []
+
+    def quick(data, filename):
+        sha = _h.sha256(data).hexdigest()
+        looked.append(sha)
+        kind, conf = said[sha]
+        return kind, conf, "claude-haiku-4-5", 0.002
+
+    def text(fid, when):
+        return {"id": fid, "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL", "uploadById": 1,
+                "comments": "Driver Supplied Image - load", "dateCreated": when}
+
+    def sha(data):
+        return _h.sha256(data).hexdigest()
+
+    run = lambda: autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600, quick=quick)  # noqa: E731
+
+    # A: at the shipper. An emailed freight photo, an unsure one, and the pickup BOL the driver texted.
+    load_row(2600030, "bol_expected", "loaded")
+    tpro.add(2600030, files=[(text(701, "2026-09-24T09:00:00Z"), _picture(30))])
+    on_load(_picture(30), _reading(2600030))
+    said[sha(_picture(30))] = ("bol", 0.95)
+    mail(2600030, "ma", [(_picture(31), _reading(2600030, "photo")), (_picture(32), _reading(2600030, "photo"))])
+    said[sha(_picture(31))] = ("photo", 0.97)
+    said[sha(_picture(32))] = ("photo", 0.6)
+    # B: at the consignee. The signed POD texted, which the quick look calls an unsigned BOL.
+    load_row(2600031, "wrong_doc_type", "at consignee")
+    tpro.add(2600031, files=[(text(711, "2026-09-24T11:13:39Z"), _picture(33))])
+    on_load(_picture(33), _reading(2600031, "proof_of_delivery", receiver=True))
+    said[sha(_picture(33))] = ("bol", 0.95)
+    # C: an emailed copy of a picture already read on the load.
+    load_row(2600032, "wrong_doc_type", "delivered")
+    tpro.add(2600032, files=[(text(721, "2026-09-24T08:00:00Z"), _picture(34))])
+    on_load(_picture(34), _reading(2600032))
+    said[sha(_picture(34))] = ("bol", 0.9)
+    run()
+    full = {x for x in reads}
+    check("a photo the quick look is sure of gets no full read", sha(_picture(31)) not in full
+          and conn.execute("SELECT outcome FROM autofile WHERE sha256=?", (sha(_picture(31)),)).fetchone()[0] == "not_bol_pod")
+    check("one it is unsure of does", sha(_picture(32)) in full)
+    check("a BOL texted before the consignee is only looked at, and logged as on file", sha(_picture(30)) not in full
+          and conn.execute("SELECT outcome FROM autofile WHERE sha256=?", (sha(_picture(30)),)).fetchone()[0] == "on_file"
+          and log.rows[autofile.ref(2600030, sha(_picture(30)))][6].startswith("BOL (quick look"))
+    check("at the consignee a texted page gets the full read, whatever the quick look said",
+          sha(_picture(33)) in full and any(u["load"] == 2600031 and u["type"] == "Bill Of Lading" for u in tpro.uploads))
+    reads_before = len(reads)
+    mail(2600032, "mc", [(_picture(34, "JPEG"), _reading(2600032))])
+    said[sha(_picture(34, "JPEG"))] = ("bol", 0.9)
+    run()
+    check("the same picture already read is not read again", len(reads) == reads_before and conn.execute(
+        "SELECT model, cost_usd FROM attachment WHERE sha256=?", (sha(_picture(34, "JPEG")),)).fetchone()[:] ==
+          (f"reused from {sha(_picture(34))[:12]}", 0.0))
+    check("and is decided on the reused reading", conn.execute(
+        "SELECT outcome FROM autofile WHERE sha256=?", (sha(_picture(34, "JPEG")),)).fetchone()[0] in ("on_file", "not_needed"))
+
+    # D: page 1 texted while TransportPro still says loaded - only looked at - then the signed page 2
+    # 20 seconds later, once the truck shows at the consignee. Both pages go up, page 1 read in full.
+    load_row(2600033, "wrong_doc_type", "loaded")
+    tpro.add(2600033, files=[(text(731, "2026-09-24T12:00:00Z"), _picture(35))])
+    on_load(_picture(35), _reading(2600033, conf=0.93))
+    said[sha(_picture(35))] = ("bol", 0.95)
+    run()
+    check("page 1 is set aside by the quick look", sha(_picture(35)) not in reads)
+    tpro.loads[2600033]["files"].append(text(732, "2026-09-24T12:00:20Z"))
+    tpro.loads[2600033]["bytes"][732] = _picture(36)
+    on_load(_picture(36), _reading(2600033, "proof_of_delivery", receiver=True))
+    said[sha(_picture(36))] = ("pod", 0.9)
+    conn.execute("UPDATE load SET stage='at consignee', last_checked_at=? WHERE load_id=2600033", ("9999-01-01T00:00:00+00:00",))
+    run()
+    up = [u for u in tpro.uploads if u["load"] == 2600033]
+    check("when its signed page 2 arrives, page 1 gets its full read and both go up",
+          sha(_picture(35)) in reads and len(up) == 1 and len(autofile.picture_sig(up[0]["data"])) == 2,
+          str([u["comment"] for u in up]))
+    spent = float(db.get_state(conn, f"ai_spend:{dt.datetime.now(dt.timezone.utc).date().isoformat()}"))
+    check("the quick looks are counted in the day's spend", spent > 0.05 * len(reads) - 1e-9 and len(looked) >= 7)
+
+
+def test_reader_is_brief_and_caches_the_schema() -> None:
+    """On Bedrock the schema travels in the prompt: it goes in the cached system block, not after the
+    images; low effort is sent on its own, and an endpoint that refuses it is asked once."""
+    print("reader: brief, cached, low effort")
+    import anthropic
+    import httpx2 as httpx
+    from pod_intake import reader as rd
+    from pod_intake.schema import Extraction
+
+    calls: list[dict] = []
+
+    class _Msg:
+        def __init__(self, text):
+            self.content = [type("B", (), {"type": "text", "text": text})()]
+            self.stop_reason = "end_turn"
+            self.usage = type("U", (), {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 0,
+                                        "cache_creation_input_tokens": 0})()
+
+    def refuse(what):
+        req = httpx.Request("POST", "https://example")
+        return anthropic.BadRequestError(what, response=httpx.Response(400, request=req), body=None)
+
+    class _Client:
+        def __init__(self, effort_ok=True):
+            self.messages = self
+            self.effort_ok = effort_ok
+
+        def create(self, **kw):
+            calls.append(kw)
+            oc = kw.get("output_config") or {}
+            if "format" in oc:
+                raise refuse("output_config.format is not supported")
+            if "effort" in oc and not self.effort_ok:
+                raise refuse("effort is not supported")
+            if kw.get("max_tokens") == 60:
+                return _Msg('{"kind": "photo", "confidence": 0.97}')
+            return _Msg(json.dumps(_extraction("bill_of_lading")))
+
+    import json
+    rd._NO_STRUCTURED_OUTPUT.clear()
+    rd._NO_EFFORT.clear()
+    ex, _ = rd._structured_call(_Client(), "anthropic.claude-opus-5", "SYSTEM", [{"type": "text", "text": "page"}],
+                                Extraction, effort="low", brief=True)
+    last = calls[-1]
+    check("the schema goes in the cached system block", "JSON schema" in last["system"][0]["text"]
+          and last["system"][0].get("cache_control") and all("JSON schema" not in str(b) for b in last["messages"][0]["content"]))
+    check("with the brief-notes instruction", "two short sentences" in last["system"][0]["text"])
+    check("and low effort, on its own", last.get("output_config") == {"effort": "low"})
+    calls.clear()
+    rd._NO_EFFORT.clear()
+    rd._structured_call(_Client(effort_ok=False), "anthropic.claude-opus-5", "SYSTEM", [], Extraction, effort="low")
+    rd._structured_call(_Client(effort_ok=False), "anthropic.claude-opus-5", "SYSTEM", [], Extraction, effort="low")
+    check("an endpoint that refuses effort is asked once, then read without it",
+          sum("effort" in (c.get("output_config") or {}) for c in calls) == 1 and "output_config" not in calls[-1])
+    doc = type("D", (), {"pages": []})()
+    kind, conf, _u = rd.quick_look(_Client(), doc, "claude-haiku-4-5")
+    check("the quick look answers a kind and how sure", (kind, conf) == ("photo", 0.97))
+
+
 def test_auto_upload_dry_run_and_off() -> None:
     print("auto-upload: dry run and off")
     import time as _time
@@ -2806,6 +2955,8 @@ if __name__ == "__main__":
     test_auto_upload_facts_and_pictures()
     test_auto_upload_pilot()
     test_auto_upload_texted_pages()
+    test_auto_upload_quick_look()
+    test_reader_is_brief_and_caches_the_schema()
     test_auto_upload_dry_run_and_off()
     test_upload_log_sheet()
     test_every_load_state_is_classified()

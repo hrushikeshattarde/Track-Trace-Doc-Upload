@@ -99,8 +99,11 @@ def _worker_env(env: dict) -> dict:
             # Auto-upload (intake/autofile.py). `autoupload off` stops it without a redeploy. The
             # sheet id is Circle's and lives in .env, not in this public repository.
             "INTAKE_AUTO_UPLOAD": env.get("INTAKE_AUTO_UPLOAD", "on"), "INTAKE_AUTO_TERMINALS": AUTO_TERMINALS,
-            "INTAKE_AUTO_DAILY_USD": "10", "INTAKE_AUTO_MAX_READS": "60",
-            "INTAKE_MODEL_PROVIDER": "bedrock", "INTAKE_READ_MODEL": "claude-opus-5",
+            # A safety limit, not a budget (24 Sep 2026): with the quick look and the brief full read a
+            # normal day for the pilot pod is about $1. The limit only stops a runaway.
+            "INTAKE_AUTO_DAILY_USD": "50", "INTAKE_AUTO_MAX_READS": "60",
+            "INTAKE_MODEL_PROVIDER": "bedrock", "INTAKE_READ_MODEL": "claude-opus-5", "INTAKE_READ_EFFORT": "low",
+            "INTAKE_QUICK_LOOK": "on", "INTAKE_QUICK_MODEL": "claude-haiku-4-5",
             "INTAKE_GMAIL_SECRET": GMAIL_SECRET, "INTAKE_UPLOAD_SHEET_ID": env["INTAKE_UPLOAD_SHEET_ID"],
             # The bot's own TransportPro login, once an admin has made one and somebody has put it in
             # Secrets Manager as JSON {username, password}. Until then uploads go in as the reading login.

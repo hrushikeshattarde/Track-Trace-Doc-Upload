@@ -219,7 +219,13 @@ def login_from(secret: str, env) -> dict:
 def _auto_upload(conn, tpro, store, auto: autofile.Settings, env, deadline: float, failed: list[str]) -> str:
     """Step 4 for the pilot terminals: read, upload what passes, log every BOL and POD."""
     from . import aws_lambda, ingest, sheets
-    read = ingest.make_reader(env.get("INTAKE_READ_MODEL", "claude-opus-5"), timeout=autofile.READ_TIMEOUT_S)
+    # The brief full read (short notes, low effort) and the quick look that decides which pages need
+    # it: measured 24 Sep 2026, the same decisions for about a third of the cost.
+    read = ingest.make_reader(env.get("INTAKE_READ_MODEL", "claude-opus-5"), timeout=autofile.READ_TIMEOUT_S,
+                              effort=env.get("INTAKE_READ_EFFORT", "low") or None, brief=True)
+    quick = None
+    if env.get("INTAKE_QUICK_LOOK", "on") != "off":
+        quick = ingest.make_quick_reader(env.get("INTAKE_QUICK_MODEL", "claude-haiku-4-5"), timeout=60)
     log = None
     if auto.mode == autofile.ON:
         # The sheet is written as the Gmail service account itself, the key the collector already uses.
@@ -233,7 +239,7 @@ def _auto_upload(conn, tpro, store, auto: autofile.Settings, env, deadline: floa
         secret = boto3.client("secretsmanager").get_secret_value(
             SecretId=env["INTAKE_TPRO_UPLOAD_SECRET"])["SecretString"]
         uploader = tp.TransportPro(**login_from(secret, {"INTAKE_TPRO_BASE_URL": env.get("INTAKE_TPRO_BASE_URL", "")}))
-    stats = autofile.run(conn, tpro, store, read, log, auto, deadline=deadline, uploader=uploader)
+    stats = autofile.run(conn, tpro, store, read, log, auto, deadline=deadline, uploader=uploader, quick=quick)
     if stats.sheet_error:
         failed.append("upload_log")         # the rows stay pending and go with the next run
     return stats.line()
