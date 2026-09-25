@@ -2842,37 +2842,94 @@ def test_auto_upload_leaves_out_pages_that_are_not_paperwork() -> None:
           len(tpro.uploads) == 1, str([(u["type"], u["comment"]) for u in tpro.uploads]))
 
 
-def test_auto_upload_holds_a_long_packet_unread() -> None:
-    """Load 2571670 (24 Sep 2026): a 27-page scan sent every page to the AI, which refused the request
-    and ran the worker out of memory. A file longer than the bot reads is held for a person, unread."""
-    print("auto-upload: a packet too long to read")
+def test_auto_upload_reads_a_long_file_in_pieces() -> None:
+    """Loads 2571670 and 2581039 (24 Sep 2026): 27- and 17-page packets were held unread, because every
+    page went to the AI in one request - 38 MB of PNG for ten pages of a CamScanner scan, which Bedrock
+    refused, and one rendering of all 27 ran the 1 GB worker out of memory. Pages now go as JPEG, and a
+    file longer than CHUNK_PAGES is read CHUNK_PAGES at a time, each piece kept until the file's reading
+    is merged. Only a file over MAX_READ_PAGES is still held for a person."""
+    print("auto-upload: a long file is read in pieces")
+    import re as _re
     import tempfile as _tf
     import time as _time
     from intake import autofile
+    from pod_intake import reader
     from pod_intake.normalize import load_document
+    from pod_intake.schema import Extraction
 
-    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
-    looked: list[str] = []
-
-    def quick(data, filename):
-        looked.append(filename)
-        return "bol", 0.9, "claude-haiku-4-5", 0.002
-
-    log = _AutoLog()
-    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
     packet = autofile.combine_pdf([_picture(50 + i) for i in range(12)], "packet")
-    load_row(2600050, "bol_expected", "loaded")
-    tpro.add(2600050)
-    (sha,) = mail(2600050, "m50", [(packet, _reading(2600050))])
-    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600, quick=quick)
-    check("a 12-page file is sent to neither AI", not reads and not looked)
-    row = log.rows.get(autofile.ref(2600050, sha))
-    check("it is held for a person, and says why", row is not None and row[13].startswith("HELD - too long for the bot: 12 pages")
-          and not tpro.uploads, str(row and row[13]))
     tmp = Path(_tf.mkdtemp()) / "p.pdf"
     tmp.write_bytes(packet)
     doc = load_document(tmp, max_edge=400, max_pages=3)
     check("a quick look renders only the pages it sends", len(doc.pages) == 3 and doc.total_pages == 12)
+    blocks = reader._page_blocks(doc)
+    check("pages go to the model as JPEG", doc.pages[0].image[:3] == b"\xff\xd8\xff"
+          and all(b["source"]["media_type"] == "image/jpeg" for b in blocks))
+
+    # The merge: a packet's BOL pages in one piece, the page the receiver signed in the next.
+    bol = {**_reading(2600050, numbers=[("Pickup #", "P2600050"), ("Order", "A1")]),
+           "pages": [{"page": i, "role": "bol", "legibility": 0.9} for i in range(1, 11)], "notes": "ten BOL pages"}
+    pod = {**_reading(2600050, "proof_of_delivery", receiver=True, conf=0.88, numbers=[("PO", "PO2600050"), ("Order", "A1")]),
+           "times": {"check_in": "07:59", "check_out": "08:32", "source": "handwritten", "at_stop": "consignee"},
+           "pages": [{"page": 1, "role": "bol", "legibility": 0.9}, {"page": 2, "role": "pod", "legibility": 0.9}],
+           "notes": "the delivery copy"}
+    merged = Extraction.model_validate(reader.merge_readings([(11, pod), (1, bol)]))
+    check("a file is a POD when any piece is, as sure as that piece",
+          merged.document_type == "proof_of_delivery" and merged.document_type_confidence == 0.88)
+    check("the receiver and the delivery times come from the piece that has them",
+          merged.signatures.receiver_signed and merged.signatures.receiver_name == "Kendyl"
+          and merged.times.check_out == "08:32" and merged.times.at_stop == "consignee")
+    check("its pages are numbered as in the file", [(p.page, p.role) for p in merged.pages][-2:] == [(11, "bol"), (12, "pod")]
+          and len(merged.pages) == 12)
+    check("every reference number is kept, once", sorted(n.value for n in merged.numbers) == ["A1", "P2600050", "PO2600050"])
+    check("the notes say which pages they are about", merged.notes.startswith("pages 1-10: ten BOL pages | pages 11-12:"), merged.notes)
+
+    # End to end: the receiver signed page 12 of a 12-page packet.
+    calls: list[tuple[int, int]] = []
+    fail_first = {11}
+
+    def read(data, filename):
+        m = _re.search(r"\(pages (\d+)-(\d+)\)", filename)
+        first, n = (int(m.group(1)) if m else 1), autofile.page_count(data)
+        if first in fail_first:
+            fail_first.discard(first)
+            raise RuntimeError("Error code: 529 - overloaded")
+        calls.append((first, n))
+        roles = ["pod" if first + i == 12 else "bol" for i in range(n)]
+        r = _reading(2600050, "proof_of_delivery" if "pod" in roles else "bill_of_lading", receiver="pod" in roles)
+        r["pages"] = [{"page": i + 1, "role": x, "legibility": 0.9} for i, x in enumerate(roles)]
+        return r, r["document_type"], "claude-opus-5", 0.05
+
+    conn, store, tpro, _read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    load_row(2600050, "pod_expected", "delivered")
+    tpro.add(2600050)
+    (sha,) = mail(2600050, "m50", [(packet, {})])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    check("a 12-page file is read in two pieces; the one that failed is not paid for twice",
+          calls == [(1, 10)] and not tpro.uploads and db.get_attachment(conn, sha)["extraction_json"] is None, str(calls))
+    conn.execute("UPDATE attachment SET next_read_at='2000-01-01T00:00:00+00:00' WHERE sha256=?", (sha,))
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    check("the next run reads only the missing piece", calls == [(1, 10), (11, 2)], str(calls))
+    up = tpro.uploads[0] if len(tpro.uploads) == 1 else {}
+    check("and the packet goes up as the POD, every page of it",
+          up.get("type") == "Bill Of Lading" and autofile.page_count(up.get("data") or b"") == 12
+          and "12 pages" in up.get("comment", ""), str([(u["type"], u["comment"]) for u in tpro.uploads]))
+    check("its reading is recorded as merged from its pieces",
+          db.get_attachment(conn, sha)["model"] == "claude-opus-5, 2 pieces")
+
+    # Over MAX_READ_PAGES a file is still held, unread.
+    huge = autofile.combine_pdf([_picture(100 + i) for i in range(autofile.MAX_READ_PAGES + 1)], "huge")
+    load_row(2600051, "bol_expected", "loaded")
+    tpro.add(2600051)
+    (big,) = mail(2600051, "m51", [(huge, {})])
+    before = len(calls)
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    row = log.rows.get(autofile.ref(2600051, big))
+    check(f"a {autofile.MAX_READ_PAGES + 1}-page file is not read, and is held for a person",
+          len(calls) == before and row is not None
+          and row[13].startswith(f"HELD - too long for the bot: {autofile.MAX_READ_PAGES + 1} pages"), str(row and row[13]))
 
 
 def test_auto_upload_quick_look() -> None:
@@ -3193,7 +3250,7 @@ if __name__ == "__main__":
     test_auto_upload_texted_pages()
     test_auto_upload_bol_sets()
     test_auto_upload_leaves_out_pages_that_are_not_paperwork()
-    test_auto_upload_holds_a_long_packet_unread()
+    test_auto_upload_reads_a_long_file_in_pieces()
     test_auto_upload_quick_look()
     test_reader_is_brief_and_caches_the_schema()
     test_auto_upload_dry_run_and_off()

@@ -100,7 +100,7 @@ def _check_stop(response) -> None:
 
 
 def _page_blocks(doc: Document) -> list[dict]:
-    return [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": p.b64}} for p in doc.pages]
+    return [{"type": "image", "source": {"type": "base64", "media_type": p.media_type, "data": p.b64}} for p in doc.pages]
 
 
 def _output_format(schema_model) -> dict:
@@ -238,6 +238,71 @@ def read_document(client, doc: Document, model: str, effort: str | None = None,
         content.append({"type": "text", "text": f"The file also carries this typed text layer (likely an app stamp, not part of the printed form):\n{doc.text_layer}"})
     content.append({"type": "text", "text": f"File name: {doc.path.name}. {len(doc.pages)} page(s). Extract the document per the schema."})
     return _structured_call(client, model, READER_SYSTEM, content, Extraction, effort=effort, brief=brief)
+
+
+def merge_readings(parts: list[tuple[int, dict]]) -> dict:
+    """One reading for a file read in pieces: [(first page of the piece, its reading)] -> a reading of
+    the whole file, in the Extraction shape, pages numbered as they are in the file.
+
+    A long file is read ten pages at a time (intake.autofile.CHUNK_PAGES), and a packet's receiver
+    evidence can sit in any piece - so the file is a POD when any piece is, the signatures and stamp
+    count when any piece shows them, and the receiver's name, date and delivery times come from the
+    piece that carries them. Every reference number is kept. The confidence is that of the pieces
+    that read the file's type, at their best: a piece of plain BOL pages cannot make a POD less sure.
+    """
+    parts = sorted(parts, key=lambda p: p[0])
+    readings = [r for _, r in parts]
+    types = [r["document_type"] for r in readings]
+    order = ["proof_of_delivery", "bill_of_lading"]
+    dtype = next((t for t in order if t in types), types[0])
+    sure = [r for r in readings if r["document_type"] == dtype]
+
+    def first(key, among=readings):
+        return next((r.get(key) for r in among if r.get(key)), None)
+
+    def receiver(r):
+        s = r.get("signatures") or {}
+        return s.get("receiver_signed") or s.get("stamp_present")
+
+    signed = [r for r in readings if receiver(r)]
+    sigs = [r.get("signatures") or {} for r in readings]
+    sig = {k: any(s.get(k) for s in sigs) for k in ("shipper_signed", "driver_signed", "receiver_signed", "stamp_present")}
+    lead = (signed[0].get("signatures") or {}) if signed else {}
+    sig["receiver_name"] = lead.get("receiver_name") or next((s.get("receiver_name") for s in sigs if s.get("receiver_name")), None)
+    sig["receiver_date"] = lead.get("receiver_date") or next((s.get("receiver_date") for s in sigs if s.get("receiver_date")), None)
+    times = next((r["times"] for r in readings if (r.get("times") or {}).get("at_stop") == "consignee"
+                  and ((r["times"].get("check_in")) or r["times"].get("check_out"))), None) \
+        or next((r["times"] for r in readings if (r.get("times") or {}).get("check_in") or (r.get("times") or {}).get("check_out")), None) \
+        or readings[0].get("times") or {"source": "none"}
+    numbers, seen = [], set()
+    for r in readings:
+        for n in r.get("numbers") or []:
+            key = (n.get("kind"), re.sub(r"[^A-Z0-9]", "", str(n.get("value")).upper()))
+            if key not in seen:
+                seen.add(key)
+                numbers.append(n)
+    pages = [{**p, "page": p["page"] + start - 1} for start, r in parts for p in (r.get("pages") or [])]
+    stamps = [r["photo_stamp"] for r in readings if (r.get("photo_stamp") or {}).get("present")]
+
+    def party(side):
+        return next((r[side] for r in readings if (r.get(side) or {}).get("name") or (r.get(side) or {}).get("city")),
+                    readings[0].get(side) or {})
+
+    ends = [nxt - 1 for nxt, _ in parts[1:]] + [parts[-1][0] + max(1, len(readings[-1].get("pages") or [])) - 1]
+    notes = " | ".join(f"pages {start}-{end}: {r.get('notes') or ''}" for (start, r), end in zip(parts, ends))
+    merged = {
+        "document_type": dtype,
+        "document_type_confidence": max(r.get("document_type_confidence") or 0 for r in sure),
+        "numbers": numbers, "shipper": party("shipper"), "consignee": party("consignee"),
+        "carrier_name": first("carrier_name"), "carrier_dot": first("carrier_dot"), "carrier_mc": first("carrier_mc"),
+        "driver_name": first("driver_name"), "driver_phone": first("driver_phone"), "ship_date": first("ship_date"),
+        "delivery_date": first("delivery_date", signed) or first("delivery_date"),
+        "signatures": sig, "times": times, "pieces": first("pieces"), "weight_lbs": first("weight_lbs"),
+        "pages": pages, "notes": notes,
+    }
+    if stamps:
+        merged["photo_stamp"] = stamps[0]
+    return merged
 
 
 # The cheap first look: which of five things a page is, for about $0.002 on Claude Haiku 4.5.

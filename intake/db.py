@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # Backoff for a failed read, by attempt. After the last one the file is left alone and reported as
 # a permanent failure: a .MOV or a corrupt part fails identically every time, and retrying it on a
@@ -420,6 +420,13 @@ def migrate(conn: sqlite3.Connection) -> None:
         # spent only where it can change what is uploaded.
         conn.execute("CREATE TABLE IF NOT EXISTS quicklook (sha256 TEXT PRIMARY KEY, kind TEXT, confidence REAL, "
                      "model TEXT, cost_usd REAL, looked_at TEXT)")
+    if have < 16:
+        # A file longer than one read is read in pieces (intake/autofile.py, 25 Sep 2026). Each piece's
+        # reading is kept here until every piece is in and the merged reading goes to `attachment`, so a
+        # run that stops half way through a 27-page packet pays only for the pieces still missing.
+        conn.execute("CREATE TABLE IF NOT EXISTS read_part (sha256 TEXT NOT NULL, first_page INTEGER NOT NULL, "
+                     "last_page INTEGER NOT NULL, extraction_json TEXT NOT NULL, model TEXT, cost_usd REAL, read_at TEXT, "
+                     "PRIMARY KEY (sha256, first_page))")
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 

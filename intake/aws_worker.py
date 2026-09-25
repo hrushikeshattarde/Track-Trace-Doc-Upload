@@ -220,10 +220,11 @@ def _auto_upload(conn, tpro, store, auto: autofile.Settings, env, deadline: floa
     """Step 4 for the pilot terminals: read, upload what passes, log every BOL and POD."""
     from . import aws_lambda, ingest, sheets
     # The brief full read (short notes, low effort) and the quick look that decides which pages need
-    # it: measured 24 Sep 2026, the same decisions for about a third of the cost.
+    # it: measured 24 Sep 2026, the same decisions for about a third of the cost. One read renders at
+    # most CHUNK_PAGES pages; autofile cuts a longer file into pieces of that size before it gets here.
     read = ingest.make_reader(env.get("INTAKE_READ_MODEL", "claude-opus-5"), timeout=autofile.READ_TIMEOUT_S,
                               effort=env.get("INTAKE_READ_EFFORT", "low") or None, brief=True,
-                              max_pages=autofile.MAX_READ_PAGES)
+                              max_pages=autofile.CHUNK_PAGES)
     quick = None
     if env.get("INTAKE_QUICK_LOOK", "on") != "off":
         quick = ingest.make_quick_reader(env.get("INTAKE_QUICK_MODEL", "claude-haiku-4-5"), timeout=60)

@@ -49,7 +49,7 @@ def make_client() -> OpenAI:
 
 
 def _page_parts(doc: Document) -> list[dict]:
-    return [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{p.b64}", "detail": "high"}} for p in doc.pages]
+    return [{"type": "image_url", "image_url": {"url": f"data:{p.media_type};base64,{p.b64}", "detail": "high"}} for p in doc.pages]
 
 
 def _usage(model: str, completion) -> OpenAIUsage:

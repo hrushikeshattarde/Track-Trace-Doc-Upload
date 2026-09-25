@@ -297,11 +297,11 @@ Each document without a reading goes down this ladder:
 |---|---|---|
 | 0 | Still waiting out a failed read's retry delay? Skip it, and leave the load for the next run. | – |
 | 1 | Get the bytes: from S3 `doc/` for email (checked against the SHA-256), from TransportPro for a file on the load | free |
-| 2 | **Too long?** Over 10 pages (`MAX_READ_PAGES`) or 20 MB: recorded as a permanent failure, "too long for the bot", and **held for a person**. It is never sent to the AI. | free |
+| 2 | **Too long?** Over 40 pages (`MAX_READ_PAGES`) or 25 MB (`MAX_READ_MB`): recorded as a permanent failure, "too long for the bot", and **held for a person**. It is never sent to the AI. Up to 25 Sep 2026 the limit was 10 pages. | free |
 | 3 | **Same picture already read on this load?** (every page within a mean difference of 3.0 of a read document's pages) Copy that reading. | $0 |
 | 4 | **Quick look**: Claude Haiku 4.5, first 3 pages at 1,100 px, 4 in parallel, 60 s timeout. Answers `pod`, `bol`, `other_paperwork`, `photo` or `not_freight`, with a confidence. Stored in `quicklook`. | ~$0.002 |
 | 5 | **Skip the full read** only when the quick look says `photo` or `not_freight` at 80% or more, or when the page is already on the load (a texted picture), the truck isn't at the consignee, and the quick look called it `bol`, `other_paperwork`, `photo` or `not_freight`. A texted POD pulls the other pictures from its text batch into the full read. | – |
-| 6 | **Full read**: Claude Opus 5 on Bedrock, effort `low`, brief notes, up to 10 pages at 1,568 px, 3 in parallel, 120 s timeout. Returns the `Extraction` in [`pod_intake/schema.py`](../pod_intake/schema.py). Stored in `attachment.extraction_json`. | ~$0.04 |
+| 6 | **Full read**: Claude Opus 5 on Bedrock, effort `low`, brief notes, 1,568 px pages sent as JPEG, 3 reads in parallel, 120 s timeout each. A file over 10 pages (`CHUNK_PAGES`) is read in pieces of up to 10 pages, one read per piece (`pieces_to_read`, `_read_input`). Each piece's reading is kept in `read_part` until every piece is in; then `merge_readings` ([`pod_intake/reader.py`](../pod_intake/reader.py)) combines them into one reading for the whole file. The file is a POD if any piece is, the receiver's name and delivery times come from the piece that has them, and pages are numbered as in the file. The result is the `Extraction` in [`pod_intake/schema.py`](../pod_intake/schema.py), stored in `attachment.extraction_json`. | ~$0.04 a read; a 27-page packet ~$0.40 |
 
 The full read returns:
 
@@ -478,7 +478,8 @@ object, and the same file read twice is one paid read.
 |---|---|---|
 | Out of time while looking at loads | The loads not reached aren't marked looked | Looked at next run |
 | A document's bytes can't be fetched | Load left unread (not marked looked) | Tried next run |
-| Over 10 pages or 20 MB | **Held**, with a sheet row | Never read by the bot. A person files it. |
+| Over 40 pages or 25 MB | **Held**, with a sheet row | Never read by the bot. A person files it. |
+| A long file read in pieces, some not finished (time, read cap, a failed piece) | The pieces that came back, in `read_part` | The next run reads only the missing pieces, then merges |
 | Same picture as a page already read | The reading is copied | – |
 | Quick look fails (a timeout, HTTP 413, a file it can't open) | Nothing | The full read decides in the same run |
 | Read cap reached (60 a run, or $50 a UTC day) | Load left unread | Next run, or the next UTC day |
@@ -514,7 +515,7 @@ flowchart TD
     RC -- yes --> J["Judge (6.4)"]
     RC -- no --> BO{"Waiting out a<br/>retry delay?"}
     BO -- yes --> NX(["Next run"])
-    BO -- no --> TL{"Over 10 pages<br/>or 20 MB?"}
+    BO -- no --> TL{"Over 40 pages<br/>or 25 MB?"}
     TL -- yes --> H1["HELD: too long<br/>sheet row"]
     TL -- no --> SP{"Same picture<br/>already read?"}
     SP -- yes --> J
@@ -541,7 +542,7 @@ flowchart TD
 
 ## 8. The ledger
 
-One SQLite file ([`intake/db.py`](../intake/db.py), schema version 15), about 32 MB as of 25 Sep 2026.
+One SQLite file ([`intake/db.py`](../intake/db.py), schema version 16), about 32 MB as of 25 Sep 2026.
 The ledger is the index; S3 is the archive. Two rules carry it:
 
 - `part` is one row per **occurrence** of an attachment, and `attachment` is one row per **unique
@@ -556,6 +557,7 @@ The ledger is the index; S3 is the archive. Two rules carry it:
 | `part` | attachment occurrence | the filter decision (`keep`, `too_small`, …) and its SHA-256 |
 | `attachment` | unique file | the reading (`extraction_json`), cost, error and retry state (`read_attempts`, `next_read_at`) |
 | `quicklook` | unique file | what the quick look called it |
+| `read_part` | piece of a long file | a piece's reading, kept until the file's reading is merged |
 | `picture_sig` | unique file | per-page thumbnails for "same picture" checks |
 | `tpro_file` | file on a load in TransportPro | its type, comment, uploader and hash |
 | `load` | load | state, stage, reason, `next_check_at`, `last_checked_at`, `in_view` |

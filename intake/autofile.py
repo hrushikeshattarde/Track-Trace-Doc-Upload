@@ -86,12 +86,17 @@ LOOK_UNTIL_S = 240           # stop looking at more loads this long before the d
 READ_UNTIL_S = 120           # ...stop waiting for reads
 UPLOAD_NEEDS_S = 45          # ...and do not start an upload with less than this left
 MAX_UPLOAD_ATTEMPTS = 3
-# The longest document the bot reads. Load 2571670 (24 Sep 2026): a 27-page, 10.6 MB CamScanner
-# packet sent every page to the AI - too large a request, and the rendering ran the 1 GB worker out
-# of memory, which lost the whole run and would have lost every run after it. A longer file is held
-# for a person, unread: uploading pages the bot never looked at could put anything into File History.
-MAX_READ_PAGES = 10
-MAX_READ_MB = 20
+# How much the bot reads. Load 2571670 (24 Sep 2026): a 27-page, 10.6 MB CamScanner packet sent every
+# page to the AI as PNG - too large a request (413), and rendering it ran the 1 GB worker out of memory,
+# which lost the whole run. Until 25 Sep 2026 anything over 10 pages was therefore held unread. Pages
+# now go as JPEG (a tenth of the size) and a file over CHUNK_PAGES is read in pieces of CHUNK_PAGES,
+# each its own request, their readings merged (pod_intake.reader.merge_readings) - that packet is three
+# reads of ten pages at most, and never more than ten pages are rendered for one read. A file over
+# MAX_READ_PAGES or MAX_READ_MB is still held for a person, unread: uploading pages the bot never looked
+# at could put anything into File History.
+CHUNK_PAGES = 10
+MAX_READ_PAGES = 40
+MAX_READ_MB = 25
 TOO_LONG = "too long for the bot"
 # Pictures a driver texts this close together are one sending, the way one email is. Load 2577917
 # (24 Sep 2026): the delivery copy came as two texts 11 seconds apart - page 1 at 11:13:28, the
@@ -611,7 +616,8 @@ def _read(conn, store, tpro, read, quick, s: Settings, stats: Stats, plans, dead
             mid = d.message_id or f"tpro-file:{d.source.split(':', 1)[1]}"
             db.put_attachment(conn, d.sha256, message_id=mid, filename=d.filename, size=len(d.data), extraction=None,
                               document_type=None, model=None, cost_usd=None, permanent=True,
-                              error=f"{TOO_LONG}: {pages} pages, {mb:.1f} MB (it reads up to {MAX_READ_PAGES} pages)")
+                              error=f"{TOO_LONG}: {pages} pages, {mb:.1f} MB (it reads up to {MAX_READ_PAGES} pages "
+                                    f"and {MAX_READ_MB} MB)")
             continue
         ready.append((row, filed, d))
 
@@ -652,26 +658,33 @@ def _read(conn, store, tpro, read, quick, s: Settings, stats: Stats, plans, dead
             full.append((row, filed, mate))
             shas.add(mate.sha256)
 
-    # 3. the full read
-    jobs = [(int(row["load_id"]), d) for row, _, d in full]
+    # 3. the full read. A file longer than CHUNK_PAGES is read in pieces, each piece a job of its own;
+    # a piece already read in an earlier run is not read again.
+    jobs = []
+    for row, _, d in full:
+        for first, last in pieces_to_read(conn, d):
+            jobs.append((int(row["load_id"]), d, first, last))
     if not jobs:
+        _merge_pieces(conn, full, unread)
         _save_spend(conn, stats, day)
         return unread
     allowed = min(s.max_reads, max(0, int((s.daily_usd - stats.spent_today - stats.spent) / EST_READ_USD)))
     if read is None:
         allowed = 0
     if len(jobs) > allowed:
-        stats.stopped = (f"read cap: {len(jobs) - allowed} document(s) left for later "
+        stats.stopped = (f"read cap: {len(jobs) - allowed} read(s) left for later "
                          + (f"(daily ${s.daily_usd:.0f} safety limit reached)" if allowed < s.max_reads
                             else f"({s.max_reads} a run)"))
-        for load_id, _ in jobs[allowed:]:
+        for load_id, *_ in jobs[allowed:]:
             unread.add(load_id)
         jobs = jobs[:allowed]
     if not jobs:
+        _merge_pieces(conn, full, unread)
         _save_spend(conn, stats, day)
         return unread
     pool = ThreadPoolExecutor(max_workers=READERS)
-    futures = {pool.submit(read, d.data, d.filename): (load_id, d) for load_id, d in jobs}
+    futures = {pool.submit(read, *_read_input(d, first, last)): (load_id, d, first, last)
+               for load_id, d, first, last in jobs}
     done, late = wait(futures, timeout=max(1.0, deadline - READ_UNTIL_S - time.monotonic()))
     # Not `with`: its exit waits for every read, and a stuck one must not hold the ledger past the
     # timeout. Reads not started are cancelled; one still running is abandoned and tried next run.
@@ -682,23 +695,77 @@ def _read(conn, store, tpro, read, quick, s: Settings, stats: Stats, plans, dead
         stats.stopped = f"{len(late)} read(s) not finished in time; next run"
     from .ingest import permanent_read_error
     for fut in done:
-        load_id, d = futures[fut]
+        load_id, d, first, last = futures[fut]
         mid = d.message_id or f"tpro-file:{d.source.split(':', 1)[1]}"
         try:
             ex, dtype, model, cost = fut.result()
         except Exception as e:                                   # noqa: BLE001 - recorded with its retry
+            # A failed piece fails the file's read, on the file's backoff; the pieces that did come
+            # back are kept, so the retry reads only this one.
             stats.read_failed += 1
             unread.add(load_id)
             db.put_attachment(conn, d.sha256, message_id=mid, filename=d.filename, size=len(d.data or b""),
                               extraction=None, document_type=None, model=None, cost_usd=None,
                               error=f"{type(e).__name__}: {str(e)[:400]}", permanent=permanent_read_error(e))
             continue
-        db.put_attachment(conn, d.sha256, message_id=mid, filename=d.filename, size=len(d.data or b""),
-                          extraction=ex, document_type=dtype, model=model, cost_usd=cost)
         stats.read += 1
         stats.spent += cost or 0
+        if first is None:
+            db.put_attachment(conn, d.sha256, message_id=mid, filename=d.filename, size=len(d.data or b""),
+                              extraction=ex, document_type=dtype, model=model, cost_usd=cost)
+            continue
+        conn.execute("INSERT OR REPLACE INTO read_part (sha256, first_page, last_page, extraction_json, model, cost_usd, "
+                     "read_at) VALUES (?,?,?,?,?,?,?)", (d.sha256, first, last, json.dumps(ex), model, cost, db.now_iso()))
+    _merge_pieces(conn, full, unread)
     _save_spend(conn, stats, day)
     return unread
+
+
+def _merge_pieces(conn, full: list, unread: set[int]) -> None:
+    """Give each file read in pieces its reading, once every piece is in. One still missing a piece
+    leaves its load unread, so it is looked at again next run and only that piece is read."""
+    from pod_intake.reader import merge_readings
+    for row, _, d in full:
+        if pieces_to_read(conn, d) == [(None, None)]:
+            continue                                   # one read of the whole file, recorded as it came back
+        if pieces_to_read(conn, d):
+            unread.add(int(row["load_id"]))
+            continue
+        att = db.get_attachment(conn, d.sha256)
+        if att is not None and att["extraction_json"] is not None:
+            continue                                   # another load's copy of the file merged it already
+        parts = conn.execute("SELECT first_page, extraction_json, model, cost_usd FROM read_part WHERE sha256=? "
+                             "ORDER BY first_page", (d.sha256,)).fetchall()
+        merged = merge_readings([(p["first_page"], json.loads(p["extraction_json"])) for p in parts])
+        mid = d.message_id or f"tpro-file:{d.source.split(':', 1)[1]}"
+        db.put_attachment(conn, d.sha256, message_id=mid, filename=d.filename, size=len(d.data or b""),
+                          extraction=merged, document_type=merged["document_type"],
+                          model=f"{parts[0]['model']}, {len(parts)} pieces",
+                          cost_usd=round(sum(p["cost_usd"] or 0 for p in parts), 5))
+
+
+def pieces(total: int) -> list[tuple[int, int]]:
+    """The page ranges a `total`-page file is read in, 1-based and inclusive."""
+    return [(a, min(a + CHUNK_PAGES - 1, total)) for a in range(1, total + 1, CHUNK_PAGES)]
+
+
+def pieces_to_read(conn, d: Doc) -> list[tuple[int | None, int | None]]:
+    """What is left to read of this file: [(None, None)] for one read of the whole file, or the page
+    ranges of a long file that have no reading in read_part yet."""
+    total = page_count(d.data) if d.data else 1
+    if total <= CHUNK_PAGES:
+        return [(None, None)]
+    have = {r[0] for r in conn.execute("SELECT first_page FROM read_part WHERE sha256=?", (d.sha256,))}
+    return [(a, b) for a, b in pieces(total) if a not in have]
+
+
+def _read_input(d: Doc, first: int | None, last: int | None) -> tuple[bytes, str]:
+    """(bytes, file name) for one read: the whole file, or pages first..last of it as a PDF of their own."""
+    if first is None:
+        return d.data, d.filename
+    from pathlib import PurePath
+    name = PurePath(d.filename or "file.pdf")
+    return only_pages(d.data, list(range(first, last + 1))), f"{name.stem} (pages {first}-{last}).pdf"
 
 
 def _save_spend(conn, stats: Stats, day: str) -> None:

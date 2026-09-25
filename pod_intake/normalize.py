@@ -14,20 +14,26 @@ import pymupdf
 
 MAX_EDGE_PX = 1568          # Anthropic's recommended long edge; ~1,600 tokens per page
 MIN_LOGO_PX = 300           # images smaller than this on both sides are treated as logos/icons
+# Pages go to the model as JPEG, not PNG. A scanned or photographed page is noise to PNG: load 2571670's
+# 27-page CamScanner packet (25 Sep 2026) came to 3.6 MB a page as PNG and 0.37 MB as JPEG, so ten of
+# its pages were a 38 MB request that Bedrock refused (413) and all 27 as JPEG are 10 MB. What a page
+# costs in tokens depends on its pixels, not its encoding, and the reading was the same.
+JPEG_QUALITY = 85
 
 
 @dataclass
 class PageImage:
     number: int
-    png: bytes
+    image: bytes
     width: int
     height: int
     dhash: str
     text_layer: str = ""
+    media_type: str = "image/jpeg"
 
     @property
     def b64(self) -> str:
-        return base64.standard_b64encode(self.png).decode("ascii")
+        return base64.standard_b64encode(self.image).decode("ascii")
 
     @property
     def approx_tokens(self) -> int:
@@ -98,7 +104,7 @@ def load_document(path: str | Path, max_edge: int = MAX_EDGE_PX, max_pages: int 
         pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), colorspace=pymupdf.csRGB, alpha=False)
         out.pages.append(PageImage(
             number=i,
-            png=pix.tobytes("png"),
+            image=pix.tobytes("jpeg", jpg_quality=JPEG_QUALITY),
             width=pix.width,
             height=pix.height,
             dhash=_dhash(page),
