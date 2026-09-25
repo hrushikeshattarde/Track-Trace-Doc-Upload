@@ -2743,6 +2743,56 @@ def test_auto_upload_bol_sets() -> None:
           and conn.execute("SELECT outcome FROM autofile WHERE sha256=?", (b42,)).fetchone()[0] == "held")
 
 
+def test_auto_upload_leaves_out_pages_that_are_not_paperwork() -> None:
+    """Load 2570838 (25 Sep 2026): BOL.pdf held the BOL on page 1 and photos of the seal and the loaded
+    trailer on pages 2-3, and the whole file went up. Only the BOL and POD pages of a file are uploaded."""
+    print("auto-upload: only the BOL and POD pages of a file")
+    import time as _time
+    from intake import autofile
+    from pod_intake.schema import Extraction
+
+    def with_pages(reading, roles):
+        return {**reading, "pages": [{"page": i, "role": r, "legibility": 0.9} for i, r in enumerate(roles, 1)]}
+
+    ex = Extraction.model_validate(with_pages(_reading(1), ["bol", "photo", "photo"]))
+    check("photo pages are left out, the BOL page stays",
+          autofile.paper_pages(ex, 3) == ([1], [(2, "photo"), (3, "photo")]), str(autofile.paper_pages(ex, 3)))
+    ex = Extraction.model_validate(with_pages(_reading(1), ["pod", "bol", "lumper", "other"]))
+    check("so are a lumper receipt and other paperwork; a POD's BOL page is kept",
+          autofile.paper_pages(ex, 4)[0] == [1, 2])
+    ex = Extraction.model_validate(with_pages(_reading(1), ["pod"]))
+    check("a page the reading did not label is kept", autofile.paper_pages(ex, 2) == ([1, 2], []))
+    ex = Extraction.model_validate(with_pages(_reading(1), ["photo", "photo"]))
+    check("a reading that leaves nothing keeps the whole file", autofile.paper_pages(ex, 2) == ([1, 2], []))
+    pdf = autofile.combine_pdf([_picture(61), _picture(62), _picture(63)], "BOL.pdf")
+    first = autofile.only_pages(pdf, [1])
+    check("a PDF cut to its paper pages keeps those pages as they were",
+          len(autofile.picture_sig(first)) == 1
+          and autofile._diff(autofile.picture_sig(first)[0], autofile.picture_sig(pdf)[0]) < autofile.SAME_PICTURE)
+    check("a PDF that keeps every page goes up byte for byte", autofile.only_pages(pdf, [1, 2, 3]) is pdf)
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    load_row(2600060, "bol_expected", "loaded")
+    tpro.add(2600060)
+    (sha,) = mail(2600060, "m60", [(pdf, with_pages(_reading(2600060), ["bol", "photo", "photo"]))])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    up = tpro.uploads[0] if len(tpro.uploads) == 1 else {}
+    check("the BOL goes up without its photos", up.get("type") == "Driver Supplied BOL"
+          and len(autofile.picture_sig(up.get("data") or b"")) == 1, str([(u["type"], u["comment"]) for u in tpro.uploads]))
+    check("its comment counts only the page that went up", "pages" not in up.get("comment", "x"), up.get("comment"))
+    row = log.rows.get(autofile.ref(2600060, sha)) or [""] * 14
+    check("the sheet names the pages left out", "(left out: page 2 photo, page 3 photo)" in row[4], row[4])
+    # The driver sends the same PDF again, saved anew: different bytes, the same pictures.
+    again = autofile.combine_pdf([_picture(61), _picture(62), _picture(63)], "BOL (1).pdf")
+    conn.execute("UPDATE load SET last_checked_at=? WHERE load_id=2600060", (db.now_iso(),))
+    mail(2600060, "m61", [(again, with_pages(_reading(2600060), ["bol", "photo", "photo"]))])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    check("a second copy of the file is found on the load by its BOL page, not uploaded again",
+          len(tpro.uploads) == 1, str([(u["type"], u["comment"]) for u in tpro.uploads]))
+
+
 def test_auto_upload_holds_a_long_packet_unread() -> None:
     """Load 2571670 (24 Sep 2026): a 27-page scan sent every page to the AI, which refused the request
     and ran the worker out of memory. A file longer than the bot reads is held for a person, unread."""
@@ -3093,6 +3143,7 @@ if __name__ == "__main__":
     test_auto_upload_pilot()
     test_auto_upload_texted_pages()
     test_auto_upload_bol_sets()
+    test_auto_upload_leaves_out_pages_that_are_not_paperwork()
     test_auto_upload_holds_a_long_packet_unread()
     test_auto_upload_quick_look()
     test_reader_is_brief_and_caches_the_schema()

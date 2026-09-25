@@ -10,8 +10,9 @@ Frankie Saiz pod (1160) from 24 Sep 2026. For each of their loads that is not ye
     upload   what passed. The manager's rule (24 Sep 2026): a POD goes in as Bill Of Lading, which
              clears Waiting for Documents, and a BOL as Driver Supplied BOL, which does not. Pages of
              one document from one email - or from one burst of texts, which TransportPro files one
-             picture at a time - go up as one PDF. Every upload's comment starts "Doc Intake Bot:"
-             and says what the page really is
+             picture at a time - go up as one PDF, and only their BOL and POD pages: a photo, a lumper
+             receipt or a packing list inside the same file is left out. Every upload's comment starts
+             "Doc Intake Bot:" and says what the page really is
     log      what it uploaded, and what it held back and which check failed, to the pod's Upload log
              sheet - one row per document, updated in place when its status changes. Every other
              decision (already on file, not needed, waiting) is kept in the ledger only
@@ -98,6 +99,15 @@ TOO_LONG = "too long for the bot"
 # pod's loads that day the pictures of one sending landed 2 to 65 seconds apart (2555376's longest
 # gap), and a pickup sending and a delivery sending hours apart.
 TEXT_BATCH_GAP_S = 180
+
+# The pages that go into File History. The reader labels every page of a file, and a driver's PDF often
+# carries more than the paperwork: load 2570838 (25 Sep 2026) sent BOL.pdf with the BOL on page 1 and
+# photos of the trailer-door seal and the loaded trailer on pages 2-3, and the whole file went up. Of the
+# first 21 uploads, 8 carried pages like that - freight and seal photos, lumper receipts, packing lists,
+# certificates of analysis, pallet lists, trailer inspection forms. Only the BOL and POD pages go up now.
+PAPER_ROLES = frozenset({"bol", "pod"})
+ROLE_WORDS = {"photo": "photo", "lumper": "lumper receipt", "weight_ticket": "scale ticket", "reefer_log": "reefer log",
+              "invoice": "invoice", "rate_confirmation": "rate confirmation", "other": "other paperwork"}
 
 # Outcomes. The last three are never logged: not paperwork, personal ID, or unreadable.
 UPLOADED, ON_FILE, NOT_NEEDED, HELD, WAITING, DRY = ("uploaded", "on_file", "not_needed", "held",
@@ -222,6 +232,8 @@ class Decision:
     on_clearing: bool = False     # already on the load under a type that clears
     companion: bool = False       # another page of a POD from the same email, going up with it
     quick: str = ""               # "BOL (quick look, 95% sure)" when only the quick look saw the page
+    pages: list[int] | None = None                                 # the file's pages that go up, 1-based
+    left_out: list[tuple[int, str]] = field(default_factory=list)  # (page, role) of the ones that do not
 
     @property
     def ready(self) -> bool:
@@ -832,9 +844,14 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
     dec.facts, dec.strong = match_facts_detail(ex, load)
     strong = len(dec.strong)
 
-    # Already on the load? The same file, or the same picture under a type that counts.
+    # Already on the load? The same file, or the same picture under a type that counts. Only the pages
+    # that would go up are compared: an upload leaves a file's photos out, so they are never on the load
+    # to be found, and a second copy of the same PDF would otherwise read as new and go up again.
     mine = sig()
-    counts = [of for of in filed if kind == "BOL" or of.type_id in st.CLEARING_TYPES]
+    keep, _ = paper_pages(ex, len(mine))
+    if mine and len(keep) < len(mine):
+        mine = [mine[n - 1] for n in keep]
+    counts =[of for of in filed if kind == "BOL" or of.type_id in st.CLEARING_TYPES]
     hit = _covering(d.sha256, mine, counts)
     if hit is not None:
         ours = hit.by_bot and (hit.sha256 == d.sha256 or conn.execute(
@@ -1156,7 +1173,8 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
     members = sorted(members + pages_along, key=lambda x: x.doc.order)
     for m in members:
         m.doc.data = m.doc.data or doc_bytes(store, tpro, m.doc)
-    data, filename, content_type = upload_payload([m.doc.data for m in members], kind, load_id)
+        m.pages, m.left_out = paper_pages(m.ex, page_count(m.doc.data))
+    data, filename, content_type = upload_payload([only_pages(m.doc.data, m.pages) for m in members], kind, load_id)
     comment = upload_comment(members, kind, load_id)
     # One row per upload in the sheet (24 Sep 2026): the page the upload is judged on carries it -
     # the POD's signed page, a BOL set's front - and lists every page. The others are still recorded,
@@ -1229,6 +1247,48 @@ def _kind_of(data: bytes) -> str:
     return "other"
 
 
+def paper_pages(ex, total: int) -> tuple[list[int], list[tuple[int, str]]]:
+    """(the pages of a `total`-page file that go up, [(page, role)] of the ones left out), 1-based.
+
+    A page the reading labels as anything but a BOL or a POD is left out. A page it does not label is
+    kept: leaving out a signed page nobody classified costs more than carrying one extra page. When
+    nothing would be left the reading contradicts itself, and the file stands whole - it is judged on
+    what the reading says the document is."""
+    roles = {p.page: p.role for p in (ex.pages if ex is not None else [])}
+    keep = [n for n in range(1, total + 1) if roles.get(n) is None or roles[n] in PAPER_ROLES]
+    if not keep:
+        return list(range(1, total + 1)), []
+    return keep, [(n, roles[n]) for n in range(1, total + 1) if n not in keep]
+
+
+def only_pages(data: bytes, keep: list[int] | None) -> bytes:
+    """The file with only these pages (1-based). A picture is one page and comes back as it is, and so
+    does a PDF that keeps every page - it goes up byte for byte."""
+    if keep is None or _kind_of(data) != "pdf":
+        return data
+    import pymupdf
+    doc = pymupdf.open(stream=data, filetype="pdf")
+    if keep == list(range(1, doc.page_count + 1)):
+        return data
+    doc.select([n - 1 for n in keep if 1 <= n <= doc.page_count])
+    return doc.tobytes(garbage=3, deflate=True)
+
+
+def _pages_up(m: Decision) -> int:
+    """How many pages this document puts into the upload."""
+    if m.pages is not None:
+        return len(m.pages)
+    return max(1, len(m.ex.pages)) if m.ex is not None else 1
+
+
+def _named(d: Decision) -> str:
+    """The file's name for the sheet, saying which of its pages stayed out: "BOL.pdf (left out: page 2
+    photo, page 3 photo)"."""
+    if not d.left_out:
+        return d.doc.filename
+    return f"{d.doc.filename} (left out: {', '.join(f'page {n} {ROLE_WORDS.get(r, r)}' for n, r in d.left_out)})"
+
+
 def upload_payload(parts: list[bytes], kind: str, load_id: int) -> tuple[bytes, str, str]:
     """(bytes, filename, content type) - always one PDF. A PDF that arrives on its own goes up as it
     is; a photo, several pages, or an iPhone HEIC are made into one PDF first. File History is PDFs -
@@ -1286,7 +1346,7 @@ def upload_comment(members: list[Decision], kind: str, load_id: int) -> str:
         signed = next((d for m in members for d in page_detail(m.ex) if "signed" in d and "unsigned" not in d), None)
         detail = [signed] + [d for d in detail if d != "unsigned"] if signed else detail
     bits = [kind] + detail
-    pages = sum(max(1, len(m.ex.pages)) for m in members)
+    pages = sum(_pages_up(m) for m in members)
     if pages > 1:
         bits.append(f"{pages} pages")
     if lead.refiles:
@@ -1324,14 +1384,14 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
               group: list[Decision] | None = None) -> list:
     """Columns A..N of the Upload log. O and P are the pod's."""
     d, ex = dec.doc, dec.ex
-    name = d.filename
+    name = _named(dec)
     if group and len(group) > 1:
-        names = [g.doc.filename for g in sorted(group, key=lambda g: g.doc.order)]
-        pages = sum(max(1, len(g.ex.pages)) if g.ex is not None else 1 for g in group)
+        names = [_named(g) for g in sorted(group, key=lambda g: g.doc.order)]
+        pages = sum(_pages_up(g) for g in group)
         name = " + ".join(names) + f" - one {pages}-page PDF"
     read_as = dec.quick
     if ex is not None and dec.kind:
-        pages = len(ex.pages)
+        pages = len(dec.pages) if dec.pages is not None else len(ex.pages)
         detail = ", ".join(page_detail(ex) + ([f"{pages} pages"] if pages > 1 else []))
         read_as = dec.kind + (f" - {detail}" if detail else "")
     facts = ((f"{len(dec.facts)} fact(s): " + "; ".join(dec.facts)) if dec.facts
