@@ -2764,6 +2764,15 @@ def test_auto_upload_leaves_out_pages_that_are_not_paperwork() -> None:
     check("a page the reading did not label is kept", autofile.paper_pages(ex, 2) == ([1, 2], []))
     ex = Extraction.model_validate(with_pages(_reading(1), ["photo", "photo"]))
     check("a reading that leaves nothing keeps the whole file", autofile.paper_pages(ex, 2) == ([1, 2], []))
+    # Load 2590747: the receiving stamp was on page 1 of a packing list; the BOL behind it was unsigned.
+    stamped = with_pages(_reading(1, "proof_of_delivery"), ["pod", "other", "other", "bol", "bol"])
+    check("a POD keeps the packing-list page the receiver stamped",
+          autofile.paper_pages(Extraction.model_validate(stamped), 5, "POD")[0] == [1, 4, 5])
+    unlabelled = with_pages(_reading(1, "proof_of_delivery"), ["other", "other", "photo", "bol", "bol"])
+    check("a POD whose stamped page was not labelled pod loses only its photos",
+          autofile.paper_pages(Extraction.model_validate(unlabelled), 5, "POD")[0] == [1, 2, 4, 5])
+    check("a BOL is cut to its BOL pages as before",
+          autofile.paper_pages(Extraction.model_validate(unlabelled), 5, "BOL")[0] == [4, 5])
     pdf = autofile.combine_pdf([_picture(61), _picture(62), _picture(63)], "BOL.pdf")
     first = autofile.only_pages(pdf, [1])
     check("a PDF cut to its paper pages keeps those pages as they were",

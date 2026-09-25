@@ -848,7 +848,7 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
     # that would go up are compared: an upload leaves a file's photos out, so they are never on the load
     # to be found, and a second copy of the same PDF would otherwise read as new and go up again.
     mine = sig()
-    keep, _ = paper_pages(ex, len(mine))
+    keep, _ = paper_pages(ex, len(mine), kind)
     if mine and len(keep) < len(mine):
         mine = [mine[n - 1] for n in keep]
     counts =[of for of in filed if kind == "BOL" or of.type_id in st.CLEARING_TYPES]
@@ -1173,7 +1173,7 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
     members = sorted(members + pages_along, key=lambda x: x.doc.order)
     for m in members:
         m.doc.data = m.doc.data or doc_bytes(store, tpro, m.doc)
-        m.pages, m.left_out = paper_pages(m.ex, page_count(m.doc.data))
+        m.pages, m.left_out = paper_pages(m.ex, page_count(m.doc.data), m.kind)
     data, filename, content_type = upload_payload([only_pages(m.doc.data, m.pages) for m in members], kind, load_id)
     comment = upload_comment(members, kind, load_id)
     # One row per upload in the sheet (24 Sep 2026): the page the upload is judged on carries it -
@@ -1247,15 +1247,22 @@ def _kind_of(data: bytes) -> str:
     return "other"
 
 
-def paper_pages(ex, total: int) -> tuple[list[int], list[tuple[int, str]]]:
+def paper_pages(ex, total: int, kind: str | None = None) -> tuple[list[int], list[tuple[int, str]]]:
     """(the pages of a `total`-page file that go up, [(page, role)] of the ones left out), 1-based.
 
     A page the reading labels as anything but a BOL or a POD is left out. A page it does not label is
     kept: leaving out a signed page nobody classified costs more than carrying one extra page. When
     nothing would be left the reading contradicts itself, and the file stands whole - it is judged on
-    what the reading says the document is."""
+    what the reading says the document is.
+
+    A POD keeps the page its receiver evidence is on, whatever that page is labelled. Load 2590747
+    (25 Sep 2026): the consignee's receiving stamp was on page 1 of a packing list, and the BOL pages
+    behind it were unsigned - cutting the file to its BOL pages would have uploaded a "POD" with no
+    proof of delivery on it. So when a POD's pages carry no page labelled pod, only the photos go."""
     roles = {p.page: p.role for p in (ex.pages if ex is not None else [])}
     keep = [n for n in range(1, total + 1) if roles.get(n) is None or roles[n] in PAPER_ROLES]
+    if kind == "POD" and not any(roles.get(n) == "pod" for n in keep):
+        keep = [n for n in range(1, total + 1) if roles.get(n) != "photo"]
     if not keep:
         return list(range(1, total + 1)), []
     return keep, [(n, roles[n]) for n in range(1, total + 1) if n not in keep]
