@@ -178,6 +178,46 @@ def test_receiving_stamp_is_acknowledgement() -> None:
     check("and a page with neither is still the pickup copy", t == "Bill Of Lading", t)
 
 
+def test_costco_receiving_sticker_is_a_pod() -> None:
+    """Load 2572625 (25 Sep 2026): Costco's receiving sticker - door, in/out times, "RECVR: G QUI",
+    "TRAILER LEAVING EMPTY", laid over the unsigned BOL - was read at 83% and held. Spindrift accepts the
+    sticker as the POD for the Saiz pod, and the reader is now told it is one."""
+    print("a Costco receiving sticker is a POD")
+    import time as _time
+    from intake import autofile
+    from pod_intake import reader
+    from pod_intake.matcher import brief_page_comment
+    from pod_intake.schema import Extraction
+
+    check("the reader and the quick look are told about the sticker",
+          "Costco receiving stickers are proofs of delivery" in reader.READER_SYSTEM and "Costco" in reader.QUICK_SYSTEM)
+    sticker = _reading(2600070, "proof_of_delivery", conf=0.93, numbers=[("PO", "PO2600070"), ("Pickup #", "P2600070")])
+    sticker["signatures"] = {"shipper_signed": False, "driver_signed": False, "receiver_signed": False,
+                             "receiver_name": "G QUI", "receiver_date": "9/25/26", "stamp_present": True}
+    sticker["times"] = {"check_in": "07:59", "check_out": "08:32", "source": "printed", "at_stop": "consignee"}
+    sticker["pages"] = [{"page": 1, "role": "pod", "legibility": 0.9}]
+    check("its comment names the receiver instead of calling it unsigned",
+          brief_page_comment(Extraction.model_validate(sticker), max_words=60) == "POD, stamped, received by G QUI 9/25/26",
+          brief_page_comment(Extraction.model_validate(sticker), max_words=60))
+    nameless = {**sticker, "signatures": {**sticker["signatures"], "receiver_name": None}}
+    check("a stamp that names nobody is still stamped, unsigned",
+          brief_page_comment(Extraction.model_validate(nameless)) == "POD, stamped, unsigned")
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    texted = {"id": 701, "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL", "uploadById": 1,
+              "comments": "Driver Supplied Image - 2600070", "dateCreated": "2026-09-25T14:09:00Z"}
+    load_row(2600070, "wrong_doc_type", "delivered")
+    tpro.add(2600070, files=[(texted, _picture(71))])
+    on_load(_picture(71), sticker)
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    up = tpro.uploads[0] if len(tpro.uploads) == 1 else {}
+    check("a texted Costco sticker goes up as Bill Of Lading, the POD type that clears",
+          up.get("type") == "Bill Of Lading" and "POD, stamped, received by G QUI" in up.get("comment", ""),
+          str([(u["type"], u["comment"]) for u in tpro.uploads]))
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -3163,6 +3203,7 @@ if __name__ == "__main__":
     test_photo_stamp()
     test_pii_gate()
     test_receiving_stamp_is_acknowledgement()
+    test_costco_receiving_sticker_is_a_pod()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

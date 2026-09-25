@@ -290,7 +290,12 @@ def brief_page_comment(ex: Extraction, max_words: int = 10) -> str:
         when_ = (sig.receiver_date or "").strip()
         bits.append("signed" + (f" by {who}" if who else "") + (f" {when_}" if when_ else ""))
     elif sig.stamp_present:
-        bits.append("stamped, unsigned")
+        # A receiving label names its receiver without a signature: Costco's sticker reads "RECVR: G QUI"
+        # (load 2572625, 25 Sep 2026). Saying "unsigned" there describes a missing signature nobody
+        # was ever going to write.
+        who = " ".join(receiver_name(sig).split()[:2]).strip(" ,.")
+        when_ = (sig.receiver_date or "").strip()
+        bits.append(f"stamped, received by {who}" + (f" {when_}" if when_ else "") if who else "stamped, unsigned")
     elif ex.times.check_out and ex.times.at_stop != "shipper":
         # The other delivery evidence, and the reason an unsigned page can still be typed a POD.
         # Leaving it out made the comment read as a contradiction of its own File column: load
