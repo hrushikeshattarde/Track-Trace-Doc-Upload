@@ -1,5 +1,9 @@
 # Driver Document Intake — prototype
 
+> **Taking over the project?** [docs/PIPELINE.md](docs/PIPELINE.md) describes what runs in AWS today, end to end: the
+> collector and worker Lambdas, how each run works through the load documents, and how anything a run cannot finish
+> carries over to the next one. This README covers the prototype and the local tools it grew out of.
+
 A small, runnable version of PRD Section 18: normalize a POD/BOL file, read it with Claude into
 structured JSON, match it to a load using the PRD Section 6 rules, and, when the rules cannot settle
 it, ask a stronger model to adjudicate. Nothing here writes to TransportPro.
