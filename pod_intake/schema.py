@@ -101,6 +101,11 @@ class PageInfo(BaseModel):
     page: int
     role: Literal["bol", "pod", "lumper", "weight_ticket", "reefer_log", "invoice", "rate_confirmation", "photo", "other"]
     legibility: float = Field(ge=0, le=1, description="1 = crisp and fully readable, 0 = unreadable.")
+    # Which document page this is, so the same page scanned several times into one file is known to be
+    # one page (load 2571670, 25 Sep 2026: three one-page BOLs scanned nine times over). A picture
+    # comparison cannot tell a re-scan from a different order printed on the same form; the numbers can.
+    doc_ref: Optional[str] = Field(default=None, description="This page's own document number as printed in its header (the order, BOL or delivery number) and its page number, as '<number> <page>/<pages>', e.g. 'P2700C 1/3'. Null when the page prints none.")
+    signed: Optional[bool] = Field(default=None, description="True when this page carries any handwritten signature, handwritten mark or stamp.")
 
 
 class Extraction(BaseModel):

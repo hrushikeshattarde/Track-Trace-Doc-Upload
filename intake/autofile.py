@@ -217,6 +217,9 @@ class Doc:
     order: int = 0
     data: bytes | None = None
     batch: str | None = None      # what arrived together: email:<message id> | text:<first file id>
+    # Every sending the file came in. A file can be sent again: load 2571670's 27-page BOL packet came on
+    # 24 Sep 2026 and again on 25 Sep beside the Costco sticker it belongs with.
+    batches: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -260,6 +263,8 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
     uploader = uploader or tpro
     day = dt.datetime.now(dt.timezone.utc).date().isoformat()
     stats.spent_today = float(db.get_state(conn, f"ai_spend:{day}") or 0)
+    if reopen_too_long(conn):
+        print("  auto-upload: files held as too long under an earlier limit are read now")
 
     # 1. look
     plans: list[tuple[sqlite3.Row, dict, list[OnFile], list[Doc]]] = []
@@ -289,7 +294,12 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
             stats.stopped = "out of time before deciding; the rest go next run"
             break
         try:
-            decisions = [d for d in (_decide(conn, store, tpro, s, row, load, filed, doc) for doc in docs) if d]
+            decided = [(doc, _decide(conn, store, tpro, s, row, load, filed, doc)) for doc in docs]
+            decisions = [d for _, d in decided if d]
+            # Documents with no decision yet because nobody has read them. A POD waits for the rest of
+            # its sending: a long BOL packet takes longer to read than the one-page sticker beside it
+            # (load 2571670), and going up without it would file the receipt and leave the BOL behind.
+            unread_mates = [doc for doc, d in decided if d is None and _to_be_read(conn, doc)]
             groups: dict[tuple, list[Decision]] = {}
             for dec in decisions:
                 if dec.ready:
@@ -318,6 +328,10 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
                     stats.stopped = "out of time before an upload; it goes next run"
                     unread.add(load_id)
                     break
+                if any(same_sending(doc, g.doc) for doc in unread_mates for g in group):
+                    stats.stopped = stats.stopped or "an upload waits for the rest of its email to be read; next run"
+                    unread.add(load_id)
+                    continue
                 _upload(conn, tpro, uploader, store, s, row, filed, group, stats)
         except Exception as e:                                   # noqa: BLE001 - one load never stops the rest
             stats.errors += 1
@@ -337,6 +351,35 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
         except Exception as e:                                   # noqa: BLE001 - reported; rows stay pending
             stats.sheet_error = f"{type(e).__name__}: {str(e)[:200]}"
     return stats
+
+
+def _to_be_read(conn, doc: Doc) -> bool:
+    """Not read yet, and due to be: a first read, not one waiting out a failed read's backoff (a file
+    that keeps failing must not hold its POD back for a day) and not one nothing will ever read."""
+    att = db.get_attachment(conn, doc.sha256)
+    if att is None:
+        return True
+    if att["extraction_json"] is not None or db.read_blocked(att):
+        return False
+    return not att["error"]
+
+
+def reopen_too_long(conn) -> int:
+    """Files held "too long for the bot" under an earlier, lower limit that the bot reads now. Load
+    2571670's 27-page packet was held on 24 Sep 2026 under the 10-page limit, and the hold - a final
+    decision - kept the packet out of the POD it belonged with the next day. Their read is unblocked
+    and their hold reopened, so the next look decides them like any other document."""
+    n = 0
+    for r in conn.execute("SELECT sha256, error FROM attachment WHERE extraction_json IS NULL AND error LIKE ?",
+                          (f"{TOO_LONG}:%",)).fetchall():
+        m = re.search(r"(\d+) pages?, ([\d.]+) MB", r["error"] or "")
+        if not m or int(m.group(1)) > MAX_READ_PAGES or float(m.group(2)) > MAX_READ_MB:
+            continue
+        conn.execute("UPDATE attachment SET error=NULL, read_attempts=0, next_read_at=NULL WHERE sha256=?", (r["sha256"],))
+        conn.execute("UPDATE autofile SET final=0 WHERE sha256=? AND outcome=? AND status LIKE ?",
+                     (r["sha256"], HELD, f"HELD - {TOO_LONG}%"))
+        n += 1
+    return n
 
 
 def _mark_looked(conn, load_id: int) -> None:
@@ -387,7 +430,7 @@ def companions(conn, decisions: list[Decision], group: list[Decision], s: Settin
     kept = [cached_sig(conn, g.doc.sha256) or [] for g in group]
     out = []
     for dec in sorted(decisions, key=lambda x: x.doc.order):
-        if (dec.doc.batch == group[0].doc.batch and dec.doc.sha256 not in ids and can_join(dec, refs, kind, s)):
+        if (same_sending(dec.doc, group[0].doc) and dec.doc.sha256 not in ids and can_join(dec, refs, kind, s)):
             mine = cached_sig(conn, dec.doc.sha256) or []
             if mine and any(sig and all(any(_diff(p, q) < SAME_PICTURE for q in sig) for p in mine) for sig in kept):
                 continue
@@ -464,16 +507,26 @@ def _email_docs(conn, load_id: int) -> list[Doc]:
         return (r["internal_date"] or "", r["message_id"],
                 tuple((int(x), "") if x.isdigit() else (10 ** 9, x) for x in str(r["part_id"]).split(".")))
 
+    rows = sorted(rows, key=order)
+    sent_in: dict[str, set[str]] = {}
+    for r in rows:
+        sent_in.setdefault(r["sha256"], set()).add(f"email:{r['message_id']}")
     out, seen = [], set()
-    for i, r in enumerate(sorted(rows, key=order)):
+    for i, r in enumerate(rows):
         if r["sha256"] in seen:
             continue
         seen.add(r["sha256"])
         when = (r["internal_date"] or "")[:16].replace("T", " ")
         out.append(Doc(r["sha256"], r["filename"] or r["sha256"][:12], f"email:{r['message_id']}",
                        f"Email {when} UTC from {r['from_domain'] or 'an unknown sender'}",
-                       message_id=r["message_id"], order=i, batch=f"email:{r['message_id']}"))
+                       message_id=r["message_id"], order=i, batch=f"email:{r['message_id']}",
+                       batches=frozenset(sent_in[r["sha256"]])))
     return out
+
+
+def same_sending(a: Doc, b: Doc) -> bool:
+    """Whether two documents came in together: one email, or one burst of texts."""
+    return bool((a.batches or {a.batch}) & (b.batches or {b.batch}) - {None})
 
 
 def _look(conn, tpro, row) -> tuple | None:
@@ -1326,13 +1379,39 @@ def paper_pages(ex, total: int, kind: str | None = None) -> tuple[list[int], lis
     (25 Sep 2026): the consignee's receiving stamp was on page 1 of a packing list, and the BOL pages
     behind it were unsigned - cutting the file to its BOL pages would have uploaded a "POD" with no
     proof of delivery on it. So when a POD's pages carry no page labelled pod, only the photos go."""
-    roles = {p.page: p.role for p in (ex.pages if ex is not None else [])}
+    info = {p.page: p for p in (ex.pages if ex is not None else [])}
+    roles = {n: p.role for n, p in info.items()}
     keep = [n for n in range(1, total + 1) if roles.get(n) is None or roles[n] in PAPER_ROLES]
     if kind == "POD" and not any(roles.get(n) == "pod" for n in keep):
         keep = [n for n in range(1, total + 1) if roles.get(n) != "photo"]
     if not keep:
         return list(range(1, total + 1)), []
-    return keep, [(n, roles[n]) for n in range(1, total + 1) if n not in keep]
+    keep, repeats = without_repeats(keep, info)
+    left = [(n, roles[n]) for n in range(1, total + 1) if n not in keep and n not in repeats] + [(n, "repeat") for n in repeats]
+    return keep, sorted(left)
+
+
+def without_repeats(pages: list[int], info: dict) -> tuple[list[int], list[int]]:
+    """(pages, the repeats taken out): one copy of each document page. Load 2571670 (25 Sep 2026): the
+    driver's 27-page file was three one-page BOLs scanned nine times, and the pod needs the three.
+
+    A page is a repeat of another when the reading gives both the same doc_ref - the page's own document
+    number and page number - and the same role. Pictures are not compared: on that packet three
+    different orders printed on the same Spindrift form were as alike as two scans of one page. Of the
+    copies the one the reading calls signed is kept, else the first; a page with no doc_ref is always
+    kept, and a signed POD page never gives way to an unsigned one, because their roles differ."""
+    groups: dict[tuple[str, str], list[int]] = {}
+    for n in pages:
+        p = info.get(n)
+        ref = re.sub(r"[^A-Z0-9/]", "", str(p.doc_ref or "").upper()) if p is not None else ""
+        if ref:
+            groups.setdefault((ref, p.role), []).append(n)
+    drop: set[int] = set()
+    for copies in groups.values():
+        if len(copies) > 1:
+            best = next((n for n in copies if info[n].signed), copies[0])
+            drop.update(n for n in copies if n != best)
+    return [n for n in pages if n not in drop], sorted(drop)
 
 
 def only_pages(data: bytes, keep: list[int] | None) -> bytes:
@@ -1357,10 +1436,14 @@ def _pages_up(m: Decision) -> int:
 
 def _named(d: Decision) -> str:
     """The file's name for the sheet, saying which of its pages stayed out: "BOL.pdf (left out: page 2
-    photo, page 3 photo)"."""
+    photo, page 3 photo)", "scan.pdf (left out: 24 repeated pages)"."""
     if not d.left_out:
         return d.doc.filename
-    return f"{d.doc.filename} (left out: {', '.join(f'page {n} {ROLE_WORDS.get(r, r)}' for n, r in d.left_out)})"
+    repeats = sum(1 for _, r in d.left_out if r == "repeat")
+    bits = [f"page {n} {ROLE_WORDS.get(r, r)}" for n, r in d.left_out if r != "repeat"]
+    if repeats:
+        bits.append(f"{repeats} repeated page{'s' if repeats > 1 else ''}")
+    return f"{d.doc.filename} (left out: {', '.join(bits)})"
 
 
 def upload_payload(parts: list[bytes], kind: str, load_id: int) -> tuple[bytes, str, str]:

@@ -384,11 +384,17 @@ is the hand-off to a person.
   - one email is one batch (`email:<message id>`);
   - pictures a driver texted within 180 s of each other, chained, are one batch (`text:<first file id>`).
     TransportPro files each picture as its own Driver Supplied BOL.
+  - a file sent in several emails belongs to every one of them (`Doc.batches`, `same_sending`). Load
+    2571670's BOL packet came on 24 Sep and again on 25 Sep beside the Costco sticker it goes with.
 - Each ready POD, then each ready BOL, takes its **companions** from its batch (`companions`, `can_join`). A page joins when either:
   - it passes on its own and shares a reference number with the set, or
   - it's a sign-out side with no reference number at all, the AI is at least 60% sure of it, and
     only the facts and confidence checks failed.
 - A second shot of a page already in the set stays out.
+- **A POD waits for the rest of its email.** If another document from the same sending has not been
+  read yet (for example a long BOL packet still being read in pieces), the upload waits for the next
+  run instead of going up without it. It does not wait for a file that is failing to read.
+- For a Costco delivery this gives one POD: the BOL pages of the email, once each, then the sticker.
 - Texted pages decided in an earlier run are judged again (`_batch_mates`), so page 1 can still go
   up with a page 2 that arrived later.
 
@@ -402,8 +408,12 @@ is the hand-off to a person.
    and the sheet's Document(s) column names it: `BOL.pdf (left out: page 2 photo, page 3 photo)`.
    A page the reading didn't label is kept. A POD always keeps the page with the receiver's
    evidence: if none of its kept pages is labelled `pod`, only its photos are left out. On load
-   2590747 the consignee's stamp was on a packing list, not the BOL. A PDF that keeps every page
-   goes up as it arrived.
+   2590747 the consignee's stamp was on a packing list, not the BOL. **Repeated pages go up once**
+   (`without_repeats`): the reading gives every page a `doc_ref` (its own document and page number,
+   e.g. `P2700C 1/3`), and copies with the same `doc_ref` and role are one page. The signed copy is
+   kept, else the first. Load 2571670's 27 pages were three BOLs scanned nine times; 3 went up. The
+   pictures are not compared: different orders on the same form look as alike as re-scans. A PDF
+   that keeps every page goes up as it arrived.
    Photos, HEIC files and multi-page sets are combined with PyMuPDF. This rule has applied since
    25 Sep 2026; before it, 8 of the first 21 uploads carried such pages.
 4. **Type**, set in `filing.FILE_AS` by the manager's rule of 24 Sep 2026:
@@ -479,6 +489,7 @@ object, and the same file read twice is one paid read.
 | Out of time while looking at loads | The loads not reached aren't marked looked | Looked at next run |
 | A document's bytes can't be fetched | Load left unread (not marked looked) | Tried next run |
 | Over 40 pages or 25 MB | **Held**, with a sheet row | Never read by the bot. A person files it. |
+| Held as too long under an earlier, lower limit | The hold | Reopened by `reopen_too_long` at the start of the next run, then read like any other file |
 | A long file read in pieces, some not finished (time, read cap, a failed piece) | The pieces that came back, in `read_part` | The next run reads only the missing pieces, then merges |
 | Same picture as a page already read | The reading is copied | – |
 | Quick look fails (a timeout, HTTP 413, a file it can't open) | Nothing | The full read decides in the same run |
@@ -489,6 +500,7 @@ object, and the same file read twice is one paid read.
 | Re-fetched bytes don't match the hash | Permanent failure | Never retried |
 | No reading yet | No `autofile` row | Decided once it's read |
 | An unread Driver Supplied BOL blocks "does the load have a BOL?" | No decision | Decided once that file is read |
+| POD whose email has another document not read yet | Nothing uploaded | Uploaded with it once it is read |
 | POD, but the truck isn't at the consignee in TransportPro | **Waiting** (`final=0`) | Decided again whenever the bot looks at the load: after each load check, or when new mail arrives |
 | Out of time before deciding or uploading | – | Next run |
 | The upload call fails | **Waiting**, `attempts+1`; on the 3rd failure, **held** | Retried next run after a fresh File History check |

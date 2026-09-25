@@ -2842,6 +2842,75 @@ def test_auto_upload_leaves_out_pages_that_are_not_paperwork() -> None:
           len(tpro.uploads) == 1, str([(u["type"], u["comment"]) for u in tpro.uploads]))
 
 
+def test_auto_upload_pod_takes_its_bol_pages_once() -> None:
+    """Load 2571670 (25 Sep 2026): the carrier emailed Costco's receiving sticker beside the 27-page BOL
+    file it had already sent the day before - three one-page BOLs scanned nine times. The bot uploaded
+    the sticker alone; the pod wanted the three BOL pages with it. A file sent twice now belongs to both
+    emails, a POD waits for the rest of its email to be read, repeated pages go up once, and files held
+    as too long under the old limit are read."""
+    print("auto-upload: a POD takes its email's BOL pages, once each")
+    import time as _time
+    from intake import autofile
+    from pod_intake.schema import Extraction
+
+    def pages(*spec):
+        return [{"page": i, "role": role, "legibility": 0.9, "doc_ref": ref, "signed": signed}
+                for i, (role, ref, signed) in enumerate(spec, 1)]
+
+    ex = Extraction.model_validate({**_reading(1), "pages": pages(("bol", "A1 1/3", False), ("bol", "A2 2/3", False),
+                                                                    ("bol", "a1 1 / 3", True), ("bol", None, False),
+                                                                    ("pod", "A1 1/3", True))})
+    check("a repeat of a page goes, the signed copy stays; a page with no reference and a POD page stay",
+          autofile.paper_pages(ex, 5) == ([2, 3, 4, 5], [(1, "repeat")]), str(autofile.paper_pages(ex, 5)))
+
+    load_id = 2600080
+    bol_pages = [_picture(80), _picture(81), _picture(82)]
+    packet = autofile.combine_pdf(bol_pages * 2, "packet")
+    sticker = _picture(83)
+    packet_reading = {**_reading(load_id), "pages": pages(*[("bol", f"A{i} {i}/3", True) for i in (1, 2, 3)] * 2)}
+    sticker_reading = _reading(load_id, "proof_of_delivery", conf=0.93, numbers=[("PO", f"PO{load_id}")])
+    sticker_reading["signatures"] = {"shipper_signed": False, "driver_signed": False, "receiver_signed": False,
+                                     "receiver_name": "A TAV", "receiver_date": "9/25/26", "stamp_present": True}
+    sticker_reading["pages"] = pages(("pod", "A3 3/3", True))
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(load_id, "pod_expected", "delivered")
+    tpro.add(load_id)
+    (pk,) = mail(load_id, "m80", [(packet, packet_reading)])
+    _, st = mail(load_id, "m81", [(packet, packet_reading), (sticker, sticker_reading)])
+    db.put_attachment(conn, st, message_id="m81", filename="sticker.png", size=len(sticker), extraction=sticker_reading,
+                      document_type="proof_of_delivery", model="claude-opus-5", cost_usd=0.05)
+    capped = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"}, max_reads=0)
+    autofile.run(conn, tpro, store, read, log, capped, deadline=_time.monotonic() + 600)
+    check("the sticker waits while the BOL file of its email is not read yet", not tpro.uploads,
+          str([(u["type"], u["comment"]) for u in tpro.uploads]))
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    up = tpro.uploads[0] if len(tpro.uploads) == 1 else {}
+    sig = autofile.picture_sig(up.get("data") or b"")
+    check("then one POD goes up: each BOL page once, then the sticker",
+          up.get("type") == "Bill Of Lading" and len(sig) == 4
+          and all(autofile._diff(sig[i], autofile.picture_sig(p)[0]) < autofile.SAME_PICTURE for i, p in enumerate(bol_pages + [sticker])),
+          str([(u["type"], u["comment"]) for u in tpro.uploads]) + f" {len(sig)} pages")
+    check("its comment counts the pages that went up", "POD, stamped, received by A TAV 9/25/26, 4 pages" in up.get("comment", ""),
+          up.get("comment"))
+    row = log.rows.get(autofile.ref(load_id, st)) or [""] * 14
+    check("the sheet names both files and the repeats left out",
+          "(left out: 3 repeated pages)" in row[4] and "one 4-page PDF" in row[4], row[4])
+
+    # A file held as too long under the old 10-page limit is read now; one over today's limit stays held.
+    conn.execute("INSERT INTO attachment (sha256, filename, bytes, error, read_attempts) VALUES "
+                 "('a'||hex(randomblob(31)), 'old.pdf', 1, 'too long for the bot: 27 pages, 10.6 MB (it reads up to 10 pages)', 1), "
+                 "('b'||hex(randomblob(31)), 'huge.pdf', 1, 'too long for the bot: 55 pages, 30.0 MB (it reads up to 40 pages and 25 MB)', 1)")
+    old = conn.execute("SELECT sha256 FROM attachment WHERE filename='old.pdf'").fetchone()[0]
+    conn.execute("INSERT INTO autofile (load_id, sha256, outcome, final, status) VALUES (?,?,?,1,?)",
+                 (load_id, old, autofile.HELD, "HELD - too long for the bot: 27 pages, 10.6 MB (it reads up to 10 pages)"))
+    check("files held under the old limit are reopened, and only those", autofile.reopen_too_long(conn) == 1
+          and db.get_attachment(conn, old)["error"] is None
+          and conn.execute("SELECT final FROM autofile WHERE sha256=?", (old,)).fetchone()[0] == 0)
+
+
 def test_auto_upload_reads_a_long_file_in_pieces() -> None:
     """Loads 2571670 and 2581039 (24 Sep 2026): 27- and 17-page packets were held unread, because every
     page went to the AI in one request - 38 MB of PNG for ten pages of a CamScanner scan, which Bedrock
@@ -3250,6 +3319,7 @@ if __name__ == "__main__":
     test_auto_upload_texted_pages()
     test_auto_upload_bol_sets()
     test_auto_upload_leaves_out_pages_that_are_not_paperwork()
+    test_auto_upload_pod_takes_its_bol_pages_once()
     test_auto_upload_reads_a_long_file_in_pieces()
     test_auto_upload_quick_look()
     test_reader_is_brief_and_caches_the_schema()
