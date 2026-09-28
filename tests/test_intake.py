@@ -218,6 +218,43 @@ def test_costco_receiving_sticker_is_a_pod() -> None:
           str([(u["type"], u["comment"]) for u in tpro.uploads]))
 
 
+def test_a_facility_inspection_form_is_not_a_pod() -> None:
+    """Loads 2594968, 2572108 and 2572111 (27-28 Sep 2026): Carolina Beverage Group's trailer
+    inspection form, filled by the SHIPPER's forklift operator at loading, was read as a POD at the
+    consignee and held, so the pod got a HELD row about a page nobody needed. The reader is now told
+    the form is shipping paperwork. Read that way it is set aside in the ledger, never reaches the
+    sheet, and never gets in the way of the BOL that came in the same email."""
+    print("a facility's trailer inspection form is not a POD")
+    import time as _time
+    from intake import autofile
+    from pod_intake import reader
+
+    check("the reader and the quick look are told about the form",
+          "trailer inspection form or receiving checklist is neither a BOL nor a POD" in reader.READER_SYSTEM
+          and "trailer inspection form or receiving checklist" in reader.QUICK_SYSTEM)
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    form = _reading(2600080, "shipping_document", conf=0.9, numbers=[("BOL #", "9758658"), ("Trailer #", "91694")],
+                    notes="Carolina Beverage Group Trailer Inspection Form filled by the shipper's forklift operator at loading")
+    form["signatures"] = {"shipper_signed": False, "driver_signed": False, "receiver_signed": False,
+                          "receiver_name": None, "receiver_date": None, "stamp_present": False}
+    form["times"] = {"check_in": "09-27-26 15:49", "check_out": "09-27-26 16:57", "source": "printed", "at_stop": "unknown"}
+    form["pages"] = [{"page": 1, "role": "other", "legibility": 0.9}]
+    load_row(2600080, "bol_expected", "loaded")
+    tpro.add(2600080)
+    form_sha, bol_sha = mail(2600080, "mf", [(_picture(80), form), (_picture(81), _reading(2600080))])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    outcome = {r[0]: r[1] for r in conn.execute("SELECT sha256, outcome FROM autofile WHERE load_id=2600080")}
+    check("the form is set aside in the ledger, not held", outcome.get(form_sha) == autofile.NOT_PAPERWORK, str(outcome))
+    check("no sheet row is written for it", not any(ref.endswith(form_sha[:12]) for ref in log.rows), str(list(log.rows)))
+    check("the BOL from the same email still goes up on its own",
+          outcome.get(bol_sha) == autofile.UPLOADED and len(tpro.uploads) == 1
+          and tpro.uploads[0]["type"] == "Driver Supplied BOL",
+          str([(u["type"], u["comment"]) for u in tpro.uploads]))
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -3389,6 +3426,7 @@ if __name__ == "__main__":
     test_pii_gate()
     test_receiving_stamp_is_acknowledgement()
     test_costco_receiving_sticker_is_a_pod()
+    test_a_facility_inspection_form_is_not_a_pod()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

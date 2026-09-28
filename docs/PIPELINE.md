@@ -317,6 +317,10 @@ The full read returns:
 The quick look is trusted only to set aside photos, never to decide a page isn't a POD. It once
 called a signed POD page an unsigned BOL.
 
+A facility's trailer inspection form or receiving checklist reads as shipping paperwork, never as a
+POD, whichever facility signed it (28 Sep 2026: Carolina Beverage Group fills its form at loading, and
+three of them were read as PODs at the consignee and held).
+
 **Read caps:**
 
 - at most 60 full reads a run (`INTAKE_AUTO_MAX_READS`);
