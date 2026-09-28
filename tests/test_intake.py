@@ -255,6 +255,86 @@ def test_a_facility_inspection_form_is_not_a_pod() -> None:
           str([(u["type"], u["comment"]) for u in tpro.uploads]))
 
 
+def test_a_receiving_label_counts_the_facts_of_the_bol_sent_with_it() -> None:
+    """Load 2580410 (28 Sep 2026): a Costco receiving label matched the PO and nothing else, the Sojo
+    BOL emailed beside it matched four facts but was typed as a POD claim for its Opendocks times,
+    and both were held. Sent together and naming the same PO they are one POD: the label leads on
+    the pooled facts, the BOL joins, and one two-page Bill Of Lading goes up. A label whose mate
+    names another shipment stays held, and a promoted label still waits for the consignee."""
+    print("a receiving label counts the facts of the BOL sent with it")
+    import time as _time
+    from intake import autofile
+
+    def label(load_id, po):
+        r = _reading(load_id, "proof_of_delivery", conf=0.93, numbers=[("PO", po)], city=None)
+        r["signatures"] = {"shipper_signed": False, "driver_signed": False, "receiver_signed": False,
+                           "receiver_name": "J GUT", "receiver_date": "9/27/26", "stamp_present": True}
+        r["times"] = {"check_in": "08:46", "check_out": "10:13", "source": "printed", "at_stop": "consignee"}
+        r["pages"] = [{"page": 1, "role": "pod", "legibility": 0.9}]
+        return r
+
+    def bol(load_id, po):
+        r = _reading(load_id, conf=0.87, numbers=[("Pickup #", f"P{load_id}"), ("Customer P.O.", po)])
+        r["times"] = {"check_in": "09:00", "check_out": "10:18", "source": "printed", "at_stop": "consignee"}
+        return r
+
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    # A: the label and the BOL name the same PO, and the truck is at the consignee.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2600090, "pod_expected", "at consignee")
+    tpro.add(2600090)
+    l_sha, b_sha = mail(2600090, "mg", [(_picture(90), label(2600090, "PO2600090")),
+                                        (_picture(91), bol(2600090, "PO2600090"))])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    up = tpro.uploads[0] if len(tpro.uploads) == 1 else {}
+    check("one upload goes up as Bill Of Lading, the POD type", up.get("type") == "Bill Of Lading",
+          str([(u["type"], u["comment"]) for u in tpro.uploads]))
+    check("it carries both pages", bool(up) and autofile.page_count(up["data"]) == 2,
+          str(autofile.page_count(up["data"]) if up else None))
+    outcome = {r[0]: r[1] for r in conn.execute("SELECT sha256, outcome FROM autofile WHERE load_id=2600090")}
+    check("both pages are recorded as uploaded",
+          outcome == {l_sha: autofile.UPLOADED, b_sha: autofile.UPLOADED}, str(outcome))
+    facts = next(iter(log.rows.values()))[8] if log.rows else ""
+    check("one sheet row, whose facts say what they were counted with",
+          len(log.rows) == 1 and "counted with" in facts and "pickup #" in facts, f"{len(log.rows)} rows; {facts}")
+
+    # B: the BOL beside the label names another shipment: nothing is pooled, nothing goes up.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2600091, "pod_expected", "at consignee")
+    tpro.add(2600091)
+    l_sha, b_sha = mail(2600091, "mh", [(_picture(92), label(2600091, "PO2600091")),
+                                        (_picture(93), bol(2600091, "PO7777777"))])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    outcome = {r[0]: r[1] for r in conn.execute("SELECT sha256, outcome FROM autofile WHERE load_id=2600091")}
+    check("a label whose mate names another shipment stays held, and nothing goes up",
+          not tpro.uploads and outcome.get(l_sha) == autofile.HELD, str((outcome, len(tpro.uploads))))
+
+    # C: the same pair while TransportPro still has the truck loaded: the label waits, nothing goes up.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2600092, "pod_expected", "loaded")
+    tpro.add(2600092)
+    l_sha, b_sha = mail(2600092, "mi", [(_picture(94), label(2600092, "PO2600092")),
+                                        (_picture(95), bol(2600092, "PO2600092"))])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    got = conn.execute("SELECT outcome, final FROM autofile WHERE load_id=2600092 AND sha256=?", (l_sha,)).fetchone()
+    check("the BOL goes up on its own while the truck is loaded, and the promoted label waits",
+          [u["type"] for u in tpro.uploads] == ["Driver Supplied BOL"] and got is not None
+          and tuple(got) == (autofile.WAITING, 0), str((got and tuple(got), [u["type"] for u in tpro.uploads])))
+    # ...and once TransportPro has the truck at the consignee, the label still counts the facts of the
+    # BOL that already went up, and follows it as the POD.
+    conn.execute("UPDATE load SET stage='at consignee', last_checked_at=? WHERE load_id=2600092", (db.now_iso(),))
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    got = conn.execute("SELECT outcome FROM autofile WHERE load_id=2600092 AND sha256=?", (l_sha,)).fetchone()
+    check("at the consignee the label goes up as the POD, counting the BOL that went up before it",
+          [u["type"] for u in tpro.uploads] == ["Driver Supplied BOL", "Bill Of Lading"]
+          and got is not None and got[0] == autofile.UPLOADED
+          and autofile.page_count(tpro.uploads[1]["data"]) == 1,
+          str((got and got[0], [u["type"] for u in tpro.uploads])))
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -3427,6 +3507,7 @@ if __name__ == "__main__":
     test_receiving_stamp_is_acknowledgement()
     test_costco_receiving_sticker_is_a_pod()
     test_a_facility_inspection_form_is_not_a_pod()
+    test_a_receiving_label_counts_the_facts_of_the_bol_sent_with_it()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

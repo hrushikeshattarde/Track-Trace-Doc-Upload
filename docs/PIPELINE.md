@@ -399,6 +399,13 @@ is the hand-off to a person.
   read yet (for example a long BOL packet still being read in pieces), the upload waits for the next
   run instead of going up without it. It does not wait for a file that is failing to read.
 - For a Costco delivery this gives one POD: the BOL pages of the email, once each, then the sticker.
+- **A sending is judged as a set** (`pool_set_facts`, 28 Sep 2026). A stamped or signed POD page whose
+  only failed check is facts takes the facts of the pages sent with it that matched the same reference
+  number. Load 2580410: a Costco receiving label matched only the PO, the Sojo BOL beside it matched four
+  facts, and both were held; as a set the label leads, the BOL joins, and one POD goes up. The receiver's
+  evidence and the confidence are never borrowed, and a promoted lead still waits for the consignee stage.
+  A BOL page the classifier typed as a POD claim for its times alone joins a POD set on its facts. A mate that already went up as Driver Supplied BOL in an
+  earlier run still counts (`_sent_mates`).
 - **Other pages of the same document join it** even when they match nothing in TransportPro on their
   own: a page whose `doc_ref` carries a document number already in the set (load 2593890's signed
   page 3 of 3, whose only number was the BOL number).

@@ -243,6 +243,7 @@ class Decision:
     why: set[str] = field(default_factory=set)        # which checks failed: confidence, facts, conflict, pod_evidence
     on_clearing: bool = False     # already on the load under a type that clears
     companion: bool = False       # another page of a POD from the same email, going up with it
+    pooled: list[str] = field(default_factory=list)   # the pages sent with it whose facts it counts as its own
     quick: str = ""               # "BOL (quick look, 95% sure)" when only the quick look saw the page
     pages: list[int] | None = None                                 # the file's pages that go up, 1-based
     left_out: list[tuple[int, str]] = field(default_factory=list)  # (page, role) of the ones that do not
@@ -300,6 +301,7 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
         try:
             decided = [(doc, _decide(conn, store, tpro, s, row, load, filed, doc)) for doc in docs]
             decisions = [d for _, d in decided if d]
+            pool_set_facts(decisions, row, s, more=lambda: _sent_mates(conn, store, tpro, s, row, load, filed, docs))
             # Documents with no decision yet because nobody has read them. A POD waits for the rest of
             # its sending: a long BOL packet takes longer to read than the one-page sticker beside it
             # (load 2571670), and going up without it would file the receipt and leave the BOL behind.
@@ -418,7 +420,12 @@ def can_join(dec: Decision, refs: set[str], kind: str, s: Settings, docs: frozen
         return (dec.outcome == NOT_PAPERWORK and is_packing_list(dec.ex)
                 and bool(shipment_numbers(dec.ex) & numbers))
     if dec.kind != "BOL":
-        return False
+        # A page typed as a POD claim for its in/out times alone - load 2580410's Sojo BOL, whose
+        # Opendocks block the reader put at the consignee - is a page of the POD it was sent with
+        # once that POD carries the receiver's evidence. It joins a POD set on its facts and its
+        # confidence; the evidence check it failed is the set's to pass, not its own.
+        return (kind == "POD" and dec.why <= {"pod_evidence"} and dec.outcome in ("ready", HELD, ON_FILE, NOT_NEEDED)
+                and (dec.conf or 0) >= s.min_confidence and bool(refs & set(dec.strong)))
     if kind == "BOL" and dec.outcome == ON_FILE:
         return False                          # already on the load as paperwork: a BOL set adds nothing by repeating it
     if (dec.outcome in ("ready", ON_FILE, NOT_NEEDED) and not dec.failed
@@ -456,6 +463,49 @@ def set_marks(group: list[Decision]) -> tuple[frozenset[str], frozenset[str]]:
     lead = [g for g in group if not g.companion and g.ex is not None]
     return (frozenset(n for g in lead for n in doc_numbers(g.ex)),
             frozenset(n for g in lead for n in shipment_numbers(g.ex)))
+
+
+def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[], list[Decision]] | None = None) -> None:
+    """Judge the documents of one sending as a set when they name the same shipment.
+
+    A stamped or signed POD page short of facts on its own takes the facts of the pages sent with it
+    that matched the same reference number. Load 2580410 (28 Sep 2026): the Costco receiving label
+    carried the PO and nothing else TransportPro knows, so it was held at one fact, and the Sojo BOL
+    emailed beside it carried four - held too, typed as a POD claim for its Opendocks times. Read as
+    a set, the label leads, the BOL joins, and one POD goes up. Only the facts check may have failed:
+    the receiver's evidence and the confidence are the lead's own, never borrowed. A promoted lead
+    still waits for the consignee stage, as judge() would have had it.
+
+    `more` supplies, on demand, the pages of the load decided for good in an earlier run, judged
+    again (_sent_mates): the BOL that went up as Driver Supplied BOL while TransportPro still had
+    the truck loaded is the label's mate all the same once the truck is at the consignee."""
+    pool: list[Decision] | None = None
+    for dec in decisions:
+        if dec.outcome != HELD or dec.kind != "POD" or dec.why != {"facts"} or dec.ex is None:
+            continue
+        if not (dec.ex.signatures.receiver_signed or dec.ex.signatures.stamp_present):
+            continue
+        if pool is None:
+            pool = decisions + (more() if more is not None else [])
+        mates = [m for m in pool if m is not dec and m.ex is not None and m.kind is not None
+                 and same_sending(m.doc, dec.doc) and (m.conf or 0) >= s.min_confidence
+                 and m.why <= {"pod_evidence"} and m.outcome in ("ready", HELD, ON_FILE, NOT_NEEDED, UPLOADED)
+                 and set(m.strong) & set(dec.strong)]
+        if not mates:
+            continue
+        facts = list(dec.facts) + [f for m in mates for f in m.facts if f not in dec.facts]
+        strong = list(dec.strong) + [f for m in mates for f in m.strong if f not in dec.strong]
+        if len(facts) < s.min_facts or not strong:
+            continue
+        dec.facts, dec.strong, dec.pooled = facts, strong, [m.doc.filename for m in mates]
+        dec.failed, dec.why = [], set()
+        stage = (row["stage"] or "").lower()
+        if stage not in AT_CONSIGNEE:
+            dec.outcome, dec.final = WAITING, False
+            dec.status = (f"WAITING - receiver-signed, but TransportPro has the truck "
+                          f"{stage or 'at an unknown stage'}; uploads once it reaches the consignee")
+        else:
+            dec.outcome, dec.final, dec.status = "ready", True, ""
 
 
 def companions(conn, decisions: list[Decision], group: list[Decision], s: Settings) -> list[Decision]:
@@ -505,6 +555,24 @@ def _batch_mates(conn, store, tpro, s: Settings, row, load: dict, filed: list[On
         if att is None or att["extraction_json"] is None:
             continue
         d = file_doc(of, filed)
+        dec = judge(conn, s, row, load, filed, d, json.loads(att["extraction_json"]),
+                    sig=lambda d=d: doc_sig(conn, store, tpro, d))
+        if dec is not None:
+            out.append(dec)
+    return out
+
+
+def _sent_mates(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnFile], docs: list[Doc]) -> list[Decision]:
+    """Emailed pages of this load decided for good in an earlier run, judged again, so a receiving
+    label can still count their facts (pool_set_facts). Nothing is recorded here."""
+    have = {d.sha256 for d in docs}
+    out = []
+    for d in _email_docs(conn, int(row["load_id"])):
+        if d.sha256 in have:
+            continue
+        att = db.get_attachment(conn, d.sha256)
+        if att is None or att["extraction_json"] is None:
+            continue
         dec = judge(conn, s, row, load, filed, d, json.loads(att["extraction_json"]),
                     sig=lambda d=d: doc_sig(conn, store, tpro, d))
         if dec is not None:
@@ -1314,6 +1382,7 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
     pages_along = []
     set_refs = {x for g in group if not g.companion for x in g.strong}
     set_docs, set_numbers = set_marks(group)
+    rejudged: list[tuple[Decision, Decision | None]] = []
     for dec in sorted(group, key=lambda x: x.doc.order):
         if _docs_received(load):
             dec.outcome, dec.status = NOT_NEEDED, "NOT NEEDED - the load now shows Documents Received; nothing uploaded"
@@ -1322,6 +1391,11 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
             continue
         again = judge(conn, s, row, load, filed, dec.doc, json.loads(db.get_attachment(conn, dec.doc.sha256)["extraction_json"]),
                       sig=lambda d=dec.doc: doc_sig(conn, store, tpro, d))
+        rejudged.append((dec, again))
+    # The set is judged again as a set: a lead that stood on pooled facts must stand on them still.
+    pool_set_facts([a for _, a in rejudged if a is not None], row, s,
+                   more=lambda: _sent_mates(conn, store, tpro, s, row, load, filed, [g.doc for g in group]))
+    for dec, again in rejudged:
         if dec.companion:
             # Still only a page of this set, and still not on the load under a type that clears.
             if again is not None and can_join(again, set_refs, kind, s, set_docs, set_numbers):
@@ -1636,6 +1710,8 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
         read_as = dec.kind + (f" - {detail}" if detail else "")
     facts = ((f"{len(dec.facts)} fact(s): " + "; ".join(dec.facts)) if dec.facts
              else "not checked - not read in full" if ex is None else "nothing on the page matches")
+    if dec.pooled:
+        facts += " (counted with " + ", ".join(dec.pooled) + ", sent in the same email)"
     checks = ("FAILED: " + "; ".join(dec.failed)) if dec.failed else (
         "all passed" if dec.outcome in (UPLOADED, DRY) else "")
     shows_upload = dec.outcome in (UPLOADED, DRY) or (dec.outcome in (WAITING, HELD) and upload_as)
