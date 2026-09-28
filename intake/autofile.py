@@ -111,6 +111,10 @@ TEXT_BATCH_GAP_S = 180
 # first 21 uploads, 8 carried pages like that - freight and seal photos, lumper receipts, packing lists,
 # certificates of analysis, pallet lists, trailer inspection forms. Only the BOL and POD pages go up now.
 PAPER_ROLES = frozenset({"bol", "pod"})
+# ...and the packing list that travels with them (28 Sep 2026, load 2593890: Portland Bottling's BOL and
+# packing list 66448 came together, and the pod wants both on the load). It goes up only inside a BOL or
+# POD upload, never on its own; certificates of analysis, inspection forms and lumper receipts stay out.
+UPLOAD_ROLES = PAPER_ROLES | {"packing_list"}
 ROLE_WORDS = {"photo": "photo", "lumper": "lumper receipt", "weight_ticket": "scale ticket", "reefer_log": "reefer log",
               "invoice": "invoice", "rate_confirmation": "rate confirmation", "other": "other paperwork"}
 
@@ -396,13 +400,24 @@ REFERENCE_KINDS = frozenset({"bol", "master_bill", "po", "pickup", "shipment", "
 SIGN_OUT_MIN_CONFIDENCE = 0.6
 
 
-def can_join(dec: Decision, refs: set[str], kind: str, s: Settings) -> bool:
-    """Whether a BOL-read page may go up inside a set of `kind` whose pages matched `refs`.
+def can_join(dec: Decision, refs: set[str], kind: str, s: Settings, docs: frozenset[str] = frozenset(),
+             numbers: frozenset[str] = frozenset()) -> bool:
+    """Whether a page may go up inside a set of `kind` whose pages matched `refs`, carry the document
+    numbers `docs` (from their doc_ref) and the shipment numbers `numbers`.
 
-    Either it passes on its own and shares a reference number with the set, or it is a sign-out
-    side: nothing on it names a shipment, so nothing can contradict the set, and its only failed
-    checks are the facts it cannot have and a confidence the set's lead page makes up for."""
-    if dec.kind != "BOL" or dec.on_clearing or dec.ex is None:
+    A BOL-read page joins when it passes on its own and shares a reference number with the set; when it
+    is another page of a document already in the set - the same document number in its doc_ref, like
+    load 2593890's page 3 of 3, the signed page, whose only number was the BOL number TransportPro does
+    not know; or when it is a sign-out side, with nothing on it that names a shipment. In the last two
+    its only failed checks may be the facts it cannot have and a confidence the set's lead makes up for.
+    A packing list joins when it names the same shipment as the set: a number of a reference kind
+    printed on both."""
+    if dec.on_clearing or dec.ex is None:
+        return False
+    if dec.kind is None:
+        return (dec.outcome == NOT_PAPERWORK and is_packing_list(dec.ex)
+                and bool(shipment_numbers(dec.ex) & numbers))
+    if dec.kind != "BOL":
         return False
     if kind == "BOL" and dec.outcome == ON_FILE:
         return False                          # already on the load as paperwork: a BOL set adds nothing by repeating it
@@ -410,8 +425,37 @@ def can_join(dec: Decision, refs: set[str], kind: str, s: Settings) -> bool:
             and (dec.conf or 0) >= s.min_confidence and refs & set(dec.strong)):
         return True
     own = [n for n in dec.ex.numbers if n.kind in REFERENCE_KINDS]
-    return (not own and dec.why <= {"facts", "confidence"} and (dec.conf or 0) >= SIGN_OUT_MIN_CONFIDENCE
-            and dec.outcome in ("ready", HELD, ON_FILE, NOT_NEEDED))
+    lesser = (dec.why <= {"facts", "confidence"} and (dec.conf or 0) >= SIGN_OUT_MIN_CONFIDENCE
+              and dec.outcome in ("ready", HELD, ON_FILE, NOT_NEEDED))
+    return lesser and (not own or bool(doc_numbers(dec.ex) & docs))
+
+
+def _norm_ref(v) -> str:
+    return re.sub(r"[^A-Z0-9/]", "", str(v or "").upper())
+
+
+def doc_numbers(ex) -> set[str]:
+    """The document numbers the reading's doc_refs name: 'P2700C 1/3' -> 'P2700C'."""
+    return {_norm_ref(str(p.doc_ref).split()[0]) for p in (ex.pages if ex is not None else [])
+            if p.doc_ref and str(p.doc_ref).split()}
+
+
+def shipment_numbers(ex) -> set[str]:
+    """The numbers of a reference kind on the page - BOL, PO, order... - that are long enough to mean something."""
+    return {v for v in (_norm_ref(n.value) for n in (ex.numbers if ex is not None else []) if n.kind in REFERENCE_KINDS)
+            if len(v) >= 4}
+
+
+def is_packing_list(ex) -> bool:
+    return (ex is not None and ex.document_type == "shipping_document" and bool(ex.pages)
+            and all(p.role == "packing_list" for p in ex.pages))
+
+
+def set_marks(group: list[Decision]) -> tuple[frozenset[str], frozenset[str]]:
+    """(document numbers, shipment numbers) of the pages leading a set - what a page must share to join it."""
+    lead = [g for g in group if not g.companion and g.ex is not None]
+    return (frozenset(n for g in lead for n in doc_numbers(g.ex)),
+            frozenset(n for g in lead for n in shipment_numbers(g.ex)))
 
 
 def companions(conn, decisions: list[Decision], group: list[Decision], s: Settings) -> list[Decision]:
@@ -423,16 +467,21 @@ def companions(conn, decisions: list[Decision], group: list[Decision], s: Settin
     A BOL: load 2576831's pick slip came as the front, with the load number and customer PO, and the
     back, the driver's sign-out, with no reference number at all - held on its own, and the BOL is both.
     Who may join is can_join(). A second shot of a page already in - 2560031's driver texted the same
-    two pages eight times over - stays out."""
+    two pages eight times over - stays out: by its doc_ref at the upload (without_repeats_across), or,
+    for a reading from before doc_ref existed, by its picture here."""
     ids = {g.doc.sha256 for g in group}
     refs = {x for g in group for x in g.strong}
+    docs, numbers = set_marks(group)
     kind = group[0].kind
     kept = [cached_sig(conn, g.doc.sha256) or [] for g in group]
     out = []
     for dec in sorted(decisions, key=lambda x: x.doc.order):
-        if (same_sending(dec.doc, group[0].doc) and dec.doc.sha256 not in ids and can_join(dec, refs, kind, s)):
+        if (same_sending(dec.doc, group[0].doc) and dec.doc.sha256 not in ids
+                and can_join(dec, refs, kind, s, docs, numbers)):
             mine = cached_sig(conn, dec.doc.sha256) or []
-            if mine and any(sig and all(any(_diff(p, q) < SAME_PICTURE for q in sig) for p in mine) for sig in kept):
+            has_refs = dec.ex is not None and any(p.doc_ref for p in dec.ex.pages)
+            if (not has_refs and mine
+                    and any(sig and all(any(_diff(p, q) < SAME_PICTURE for q in sig) for p in mine) for sig in kept)):
                 continue
             ids.add(dec.doc.sha256)
             kept.append(mine)
@@ -968,7 +1017,7 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
     # that would go up are compared: an upload leaves a file's photos out, so they are never on the load
     # to be found, and a second copy of the same PDF would otherwise read as new and go up again.
     mine = sig()
-    keep, _ = paper_pages(ex, len(mine), kind)
+    keep, _ = paper_pages(ex, len(mine), kind, roles_up=PAPER_ROLES)
     if mine and len(keep) < len(mine):
         mine = [mine[n - 1] for n in keep]
     counts =[of for of in filed if kind == "BOL" or of.type_id in st.CLEARING_TYPES]
@@ -1264,6 +1313,7 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
     members = []
     pages_along = []
     set_refs = {x for g in group if not g.companion for x in g.strong}
+    set_docs, set_numbers = set_marks(group)
     for dec in sorted(group, key=lambda x: x.doc.order):
         if _docs_received(load):
             dec.outcome, dec.status = NOT_NEEDED, "NOT NEEDED - the load now shows Documents Received; nothing uploaded"
@@ -1274,7 +1324,7 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
                       sig=lambda d=dec.doc: doc_sig(conn, store, tpro, d))
         if dec.companion:
             # Still only a page of this set, and still not on the load under a type that clears.
-            if again is not None and can_join(again, set_refs, kind, s):
+            if again is not None and can_join(again, set_refs, kind, s, set_docs, set_numbers):
                 again.companion = True
                 pages_along.append(again)
             elif again is not None:
@@ -1294,7 +1344,9 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
     for m in members:
         m.doc.data = m.doc.data or doc_bytes(store, tpro, m.doc)
         m.pages, m.left_out = paper_pages(m.ex, page_count(m.doc.data), m.kind)
-    data, filename, content_type = upload_payload([only_pages(m.doc.data, m.pages) for m in members], kind, load_id)
+    without_repeats_across(members)
+    data, filename, content_type = upload_payload([only_pages(m.doc.data, m.pages) for m in members if m.pages],
+                                                  kind, load_id)
     comment = upload_comment(members, kind, load_id)
     # One row per upload in the sheet (24 Sep 2026): the page the upload is judged on carries it -
     # the POD's signed page, a BOL set's front - and lists every page. The others are still recorded,
@@ -1367,10 +1419,13 @@ def _kind_of(data: bytes) -> str:
     return "other"
 
 
-def paper_pages(ex, total: int, kind: str | None = None) -> tuple[list[int], list[tuple[int, str]]]:
+def paper_pages(ex, total: int, kind: str | None = None,
+                roles_up: frozenset[str] = UPLOAD_ROLES) -> tuple[list[int], list[tuple[int, str]]]:
     """(the pages of a `total`-page file that go up, [(page, role)] of the ones left out), 1-based.
 
-    A page the reading labels as anything but a BOL or a POD is left out. A page it does not label is
+    A page the reading labels as anything but a BOL, a POD or a packing list (`roles_up`) is left out.
+    Asked whether a document is on file already, the caller passes PAPER_ROLES: that question is about
+    the BOL or POD, and a packing list missing from the load does not make its BOL new. A page it does not label is
     kept: leaving out a signed page nobody classified costs more than carrying one extra page. When
     nothing would be left the reading contradicts itself, and the file stands whole - it is judged on
     what the reading says the document is.
@@ -1381,7 +1436,7 @@ def paper_pages(ex, total: int, kind: str | None = None) -> tuple[list[int], lis
     proof of delivery on it. So when a POD's pages carry no page labelled pod, only the photos go."""
     info = {p.page: p for p in (ex.pages if ex is not None else [])}
     roles = {n: p.role for n, p in info.items()}
-    keep = [n for n in range(1, total + 1) if roles.get(n) is None or roles[n] in PAPER_ROLES]
+    keep = [n for n in range(1, total + 1) if roles.get(n) is None or roles[n] in roles_up]
     if kind == "POD" and not any(roles.get(n) == "pod" for n in keep):
         keep = [n for n in range(1, total + 1) if roles.get(n) != "photo"]
     if not keep:
@@ -1403,7 +1458,7 @@ def without_repeats(pages: list[int], info: dict) -> tuple[list[int], list[int]]
     groups: dict[tuple[str, str], list[int]] = {}
     for n in pages:
         p = info.get(n)
-        ref = re.sub(r"[^A-Z0-9/]", "", str(p.doc_ref or "").upper()) if p is not None else ""
+        ref = _norm_ref(p.doc_ref) if p is not None else ""
         if ref:
             groups.setdefault((ref, p.role), []).append(n)
     drop: set[int] = set()
@@ -1412,6 +1467,31 @@ def without_repeats(pages: list[int], info: dict) -> tuple[list[int], list[int]]
             best = next((n for n in copies if info[n].signed), copies[0])
             drop.update(n for n in copies if n != best)
     return [n for n in pages if n not in drop], sorted(drop)
+
+
+def without_repeats_across(members: list[Decision]) -> None:
+    """The same, across the files of one upload: one copy of each document page. Load 2593890
+    (27 Sep 2026): pages 2 and 3 of the BOL were each photographed twice, as separate files, and page 2
+    went up twice. Changes members' pages and left_out in place; a copy the reading calls signed is
+    kept over one it does not, else the first."""
+    seen: dict[tuple[str, str], tuple[Decision, int]] = {}
+    for m in sorted(members, key=lambda x: x.doc.order):
+        info = {p.page: p for p in (m.ex.pages if m.ex is not None else [])}
+        for n in list(m.pages or []):
+            p = info.get(n)
+            key = (_norm_ref(p.doc_ref), p.role) if p is not None and p.doc_ref else None
+            if key is None:
+                continue
+            if key not in seen:
+                seen[key] = (m, n)
+                continue
+            first, fn = seen[key]
+            first_signed = bool(next((q.signed for q in first.ex.pages if q.page == fn), False))
+            loser, ln = (first, fn) if p.signed and not first_signed else (m, n)
+            loser.pages.remove(ln)
+            loser.left_out = sorted(loser.left_out + [(ln, "repeat")])
+            if loser is first:
+                seen[key] = (m, n)
 
 
 def only_pages(data: bytes, keep: list[int] | None) -> bytes:
@@ -1506,6 +1586,9 @@ def upload_comment(members: list[Decision], kind: str, load_id: int) -> str:
     pages = sum(_pages_up(m) for m in members)
     if pages > 1:
         bits.append(f"{pages} pages")
+    if any(m.pages and is_packing_list(m.ex) or m.ex is not None and m.pages
+           and any(p.role == "packing_list" and p.page in m.pages for p in m.ex.pages) for m in members):
+        bits.append("with packing list")
     if lead.refiles:
         # Every page that is a copy of a file already on the load, in page order: "copy of Driver
         # Supplied BOL 31442466 + 31442467".

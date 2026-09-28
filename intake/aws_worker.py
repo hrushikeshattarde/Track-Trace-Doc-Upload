@@ -25,9 +25,10 @@ pilot loads and POST /files/upload, the only write.
 WHY WORKING HOURS AND A CAP
 ---------------------------
 Nobody has yet said how hard TransportPro may be called, and at full cadence the load checks come
-to roughly 1,000 calls an hour. So the start is conservative - 06:00 to 20:00 Eastern, weekdays,
-at most INTAKE_LOAD_LIMIT loads per run - and both are settings, not code. Outside those hours the
-worker still records new mail, so a load that got paperwork overnight is due first thing.
+to roughly 1,000 calls an hour. So the start is conservative - 06:00 to 20:00 Eastern, every day
+(weekdays only until 28 Sep 2026), at most INTAKE_LOAD_LIMIT loads per run - and both are settings,
+not code. Outside those hours the worker still records new mail, so a load that got paperwork
+overnight is due first thing.
 """
 from __future__ import annotations
 
@@ -93,7 +94,7 @@ def handler(event: dict | None, context: Any) -> dict:
 
     now_local = local_now(env.get("INTAKE_TZ", "America/New_York"))
     active, why = working_hours(now_local, env.get("INTAKE_ACTIVE_HOURS", "06-20"),
-                                env.get("INTAKE_ACTIVE_DAYS", "mon-fri"))
+                                env.get("INTAKE_ACTIVE_DAYS", "all"))
     tpro = None
     if not active:
         steps["loads"] = f"not checked: {why}"

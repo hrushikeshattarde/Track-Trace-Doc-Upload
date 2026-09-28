@@ -2189,7 +2189,7 @@ def test_worker_run() -> None:
         check("the regular checks do not check it twice", "drain: 0 load(s) checked" in out["worker"]["check"],
               out["worker"]["check"])
 
-        clock["now"] = dt.datetime(2026, 9, 26, 10, 0, tzinfo=et)     # a Saturday
+        clock["now"] = dt.datetime(2026, 9, 26, 21, 0, tzinfo=et)     # Saturday 21:00: after hours, every day is worked
         calls_before = len(made)
         out = aws_worker.handler({}, None)
         check("outside working hours TransportPro is not called", len(made) == calls_before
@@ -2911,6 +2911,63 @@ def test_auto_upload_pod_takes_its_bol_pages_once() -> None:
           and conn.execute("SELECT final FROM autofile WHERE sha256=?", (old,)).fetchone()[0] == 0)
 
 
+def test_auto_upload_bol_takes_its_own_pages_and_packing_list() -> None:
+    """Load 2593890 (27 Sep 2026): the driver emailed Portland Bottling's BOL 66448 as photos - page 1,
+    page 2 twice, page 3 (the signed page) twice - with the 3-page packing list 66448 and photos of the
+    trailer and seal. The bot uploaded pages 1, 2 and 2 again, held page 3 because its only number was
+    the BOL number TransportPro does not know, and left the packing list out. The pod wanted every page
+    of both documents once, and only the freight and seal photos left out."""
+    print("auto-upload: a BOL takes its own pages and its packing list, once each")
+    import time as _time
+    from intake import autofile
+
+    load_id = 2600090
+
+    def num(label, value, kind):
+        return {"label": label, "kind": kind, "value": value, "handwritten": False, "confidence": 0.9}
+
+    def page(doc_type, role, ref, numbers, signed=False):
+        r = _reading(load_id, doc_type)
+        r["numbers"] = numbers
+        r["pages"] = [{"page": 1, "role": role, "legibility": 0.9, "doc_ref": ref, "signed": signed}]
+        return r
+
+    bol_no = num("Bill of Lading Number", "66448", "bol")
+    ours = [num("PO", f"PO{load_id}", "po"), num("Pickup #", f"P{load_id}", "pickup")]
+    files = [(_picture(110), page("bill_of_lading", "bol", "66448 1/3", [bol_no] + ours)),
+             (_picture(111), page("bill_of_lading", "bol", "66448 2/3", [bol_no] + ours)),
+             (_picture(112), page("bill_of_lading", "bol", "66448 2/3", [bol_no] + ours)),       # page 2 again
+             (_picture(113), page("bill_of_lading", "bol", "66448 3/3", [bol_no], signed=True)),  # only the BOL number
+             (_picture(114), page("bill_of_lading", "bol", "66448 3/3", [bol_no], signed=True)),  # page 3 again
+             (_picture(115), page("shipping_document", "packing_list", "66448 1/3", [bol_no, num("Order", "65876", "order")])),
+             (_picture(116), page("shipping_document", "packing_list", "66448 2/3", [bol_no])),
+             (_picture(117), page("shipping_document", "packing_list", "66448 3/3", [bol_no])),
+             (_picture(118), {**_reading(load_id, "photo"), "pages": [{"page": 1, "role": "photo", "legibility": 0.9}]}),
+             (_picture(119), page("shipping_document", "other", "C-9 1/1", [num("CofA", "C-9", "other")]))]
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(load_id, "bol_expected", "loaded")
+    tpro.add(load_id)
+    shas = mail(load_id, "m90", files)
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    up = tpro.uploads[0] if len(tpro.uploads) == 1 else {}
+    sig = autofile.picture_sig(up.get("data") or b"")
+    want = [_picture(n) for n in (110, 111, 113, 115, 116, 117)]
+    check("one Driver Supplied BOL: BOL pages 1-3 once each, then the packing list's 3 pages",
+          up.get("type") == "Driver Supplied BOL" and len(sig) == 6
+          and all(autofile._diff(sig[i], autofile.picture_sig(p)[0]) < autofile.SAME_PICTURE for i, p in enumerate(want)),
+          str([(u["type"], u["comment"]) for u in tpro.uploads]) + f" {len(sig)} pages")
+    check("its comment counts 6 pages and names the packing list",
+          "6 pages, with packing list" in up.get("comment", ""), up.get("comment"))
+    outcome = {sha: conn.execute("SELECT outcome FROM autofile WHERE load_id=? AND sha256=?", (load_id, sha)).fetchone()
+               for sha in shas}
+    check("the signed page 3 is uploaded, not held, and so is its second shot",
+          outcome[shas[3]][0] == "uploaded" and outcome[shas[4]][0] == "uploaded", str([outcome[x] and outcome[x][0] for x in shas]))
+    check("the trailer photo and a certificate of analysis stay out",
+          outcome[shas[8]][0] == "not_bol_pod" and outcome[shas[9]][0] == "not_bol_pod")
+
+
 def test_auto_upload_reads_a_long_file_in_pieces() -> None:
     """Loads 2571670 and 2581039 (24 Sep 2026): 27- and 17-page packets were held unread, because every
     page went to the AI in one request - 38 MB of PNG for ten pages of a CamScanner scan, which Bedrock
@@ -3320,6 +3377,7 @@ if __name__ == "__main__":
     test_auto_upload_bol_sets()
     test_auto_upload_leaves_out_pages_that_are_not_paperwork()
     test_auto_upload_pod_takes_its_bol_pages_once()
+    test_auto_upload_bol_takes_its_own_pages_and_packing_list()
     test_auto_upload_reads_a_long_file_in_pieces()
     test_auto_upload_quick_look()
     test_reader_is_brief_and_caches_the_schema()

@@ -92,7 +92,9 @@ def _worker_env(env: dict) -> dict:
             "INTAKE_LEDGER_KEY": LEDGER_KEY, "INTAKE_POD_CONFIG_KEY": POD_CONFIG_KEY,
             "INTAKE_TPRO_SECRET": TPRO_SECRET, "INTAKE_TPRO_USERNAME": env["PAYBOT_TP_USERNAME"],
             "INTAKE_TPRO_BASE_URL": env["PAYBOT_TP_BASE_URL"], "INTAKE_TZ": "America/New_York",
-            "INTAKE_ACTIVE_HOURS": "06-20", "INTAKE_ACTIVE_DAYS": "mon-fri",
+            # Every day since 28 Sep 2026: drivers load and deliver at weekends and the pod works them. Load
+            # 2572108's pickup paperwork came on Saturday evening and was not looked at until Monday 06:00.
+            "INTAKE_ACTIVE_HOURS": "06-20", "INTAKE_ACTIVE_DAYS": "all",
             # 150, raised from 100 on 23 Sep 2026: at 100 the loads due each working hour matched the
             # cap exactly, so any backlog made them late. TransportPro took 1,200 calls an hour cleanly.
             "INTAKE_LOAD_LIMIT": "150", "INTAKE_MAIL_DAYS": "7",

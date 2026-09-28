@@ -141,7 +141,7 @@ Code: [`intake/aws_worker.py`](../intake/aws_worker.py) `handler()`.
 ```mermaid
 flowchart TD
     A["1 Download the ledger from S3<br/>(daily snapshot on the first run of the UTC day)"] --> B["2 mail: record new S3 mail objects in the ledger"]
-    B --> C{"3 Working hours?<br/>Mon-Fri 06:00-20:00 Eastern"}
+    B --> C{"3 Working hours?<br/>06:00-20:00 Eastern, every day"}
     C -- no --> H["7 Upload the ledger back (If-Match)"]
     C -- yes --> D["4 Sign in to TransportPro, read the pod config"]
     D --> E["5 Sweep the dashboard, then check changed loads,<br/>then due loads (at most 150 in total)"]
@@ -186,7 +186,7 @@ If the load checks run long, auto-upload gets less time. Nothing is lost; the re
    - Mail with no load number: its kept parts are recorded as `pending` and the message goes on the
      `unresolved` list.
    - No Gmail, TransportPro or model calls.
-3. **Working-hours gate.** 06:00–20:00 `America/New_York`, Monday–Friday (`INTAKE_ACTIVE_HOURS`,
+3. **Working-hours gate.** 06:00–20:00 `America/New_York`, every day of the week (`INTAKE_ACTIVE_HOURS`,
    `INTAKE_ACTIVE_DAYS`). Outside that window the run stops after the mail step and goes straight
    to step 7, so no loads are checked and nothing is uploaded.
 4. **Set up.** Sign in to TransportPro and read `config/pod_terminals.json`. That file holds the 16
@@ -347,7 +347,7 @@ truck's stage.
 | quick look settled it: a texted BOL | on_file | no |
 | quick look settled it: anything else it set aside (a photo, not freight, other paperwork) | not_bol_pod | no |
 | personal ID on the page (licence, passport and similar) | personal_id | no, never uploaded |
-| the AI read it as `other` or `unknown`, or as anything but a BOL or POD (lumper, packing list, photo…) | not_bol_pod | no |
+| the AI read it as `other` or `unknown`, or as anything but a BOL or POD (lumper, packing list, photo…) | not_bol_pod (a packing list can still go up inside a BOL or POD upload, 6.5) | no |
 | **already on the load**: the same bytes, or the same picture page for page, under a type that counts (any paperwork type for a BOL; a clearing type for a POD). Only the file's BOL and POD pages are compared, because those are the only pages an upload carries. | on_file, or uploaded if it's the bot's own earlier upload | no (an upload: yes) |
 | **the load already has one**. For a BOL: type 12, or a Driver Supplied BOL that reads as a BOL or POD. For a POD: type 360 or 53, or type 12 with a POD comment or that reads as a POD. | not_needed | no |
 | a Driver Supplied BOL on the load isn't read yet, so there's no telling whether a BOL is there | no decision this run | – |
@@ -395,6 +395,14 @@ is the hand-off to a person.
   read yet (for example a long BOL packet still being read in pieces), the upload waits for the next
   run instead of going up without it. It does not wait for a file that is failing to read.
 - For a Costco delivery this gives one POD: the BOL pages of the email, once each, then the sticker.
+- **Other pages of the same document join it** even when they match nothing in TransportPro on their
+  own: a page whose `doc_ref` carries a document number already in the set (load 2593890's signed
+  page 3 of 3, whose only number was the BOL number).
+- **A packing list joins a BOL or POD upload** from the same sending when it shares a reference number
+  with it (page role `packing_list`). It never goes up on its own. Certificates of analysis,
+  inspection forms and lumper receipts stay out.
+- **Repeats across files go up once** (`without_repeats_across`): the same `doc_ref` and role in two
+  photos is one page, the signed copy kept.
 - Texted pages decided in an earlier run are judged again (`_batch_mates`), so page 1 can still go
   up with a page 2 that arrived later.
 
@@ -404,7 +412,8 @@ is the hand-off to a person.
    Documents Received, the page is not needed.
 2. **Judge every page again** against the fresh File History; someone may have filed it since.
 3. **Build one PDF, from the BOL and POD pages only** (`paper_pages`, `only_pages`). A page the
-   reading labels as a photo, a lumper receipt, a packing list or any other paperwork is left out,
+   reading labels as a photo, a lumper receipt, a certificate or any other paperwork is left out (a packing
+   list page is kept, since 28 Sep 2026),
    and the sheet's Document(s) column names it: `BOL.pdf (left out: page 2 photo, page 3 photo)`.
    A page the reading didn't label is kept. A POD always keeps the page with the receiver's
    evidence: if none of its kept pages is labelled `pod`, only its photos are left out. On load
@@ -477,7 +486,7 @@ object, and the same file read twice is one paid read.
 
 | Situation | What is kept | What happens next |
 |---|---|---|
-| Outside working hours or days | Mail still recorded; every load that got mail is due now | Checked from 06:00 Eastern on the next working day |
+| Outside working hours (20:00–06:00 Eastern) | Mail still recorded; every load that got mail is due now | Checked from 06:00 Eastern the next morning |
 | More loads due than the 150 cap | `next_check_at` unchanged | Oldest due first on the next run: a backlog delays a load, it never drops one |
 | TransportPro error on a load | `state=error`, next check in 60 min | Checked again; it stays in the counts so failures show as lag |
 | The day's full-sweep run | No regular checks that run | The next run checks |
@@ -709,8 +718,9 @@ production path.
 
 ## 11. Known gaps and open items (25 Sep 2026)
 
-- **Weekends and nights.** Loads are checked and uploads happen Monday–Friday, 06:00–20:00 Eastern
-  only. Mail is still collected, and those loads are due first thing on the next working day.
+- **Nights.** Loads are checked and uploads happen 06:00–20:00 Eastern, every day since 28 Sep 2026
+  (weekdays only before that). Mail is still collected overnight, and those loads are due first thing
+  in the morning.
 - **Unresolved mail isn't retried in AWS.** A message with no load number in its subject, thread or
   body waits on the `unresolved` list. Matching it by the numbers on the paper exists
   (`routing.resolve_from_paper`) but isn't wired into the Lambdas.
