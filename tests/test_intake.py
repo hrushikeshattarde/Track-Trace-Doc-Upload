@@ -335,6 +335,66 @@ def test_a_receiving_label_counts_the_facts_of_the_bol_sent_with_it() -> None:
           str((got and got[0], [u["type"] for u in tpro.uploads])))
 
 
+def test_a_pod_short_of_the_confidence_bar_goes_up_when_the_page_corroborates_it() -> None:
+    """Loads 2568382, 2565691, 2572625 and 2587025 (25-28 Sep 2026): signed or stamped PODs read at
+    78-83% and held on confidence alone, each with facts matching and the receiver's date on the
+    delivery day, and a person filed every one. From 75% such a page goes up when it carries the
+    receiver's signature or stamp, its receiver date is the delivery appointment day or the day
+    after, and two facts match, one a reference number. Any of those missing, or 74%, holds it."""
+    print("a POD short of the confidence bar goes up when the page corroborates it")
+    import time as _time
+    from intake import autofile
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+
+    check("dates as pages write them",
+          [autofile.page_date(x) for x in ("9/28/26", "9-26-26", "09/27/2026", "September 25, 2026", "2026-09-28", "", "Kendyl")]
+          == [autofile.dt.date(2026, 9, 28), autofile.dt.date(2026, 9, 26), autofile.dt.date(2026, 9, 27),
+              autofile.dt.date(2026, 9, 25), autofile.dt.date(2026, 9, 28), None, None])
+    late = {"waypoints": [{"type": "CN", "location": {"timezone": -5}, "appointmentTime": {"open": "2026-09-29T03:30:00Z"}}]}
+    check("the delivery day is the consignee's own day, not UTC's", autofile.delivery_day(late) == autofile.dt.date(2026, 9, 28))
+
+    def pod(load_id, conf=0.8, date="9/28/26", stamp=False):
+        r = _reading(load_id, "proof_of_delivery", receiver=not stamp, conf=conf)
+        r["signatures"]["receiver_date"] = date
+        if stamp:
+            r["signatures"].update({"receiver_signed": False, "receiver_name": "G QUI", "stamp_present": True})
+        r["pages"] = [{"page": 1, "role": "pod", "legibility": 0.6}]
+        return r
+
+    def world(load_id, reading, delivery="2026-09-28"):
+        conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+        log = _AutoLog()
+        load_row(load_id, "pod_expected", "at consignee")
+        tpro.add(load_id, delivery=delivery)
+        (sha,) = mail(load_id, f"m{load_id}", [(_picture(load_id % 1000), reading)])
+        autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+        got = conn.execute("SELECT outcome, status FROM autofile WHERE load_id=? AND sha256=?", (load_id, sha)).fetchone()
+        return [u["type"] for u in tpro.uploads], tuple(got) if got else None, log
+
+    ups, got, log = world(2600100, pod(2600100))
+    check("signed, dated on the delivery day, facts matching, 80%: uploaded as Bill Of Lading",
+          ups == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str((got, ups)))
+    row = next(iter(log.rows.values()))
+    check("the sheet's Checks column says why the confidence was accepted",
+          row[9].startswith("all passed (AI 80% sure, under 85% but accepted: receiver signature, dated 9/28/26 on the delivery day"),
+          row[9])
+    ups, got, _ = world(2600101, pod(2600101, stamp=True))
+    check("a receiving stamp is the receiver's evidence too", ups == ["Bill Of Lading"], str(got))
+    ups, got, _ = world(2600102, pod(2600102, date="9/29/26"))
+    check("dated the day after the appointment still counts", ups == ["Bill Of Lading"], str(got))
+    ups, got, _ = world(2600103, pod(2600103, date="9/26/26"))
+    check("dated two days before the appointment: held on confidence, as before",
+          not ups and got[0] == autofile.HELD and "AI only 80% sure" in got[1], str(got))
+    ups, got, _ = world(2600104, pod(2600104, conf=0.74))
+    check("74% is under the floor: held", not ups and got[0] == autofile.HELD, str(got))
+    ups, got, _ = world(2600105, pod(2600105, date=None))
+    check("no receiver date on the page: held", not ups and got[0] == autofile.HELD, str(got))
+    ups, got, _ = world(2600106, pod(2600106), delivery=None)
+    check("a load with no delivery appointment gives nothing to corroborate: held", not ups and got[0] == autofile.HELD, str(got))
+    ups, got, _ = world(2600107, pod(2600107, conf=0.9))
+    check("at 90% the ordinary route still applies", ups == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str(got))
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -2435,13 +2495,15 @@ def _reading(load_id: int, doc_type: str = "bill_of_lading", *, receiver: bool =
                        pages=[{"page": 1, "role": "pod" if receiver else "bol", "legibility": 0.9}])
 
 
-def _tp_auto(load_id: int, doc: str = "Waiting for Documents") -> dict:
+def _tp_auto(load_id: int, doc: str = "Waiting for Documents", delivery: str | None = None) -> dict:
+    cn = {"type": "CN", "location": {"city": "Atlanta", "timezone": -4}}
+    if delivery:
+        cn["appointmentTime"] = {"open": f"{delivery}T12:00:00Z", "close": f"{delivery}T12:00:00Z"}
     return {"id": load_id, "status": {"documentStatus": doc},
             "reference": {"pickupNumber": f"P{load_id}", "poNumber": f"PO{load_id}", "numberOfPieces": 2180,
                           "weight": 42992.2, "equipmentType": "Van or Reefer"},
             "waypoints": [{"type": "SH", "location": {"city": "Tarrs"},
-                           "reference": [{"type": "SERVICE_LEVEL", "value": "Priority / OP8"}]},
-                          {"type": "CN", "location": {"city": "Atlanta"}}]}
+                           "reference": [{"type": "SERVICE_LEVEL", "value": "Priority / OP8"}]}, cn]}
 
 
 class _AutoTPro:
@@ -2454,8 +2516,8 @@ class _AutoTPro:
         self.fail_uploads = 0
         self.calls = 0
 
-    def add(self, load_id, doc="Waiting for Documents", files=()):
-        self.loads[load_id] = {"load": _tp_auto(load_id, doc), "files": [], "bytes": {}}
+    def add(self, load_id, doc="Waiting for Documents", files=(), delivery=None):
+        self.loads[load_id] = {"load": _tp_auto(load_id, doc, delivery), "files": [], "bytes": {}}
         for f, data in files:
             self.loads[load_id]["files"].append(f)
             self.loads[load_id]["bytes"][f["id"]] = data
@@ -3508,6 +3570,7 @@ if __name__ == "__main__":
     test_costco_receiving_sticker_is_a_pod()
     test_a_facility_inspection_form_is_not_a_pod()
     test_a_receiving_label_counts_the_facts_of_the_bol_sent_with_it()
+    test_a_pod_short_of_the_confidence_bar_goes_up_when_the_page_corroborates_it()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

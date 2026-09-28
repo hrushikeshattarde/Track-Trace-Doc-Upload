@@ -369,6 +369,13 @@ truck's stage.
 | A page the AI called a POD | must show a receiver signature, stamp or delivery time |
 | A POD | needs a receiver signature or stamp. An in/out time alone isn't enough: on load 2562069 it was the truck's dashboard clock. |
 
+A POD the AI is 75% to 84% sure of is still accepted when the page corroborates the reading three
+ways (`corroborated_pod`, 28 Sep 2026): the receiver's signature or stamp is on it, the receiver's date is
+the delivery appointment day or the day after, and at least two facts match including a reference number.
+The sheet's Checks column then reads `all passed (AI 83% sure, under 85% but accepted: ...)`. Loads 2568382,
+2565691, 2572625 and 2587025 were held on confidence alone with all three present, and a person filed each.
+`INTAKE_AUTO_POD_FLOOR` moves the floor.
+
 **Matching facts** (`match_facts_detail`) compares every number on the page with the load.
 
 - Strong facts (reference numbers): load #, pickup #, PO #, reference #, manifest #, EDI reference #,

@@ -135,6 +135,7 @@ class Settings:
     terminals: frozenset[int] = frozenset()
     mode: str = OFF
     min_confidence: float = 0.85
+    pod_floor: float = 0.75       # a corroborated POD (corroborated_pod) may go up from here
     min_facts: int = 2
     daily_usd: float = 50.0      # a safety limit against a runaway, not a budget: a normal day is ~$1
     max_reads: int = 60
@@ -148,6 +149,7 @@ class Settings:
         terminals = frozenset(int(x) for x in re.split(r"[,\s]+", env.get("INTAKE_AUTO_TERMINALS") or "") if x)
         return cls(terminals=terminals, mode=mode,
                    min_confidence=float(env.get("INTAKE_AUTO_MIN_CONFIDENCE") or 0.85),
+                   pod_floor=float(env.get("INTAKE_AUTO_POD_FLOOR") or 0.75),
                    min_facts=int(env.get("INTAKE_AUTO_MIN_FACTS") or 2),
                    daily_usd=float(env.get("INTAKE_AUTO_DAILY_USD") or 50),
                    max_reads=int(env.get("INTAKE_AUTO_MAX_READS") or 60), pods=pods or {})
@@ -244,6 +246,7 @@ class Decision:
     on_clearing: bool = False     # already on the load under a type that clears
     companion: bool = False       # another page of a POD from the same email, going up with it
     pooled: list[str] = field(default_factory=list)   # the pages sent with it whose facts it counts as its own
+    allowed: list[str] = field(default_factory=list)  # checks passed by another route, e.g. a corroborated POD
     quick: str = ""               # "BOL (quick look, 95% sure)" when only the quick look saw the page
     pages: list[int] | None = None                                 # the file's pages that go up, 1-based
     left_out: list[tuple[int, str]] = field(default_factory=list)  # (page, role) of the ones that do not
@@ -1055,6 +1058,84 @@ def quick_decision(d: Doc, q: tuple[str, float]) -> Decision:
     return Decision(d, NOT_PAPERWORK, f"quick look: {kind}")
 
 
+DELIVERY_DAY_SLACK = 1        # a receiver may date the copy the day after the appointment
+
+
+def page_date(text) -> dt.date | None:
+    """A date as a page writes it - 9/28/26, 9-26-26, 09/27/2026, September 25, 2026, 2026-09-28 - or None."""
+    t = str(text or "").strip()
+    if not t:
+        return None
+    m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", t)
+    if m:
+        y, mo, d = int(m[1]), int(m[2]), int(m[3])
+    else:
+        m = re.search(r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})", t)
+        if m:
+            mo, d, y = int(m[1]), int(m[2]), int(m[3])
+            y = y + 2000 if y < 100 else y
+        else:
+            m = re.search(r"([A-Za-z]{3,9})\.? (\d{1,2}),? (\d{4})", t)
+            if not m:
+                return None
+            try:
+                return dt.datetime.strptime(f"{m[1][:3].title()} {m[2]} {m[3]}", "%b %d %Y").date()
+            except ValueError:
+                return None
+    try:
+        return dt.date(y, mo, d)
+    except ValueError:
+        return None
+
+
+def delivery_day(load: dict | None) -> dt.date | None:
+    """The consignee appointment's date, on the consignee's own clock (the stop's UTC offset)."""
+    stops = [w for w in (load or {}).get("waypoints") or [] if w.get("type") == "CN"]
+    if not stops:
+        return None
+    w = stops[-1]
+    when = (w.get("appointmentTime") or {}).get("open") or (w.get("appointmentTime") or {}).get("close")
+    if not when:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(str(when).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    try:
+        hours = float((w.get("location") or {}).get("timezone") or 0)
+    except (TypeError, ValueError):
+        hours = 0.0
+    return (t.astimezone(dt.timezone.utc) + dt.timedelta(hours=hours)).date()
+
+
+def corroborated_pod(ex, facts: list[str], strong: list[str], load: dict | None, s: Settings) -> str | None:
+    """Why a POD the AI is less than min_confidence sure of may still go up - or None.
+
+    Loads 2568382, 2565691, 2572625 and 2587025 (25-28 Sep 2026): signed or stamped PODs read at 78-83%
+    and held on confidence alone, each with facts matching and the receiver's date on the delivery day,
+    and a person filed every one. From `pod_floor` such a page is accepted when the page itself
+    corroborates the reading three ways: the receiver's signature or stamp is on it, the receiver's
+    date is the delivery appointment day (or the day after - trucks run late), and at least min_facts
+    facts match, one a reference number. A shipper's form dated at loading fails on the date; a page
+    for another load fails on the facts; a page nobody signed fails on the evidence."""
+    conf = ex.document_type_confidence
+    if conf < s.pod_floor or conf >= s.min_confidence:
+        return None
+    if not (ex.signatures.receiver_signed or ex.signatures.stamp_present):
+        return None
+    if len(facts) < s.min_facts or not strong:
+        return None
+    when, day = page_date(ex.signatures.receiver_date), delivery_day(load)
+    if when is None or day is None or not (0 <= (when - day).days <= DELIVERY_DAY_SLACK):
+        return None
+    evidence = "receiver signature" if ex.signatures.receiver_signed else "receiving stamp"
+    on = "the delivery day" if when == day else "the day after the appointment"
+    return (f"AI {conf:.0%} sure, under {s.min_confidence:.0%} but accepted: {evidence}, dated "
+            f"{ex.signatures.receiver_date} on {on}, {len(facts)} facts incl. a reference number")
+
+
 def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, reading: dict, *,
           sig: Callable[[], list]) -> Decision | None:
     """What should happen to this document on this load. Makes no TransportPro call and records
@@ -1120,8 +1201,12 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
 
     # The checks.
     if ex.document_type_confidence < s.min_confidence:
-        dec.failed.append(f"AI only {ex.document_type_confidence:.0%} sure (needs {s.min_confidence:.0%})")
-        dec.why.add("confidence")
+        allowed = corroborated_pod(ex, dec.facts, dec.strong, load, s) if kind == "POD" else None
+        if allowed:
+            dec.allowed.append(allowed)
+        else:
+            dec.failed.append(f"AI only {ex.document_type_confidence:.0%} sure (needs {s.min_confidence:.0%})")
+            dec.why.add("confidence")
     if len(dec.facts) < s.min_facts or strong < 1:
         dec.why.add("facts")
         dec.failed.append(f"{len(dec.facts)} fact(s) match TransportPro, {strong} a reference number "
@@ -1713,7 +1798,7 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
     if dec.pooled:
         facts += " (counted with " + ", ".join(dec.pooled) + ", sent in the same email)"
     checks = ("FAILED: " + "; ".join(dec.failed)) if dec.failed else (
-        "all passed" if dec.outcome in (UPLOADED, DRY) else "")
+        ("all passed" + (f" ({'; '.join(dec.allowed)})" if dec.allowed else "")) if dec.outcome in (UPLOADED, DRY) else "")
     shows_upload = dec.outcome in (UPLOADED, DRY) or (dec.outcome in (WAITING, HELD) and upload_as)
     return [db.now_iso()[:16].replace("T", " "), int(row["load_id"]), row["customer"] or "",
             s.pods.get(int(row["terminal"] or 0), str(row["terminal"] or "")), name, d.arrived, read_as,
