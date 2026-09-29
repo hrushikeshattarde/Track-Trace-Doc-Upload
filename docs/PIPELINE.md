@@ -416,6 +416,10 @@ is the hand-off to a person.
 - **Other pages of the same document join it** even when they match nothing in TransportPro on their
   own: a page whose `doc_ref` carries a document number already in the set (load 2593890's signed
   page 3 of 3, whose only number was the BOL number).
+- **A dock check-in sheet rides with a POD** (29 Sep 2026, load 2580064): the form the driver fills in
+  by hand at the receiving dock, page role `dock_sheet`, goes up inside a POD upload, whether it is a page of
+  the POD's file or a separate photo naming the same shipment (`POD_RIDERS`, `is_dock_sheet`). The printed
+  lumper receipt still stays out, and a BOL upload takes no sheet.
 - **A packing list joins a BOL or POD upload** from the same sending when it shares a reference number
   with it (page role `packing_list`). It never goes up on its own. Certificates of analysis,
   inspection forms and lumper receipts stay out.

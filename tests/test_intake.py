@@ -395,6 +395,82 @@ def test_a_pod_short_of_the_confidence_bar_goes_up_when_the_page_corroborates_it
     check("at 90% the ordinary route still applies", ups == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str(got))
 
 
+def test_a_dock_check_in_sheet_rides_with_the_pod() -> None:
+    """Load 2580064 (28 Sep 2026): the POD, the Capstone dock check-in sheet and the Capstone lumper
+    receipt came as one three-page file, and only the POD page went up. The manager wants the check-in
+    sheet filed with the POD. It now rides with a POD upload, inside the file or as a separate photo of
+    the same shipment; the printed receipt still stays out, and a BOL upload takes no sheet."""
+    print("a dock check-in sheet rides with the POD")
+    import time as _time
+    from intake import autofile
+    from pod_intake.schema import Extraction
+
+    def with_pages(reading, roles):
+        return {**reading, "pages": [{"page": i, "role": r, "legibility": 0.9} for i, r in enumerate(roles, 1)]}
+
+    ex = Extraction.model_validate(with_pages(_reading(1, "proof_of_delivery", receiver=True), ["pod", "dock_sheet", "lumper"]))
+    check("a POD keeps its dock check-in sheet and drops the lumper receipt",
+          autofile.paper_pages(ex, 3, "POD", riders=autofile.POD_RIDERS) == ([1, 2], [(3, "lumper")]),
+          str(autofile.paper_pages(ex, 3, "POD", riders=autofile.POD_RIDERS)))
+    check("the on-file question still looks at the POD page alone",
+          autofile.paper_pages(ex, 3, "POD", roles_up=autofile.PAPER_ROLES)[0] == [1])
+    ex = Extraction.model_validate(with_pages(_reading(1), ["bol", "dock_sheet"]))
+    check("a BOL upload leaves the sheet out", autofile.paper_pages(ex, 2, "BOL") == ([1], [(2, "dock_sheet")]))
+
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    # A: one three-page file - POD, check-in sheet, receipt.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2600110, "pod_expected", "at consignee")
+    tpro.add(2600110)
+    pdf = autofile.combine_pdf([_picture(110), _picture(111), _picture(112)], "Mitchell 2600110.pdf")
+    (sha,) = mail(2600110, "m110", [(pdf, with_pages(_reading(2600110, "proof_of_delivery", receiver=True), ["pod", "dock_sheet", "lumper"]))])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    up = tpro.uploads[0] if len(tpro.uploads) == 1 else {}
+    check("the POD goes up with its check-in sheet, without the receipt",
+          up.get("type") == "Bill Of Lading" and len(autofile.picture_sig(up.get("data") or b"")) == 2,
+          str([(u["type"], u["comment"]) for u in tpro.uploads]))
+    check("the comment says so", "with dock check-in sheet" in up.get("comment", ""), up.get("comment"))
+    row = log.rows.get(autofile.ref(2600110, sha)) or [""] * 14
+    check("the sheet names only the receipt as left out", row[4].endswith("(left out: page 3 lumper receipt)"), row[4])
+
+    # B: the sheet photographed on its own, in the same email, naming the same PO.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2600111, "pod_expected", "at consignee")
+    tpro.add(2600111)
+    pod = _reading(2600111, "proof_of_delivery", receiver=True)
+    pod["numbers"][1]["kind"] = "po"
+    sheet = _reading(2600111, "lumper", numbers=[("PO #", "PO2600111")], city=None)
+    sheet["numbers"][0]["kind"] = "po"
+    sheet["pages"] = [{"page": 1, "role": "dock_sheet", "legibility": 0.8, "signed": True}]
+    p_sha, s_sha = mail(2600111, "m111", [(_picture(113), pod), (_picture(114), sheet)])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    up = tpro.uploads[0] if len(tpro.uploads) == 1 else {}
+    outcome = {r[0]: r[1] for r in conn.execute("SELECT sha256, outcome FROM autofile WHERE load_id=2600111")}
+    check("a separate check-in sheet joins the POD it was sent with",
+          up.get("type") == "Bill Of Lading" and len(autofile.picture_sig(up.get("data") or b"")) == 2
+          and outcome.get(s_sha) == autofile.UPLOADED, str((outcome, [(u["type"], u["comment"]) for u in tpro.uploads])))
+
+    # C: the same sheet beside a BOL: it stays out, and never goes up alone.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2600112, "bol_expected", "loaded")
+    tpro.add(2600112)
+    bol = _reading(2600112)
+    bol["numbers"][1]["kind"] = "po"
+    sheet = _reading(2600112, "lumper", numbers=[("PO #", "PO2600112")], city=None)
+    sheet["numbers"][0]["kind"] = "po"
+    sheet["pages"] = [{"page": 1, "role": "dock_sheet", "legibility": 0.8, "signed": True}]
+    b_sha, s_sha = mail(2600112, "m112", [(_picture(115), bol), (_picture(116), sheet)])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    outcome = {r[0]: r[1] for r in conn.execute("SELECT sha256, outcome FROM autofile WHERE load_id=2600112")}
+    check("beside a BOL the sheet stays out and does not go up on its own",
+          [u["type"] for u in tpro.uploads] == ["Driver Supplied BOL"]
+          and len(autofile.picture_sig(tpro.uploads[0]["data"])) == 1 and outcome.get(s_sha) == autofile.NOT_PAPERWORK,
+          str((outcome, [(u["type"], u["comment"]) for u in tpro.uploads])))
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -3571,6 +3647,7 @@ if __name__ == "__main__":
     test_a_facility_inspection_form_is_not_a_pod()
     test_a_receiving_label_counts_the_facts_of_the_bol_sent_with_it()
     test_a_pod_short_of_the_confidence_bar_goes_up_when_the_page_corroborates_it()
+    test_a_dock_check_in_sheet_rides_with_the_pod()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

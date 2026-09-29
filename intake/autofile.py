@@ -115,7 +115,12 @@ PAPER_ROLES = frozenset({"bol", "pod"})
 # packing list 66448 came together, and the pod wants both on the load). It goes up only inside a BOL or
 # POD upload, never on its own; certificates of analysis, inspection forms and lumper receipts stay out.
 UPLOAD_ROLES = PAPER_ROLES | {"packing_list"}
-ROLE_WORDS = {"photo": "photo", "lumper": "lumper receipt", "weight_ticket": "scale ticket", "reefer_log": "reefer log",
+# ...and, with a POD only, the dock check-in sheet the driver filled in at the receiving dock (29 Sep 2026,
+# load 2580064: the manager wants the Capstone check-in sheet filed with the POD; the printed lumper
+# receipt still stays out, the pod files those under Lumper). Never with a BOL, never on its own.
+POD_RIDERS = frozenset({"dock_sheet"})
+ROLE_WORDS = {"photo": "photo", "lumper": "lumper receipt", "dock_sheet": "dock check-in sheet",
+              "weight_ticket": "scale ticket", "reefer_log": "reefer log",
               "invoice": "invoice", "rate_confirmation": "rate confirmation", "other": "other paperwork"}
 
 # Outcomes. The last three are never logged: not paperwork, personal ID, or unreadable.
@@ -420,8 +425,8 @@ def can_join(dec: Decision, refs: set[str], kind: str, s: Settings, docs: frozen
     if dec.on_clearing or dec.ex is None:
         return False
     if dec.kind is None:
-        return (dec.outcome == NOT_PAPERWORK and is_packing_list(dec.ex)
-                and bool(shipment_numbers(dec.ex) & numbers))
+        return (dec.outcome == NOT_PAPERWORK and bool(shipment_numbers(dec.ex) & numbers)
+                and (is_packing_list(dec.ex) or (kind == "POD" and is_dock_sheet(dec.ex))))
     if dec.kind != "BOL":
         # A page typed as a POD claim for its in/out times alone - load 2580410's Sojo BOL, whose
         # Opendocks block the reader put at the consignee - is a page of the POD it was sent with
@@ -459,6 +464,11 @@ def shipment_numbers(ex) -> set[str]:
 def is_packing_list(ex) -> bool:
     return (ex is not None and ex.document_type == "shipping_document" and bool(ex.pages)
             and all(p.role == "packing_list" for p in ex.pages))
+
+
+def is_dock_sheet(ex) -> bool:
+    """A file that is only the driver's dock check-in sheet (POD_RIDERS)."""
+    return ex is not None and bool(ex.pages) and all(p.role == "dock_sheet" for p in ex.pages)
 
 
 def set_marks(group: list[Decision]) -> tuple[frozenset[str], frozenset[str]]:
@@ -1502,7 +1512,8 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
     members = sorted(members + pages_along, key=lambda x: x.doc.order)
     for m in members:
         m.doc.data = m.doc.data or doc_bytes(store, tpro, m.doc)
-        m.pages, m.left_out = paper_pages(m.ex, page_count(m.doc.data), m.kind)
+        m.pages, m.left_out = paper_pages(m.ex, page_count(m.doc.data), m.kind,
+                                          riders=POD_RIDERS if kind == "POD" else frozenset())
     without_repeats_across(members)
     data, filename, content_type = upload_payload([only_pages(m.doc.data, m.pages) for m in members if m.pages],
                                                   kind, load_id)
@@ -1579,10 +1590,13 @@ def _kind_of(data: bytes) -> str:
 
 
 def paper_pages(ex, total: int, kind: str | None = None,
-                roles_up: frozenset[str] = UPLOAD_ROLES) -> tuple[list[int], list[tuple[int, str]]]:
+                roles_up: frozenset[str] = UPLOAD_ROLES,
+                riders: frozenset[str] = frozenset()) -> tuple[list[int], list[tuple[int, str]]]:
     """(the pages of a `total`-page file that go up, [(page, role)] of the ones left out), 1-based.
 
     A page the reading labels as anything but a BOL, a POD or a packing list (`roles_up`) is left out.
+    `riders` are the roles that go up with this upload besides: POD_RIDERS, the dock check-in sheet,
+    when the upload is a POD (load 2580064). The on-file question passes none.
     Asked whether a document is on file already, the caller passes PAPER_ROLES: that question is about
     the BOL or POD, and a packing list missing from the load does not make its BOL new. A page it does not label is
     kept: leaving out a signed page nobody classified costs more than carrying one extra page. When
@@ -1595,6 +1609,7 @@ def paper_pages(ex, total: int, kind: str | None = None,
     proof of delivery on it. So when a POD's pages carry no page labelled pod, only the photos go."""
     info = {p.page: p for p in (ex.pages if ex is not None else [])}
     roles = {n: p.role for n, p in info.items()}
+    roles_up = roles_up | riders
     keep = [n for n in range(1, total + 1) if roles.get(n) is None or roles[n] in roles_up]
     if kind == "POD" and not any(roles.get(n) == "pod" for n in keep):
         keep = [n for n in range(1, total + 1) if roles.get(n) != "photo"]
@@ -1748,6 +1763,9 @@ def upload_comment(members: list[Decision], kind: str, load_id: int) -> str:
     if any(m.pages and is_packing_list(m.ex) or m.ex is not None and m.pages
            and any(p.role == "packing_list" and p.page in m.pages for p in m.ex.pages) for m in members):
         bits.append("with packing list")
+    if any(m.ex is not None and m.pages and any(p.role == "dock_sheet" and p.page in m.pages for p in m.ex.pages)
+           for m in members):
+        bits.append("with dock check-in sheet")
     if lead.refiles:
         # Every page that is a copy of a file already on the load, in page order: "copy of Driver
         # Supplied BOL 31442466 + 31442467".

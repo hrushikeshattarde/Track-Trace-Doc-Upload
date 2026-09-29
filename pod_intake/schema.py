@@ -99,8 +99,8 @@ class PhotoStamp(BaseModel):
 
 class PageInfo(BaseModel):
     page: int
-    role: Literal["bol", "pod", "lumper", "weight_ticket", "reefer_log", "invoice", "rate_confirmation", "photo",
-                  "packing_list", "other"]
+    role: Literal["bol", "pod", "lumper", "dock_sheet", "weight_ticket", "reefer_log", "invoice", "rate_confirmation",
+                  "photo", "packing_list", "other"]
     legibility: float = Field(ge=0, le=1, description="1 = crisp and fully readable, 0 = unreadable.")
     # Which document page this is, so the same page scanned several times into one file is known to be
     # one page (load 2571670, 25 Sep 2026: three one-page BOLs scanned nine times over). A picture
