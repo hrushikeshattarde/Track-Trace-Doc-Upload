@@ -696,23 +696,22 @@ def test_usps_paperwork_matches_on_route_trip_and_facility() -> None:
 
 
 def test_the_morning_report() -> None:
-    """30 Sep 2026: the pods' leads get a mail at 07:00 Eastern listing the loads the bot did not file
-    in the last day - one line per load - and the delivered loads still waiting for documents with no
-    POD of the bot's. Nothing in the ledger is written."""
+    """30 Sep 2026: the pods' leads get a mail at 07:00 Eastern listing the loads the bot did not
+    upload in the last day - the sheet's HELD rows, one line per load - and nothing else. Nothing in
+    the ledger is written."""
     print("the morning report")
     import datetime as _dt
     from intake import report
     conn = fresh_db()
     now = _dt.datetime(2026, 9, 30, 11, 0, tzinfo=_dt.timezone.utc)      # 07:00 ET
     fresh, old = "2026-09-30T10:12:00+00:00", "2026-09-28T10:12:00+00:00"
-    for load_id, terminal, customer, stage, doc_status in (
-            (2597516, 1138, "TireHub c/o Penske Logistics (FTL)", "delivered", "Waiting for Documents"),
-            (2600101, 1138, "United States Postal Service", "loaded", "Waiting for Documents"),
-            (2585966, 1160, "Spindrift Beverage Co Inc. c/o Shipwell", "delivered", "Documents Received"),
-            (2571093, 1160, "Spindrift Beverage Co Inc. c/o Shipwell", "delivered", "Waiting for Documents"),
-            (2599999, 1075, "Somebody else's pod", "delivered", "Waiting for Documents")):
+    for load_id, terminal, customer in ((2597516, 1138, "TireHub c/o Penske Logistics (FTL)"),
+                                        (2600101, 1138, "United States Postal Service"),
+                                        (2585966, 1160, "Spindrift Beverage Co Inc. c/o Shipwell"),
+                                        (2599999, 1075, "Somebody else's pod")):
         conn.execute("INSERT INTO load (load_id, state, stage, terminal, customer, doc_status, in_view, last_checked_at, next_check_at, source) "
-                     "VALUES (?,?,?,?,?,?,1,?,?,'dashboard')", (load_id, "wrong_doc_type", stage, terminal, customer, doc_status, fresh, fresh))
+                     "VALUES (?,?,?,?,?,?,1,?,?,'dashboard')", (load_id, "wrong_doc_type", "delivered", terminal, customer, "Waiting for Documents", fresh, fresh))
+
     def held(load_id, sha, status, when, pod, customer):
         row = ["2026-09-30 06:12", load_id, customer, pod, f"{sha}.pdf", "Text", "POD", "92%", "", "", "", "", "", status]
         conn.execute("INSERT INTO autofile (load_id, sha256, source, outcome, final, status, row_json, logged, attempts, decided_at) "
@@ -721,11 +720,18 @@ def test_the_morning_report() -> None:
         held(2597516, f"a{i}", "HELD - 2 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number); not uploaded, a person should look", fresh, "Jesse Klingler", "TireHub c/o Penske Logistics (FTL)")
     held(2600101, "b0", "HELD - AI only 78% sure (needs 85%); 0 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number); not uploaded, a person should look", fresh, "Jesse Klingler", "United States Postal Service")
     held(2585966, "c0", "HELD - AI only 60% sure (needs 85%); not uploaded, a person should look", old, "Frankie Saiz", "Spindrift Beverage Co Inc. c/o Shipwell")
-    conn.execute("INSERT INTO filing (load_id, sha256, tpro_file_id, document_type, comment, filed_at) VALUES (2585966, 'x', '1', 'Bill Of Lading', 'POD', ?)", (fresh,))
+    held(2599999, "d0", "HELD - AI only 60% sure (needs 85%); not uploaded, a person should look", fresh, "Other", "Somebody else's pod")
     conn.commit()
     rep = report.build(conn, now=now, terminals={1160, 1138}, pods={1160: "Frankie Saiz", 1138: "Jesse Klingler"}, sheet_id="SHEET")
-    check("the subject counts loads held and loads waiting, dated in Eastern",
-          rep.subject == "Doc Intake: 2 load(s) held, 2 delivered and waiting - 2026-09-30", rep.subject)
+    check("the subject counts the loads, dated in Eastern", rep.subject == "Doc Intake: 2 load(s) the bot did not upload - 2026-09-30", rep.subject)
+    check("one line per held load, documents counted, the reason in the bot's words without its wrapping",
+          "2597516  (Jesse Klingler, TireHub c/o Penske Logistics (FTL)): 3 documents held - 2 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number)" in rep.text
+          and "2600101  (Jesse Klingler, United States Postal Service): 1 document held - AI only 78% sure (needs 85%); 0 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number)" in rep.text,
+          rep.text)
+    check("a hold older than the window, and another pod's, are left out", "2585966" not in rep.text and "2599999" not in rep.text, rep.text)
+    check("nothing but the held loads: no waiting-for-documents section", "WAITING" not in rep.text.upper().replace("WAITING FOR DOCUMENTS", "") and "DELIVERED" not in rep.text, rep.text)
+    check("the sheet is linked and the times are called Eastern", "spreadsheets/d/SHEET" in rep.text and "Times are US Eastern" in rep.text)
+    check("the counts are on the report", (rep.held_loads, rep.held_documents) == (2, 4))
     # The sheet is what the pods see: a row rewritten by hand or removed drops out, a mark shows.
     on_sheet = {"2597516-a0": ("UPLOADED 2026-09-30 14:11 ET as Bill Of Lading, by hand", ""),
                 "2597516-a1": ("HELD - 2 fact(s) match", "No - Other (see notes)"), "2600101-b0": ("HELD - AI only 78% sure", "")}
@@ -734,23 +740,6 @@ def test_the_morning_report() -> None:
           fol.resolved == 2 and fol.held_documents == 2 and "(2 held document(s) since filed or cleared by a person are not listed)" in fol.text, str((fol.resolved, fol.held_documents)))
     check("a row the pod has marked shows the mark",
           "2597516  (Jesse Klingler, TireHub c/o Penske Logistics (FTL)): 1 document held - 2 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number) (reviewed by the pod: No - Other (see notes))" in fol.text, fol.text)
-    # A POD filed by anybody takes a load off the waiting list, whatever TransportPro still says.
-    conn.execute("INSERT INTO tpro_file (tpro_file_id, load_id, filename, file_type_id, file_type_name, comments, date_created, seen_at) "
-                 "VALUES (99, 2571093, '99_12.pdf', 12, 'Bill Of Lading', 'Bill Of Lading filed by jesse.klingler', ?, ?)", (fresh, fresh))
-    conn.commit()
-    pod_filed = report.build(conn, now=now, terminals={1160, 1138}, pods={1160: "Frankie Saiz", 1138: "Jesse Klingler"})
-    check("a delivered load with a POD file on it, filed by the pod, is not reported", "2571093" not in pod_filed.text and pod_filed.waiting_loads == 1, pod_filed.text)
-    check("one line per held load, documents counted, the reason in the bot's words without its wrapping",
-          "2597516  (Jesse Klingler, TireHub c/o Penske Logistics (FTL)): 3 documents held - 2 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number)" in rep.text
-          and "2600101  (Jesse Klingler, United States Postal Service): 1 document held - AI only 78% sure (needs 85%); 0 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number)" in rep.text,
-          rep.text)
-    check("a hold older than the window is left out", "2585966  (" not in rep.text.split("DELIVERED")[0])
-    check("delivered loads still waiting with no POD from the bot are listed, other pods' and filed ones are not",
-          f"2571093  (Frankie Saiz, {report._short('Spindrift Beverage Co Inc. c/o Shipwell')}): delivered, still Waiting for Documents - no POD on the load" in rep.text
-          and "2597516  (Jesse Klingler, TireHub c/o Penske Logistics (FTL)): delivered, still Waiting for Documents - held above" in rep.text
-          and "2599999" not in rep.text and "2585966" not in rep.text.split("DELIVERED")[1], rep.text)
-    check("the sheet is linked and the times are called Eastern", "spreadsheets/d/SHEET" in rep.text and "Times are US Eastern" in rep.text)
-    check("the counts are on the report", (rep.held_loads, rep.held_documents, rep.waiting_loads) == (2, 4, 2))
     quiet = report.build(fresh_db(), now=now, terminals={1160}, pods={})
     check("a quiet day says so", quiet.empty and quiet.subject == "Doc Intake: nothing held - 2026-09-30" and "  none" in quiet.text, quiet.subject)
 

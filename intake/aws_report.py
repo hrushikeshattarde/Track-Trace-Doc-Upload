@@ -67,7 +67,7 @@ def handler(event: dict | None, context: Any) -> dict:
     else:
         print(rep.text)
     summary = {"report": {"subject": rep.subject, "held_loads": rep.held_loads, "held_documents": rep.held_documents,
-                          "resolved_by_a_person": rep.resolved, "waiting_loads": rep.waiting_loads,
-                          "sheet_read": sheet_status is not None, "to": to, "sent": sent, "message_id": message_id}}
+                          "resolved_by_a_person": rep.resolved, "sheet_read": sheet_status is not None,
+                          "to": to, "sent": sent, "message_id": message_id}}
     print(json.dumps(summary))
     return summary
