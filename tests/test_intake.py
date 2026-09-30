@@ -726,13 +726,27 @@ def test_the_morning_report() -> None:
     rep = report.build(conn, now=now, terminals={1160, 1138}, pods={1160: "Frankie Saiz", 1138: "Jesse Klingler"}, sheet_id="SHEET")
     check("the subject counts loads held and loads waiting, dated in Eastern",
           rep.subject == "Doc Intake: 2 load(s) held, 2 delivered and waiting - 2026-09-30", rep.subject)
+    # The sheet is what the pods see: a row rewritten by hand or removed drops out, a mark shows.
+    on_sheet = {"2597516-a0": ("UPLOADED 2026-09-30 14:11 ET as Bill Of Lading, by hand", ""),
+                "2597516-a1": ("HELD - 2 fact(s) match", "No - Other (see notes)"), "2600101-b0": ("HELD - AI only 78% sure", "")}
+    fol = report.build(conn, now=now, terminals={1160, 1138}, pods={1160: "Frankie Saiz", 1138: "Jesse Klingler"}, sheet_status=on_sheet)
+    check("a held document filed by hand, or whose row was removed, is left out and counted",
+          fol.resolved == 2 and fol.held_documents == 2 and "(2 held document(s) since filed or cleared by a person are not listed)" in fol.text, str((fol.resolved, fol.held_documents)))
+    check("a row the pod has marked shows the mark",
+          "2597516  (Jesse Klingler, TireHub c/o Penske Logistics (FTL)): 1 document held - 2 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number) (reviewed by the pod: No - Other (see notes))" in fol.text, fol.text)
+    # A POD filed by anybody takes a load off the waiting list, whatever TransportPro still says.
+    conn.execute("INSERT INTO tpro_file (tpro_file_id, load_id, filename, file_type_id, file_type_name, comments, date_created, seen_at) "
+                 "VALUES (99, 2571093, '99_12.pdf', 12, 'Bill Of Lading', 'Bill Of Lading filed by jesse.klingler', ?, ?)", (fresh, fresh))
+    conn.commit()
+    pod_filed = report.build(conn, now=now, terminals={1160, 1138}, pods={1160: "Frankie Saiz", 1138: "Jesse Klingler"})
+    check("a delivered load with a POD file on it, filed by the pod, is not reported", "2571093" not in pod_filed.text and pod_filed.waiting_loads == 1, pod_filed.text)
     check("one line per held load, documents counted, the reason in the bot's words without its wrapping",
           "2597516  (Jesse Klingler, TireHub c/o Penske Logistics (FTL)): 3 documents held - 2 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number)" in rep.text
           and "2600101  (Jesse Klingler, United States Postal Service): 1 document held - AI only 78% sure (needs 85%); 0 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number)" in rep.text,
           rep.text)
     check("a hold older than the window is left out", "2585966  (" not in rep.text.split("DELIVERED")[0])
     check("delivered loads still waiting with no POD from the bot are listed, other pods' and filed ones are not",
-          f"2571093  (Frankie Saiz, {report._short('Spindrift Beverage Co Inc. c/o Shipwell')}): delivered, still Waiting for Documents - nothing from the bot" in rep.text
+          f"2571093  (Frankie Saiz, {report._short('Spindrift Beverage Co Inc. c/o Shipwell')}): delivered, still Waiting for Documents - no POD on the load" in rep.text
           and "2597516  (Jesse Klingler, TireHub c/o Penske Logistics (FTL)): delivered, still Waiting for Documents - held above" in rep.text
           and "2599999" not in rep.text and "2585966" not in rep.text.split("DELIVERED")[1], rep.text)
     check("the sheet is linked and the times are called Eastern", "spreadsheets/d/SHEET" in rep.text and "Times are US Eastern" in rep.text)

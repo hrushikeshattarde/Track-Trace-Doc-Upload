@@ -126,7 +126,8 @@ def _report_env(env: dict) -> dict:
     return {"INTAKE_S3_BUCKET": env["INTAKE_S3_BUCKET"], "INTAKE_LEDGER_KEY": LEDGER_KEY,
             "INTAKE_POD_CONFIG_KEY": POD_CONFIG_KEY, "INTAKE_AUTO_TERMINALS": AUTO_TERMINALS,
             "INTAKE_REPORT_FROM": REPORT_FROM, "INTAKE_REPORT_TO": env.get("INTAKE_REPORT_TO", ""),
-            "INTAKE_REPORT_HOURS": "24", "INTAKE_UPLOAD_SHEET_ID": env["INTAKE_UPLOAD_SHEET_ID"]}
+            "INTAKE_REPORT_HOURS": "24", "INTAKE_UPLOAD_SHEET_ID": env["INTAKE_UPLOAD_SHEET_ID"],
+            "INTAKE_GMAIL_SECRET": GMAIL_SECRET}
 
 
 def _report_policy(b: str, secret_arns: list[str], region: str, account: str) -> dict:
@@ -135,6 +136,7 @@ def _report_policy(b: str, secret_arns: list[str], region: str, account: str) ->
         {"Sid": "ReadLedgerAndConfig", "Effect": "Allow", "Action": "s3:GetObject",
          "Resource": [f"{b}/ledger/*", f"{b}/config/*"]},
         {"Sid": "TellMissingFromForbidden", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": b},
+        {"Sid": "SheetKey", "Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": secret_arns},
         {"Sid": "SendTheReport", "Effect": "Allow", "Action": ["ses:SendEmail", "ses:SendRawEmail"],
          "Resource": [f"arn:aws:ses:{region}:{account}:identity/{domain}",
                       f"arn:aws:ses:{region}:{account}:identity/{REPORT_FROM}"]}]}
@@ -185,7 +187,7 @@ FUNCS = {
     "report": {
         "name": "circle-doc-intake-report", "schedule": "circle-doc-intake-report-daily",
         "expression": "cron(0 7 * * ? *)", "timezone": "America/New_York",
-        "handler": "intake.aws_report.handler", "memory": 512, "secrets": lambda env: [],
+        "handler": "intake.aws_report.handler", "memory": 512, "secrets": lambda env: [GMAIL_SECRET],
         "env": _report_env, "policy": _report_policy, "log_filter": '"report"',
         "description": "Every morning at 07:00 Eastern: the loads the bot did not file in the last day, "
                        "mailed to the pods' leads from DocIntake@circle-analytics.com."},

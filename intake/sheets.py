@@ -125,6 +125,24 @@ class UploadLog:
                         "properties": {"pixelSize": int(w)}, "fields": "pixelSize"}})
             self._call("POST", ":batchUpdate", {"requests": requests})
 
+    def pod_tabs(self) -> list[str]:
+        """Every tab named like the log: 'Upload Log - Saiz', 'Upload Log - Klinger', ..."""
+        stem = TAB.split(" - ")[0].strip().lower()
+        meta = self._call("GET", "?fields=sheets.properties")
+        return [str((s.get("properties") or {}).get("title") or "") for s in meta.get("sheets", [])
+                if str((s.get("properties") or {}).get("title") or "").strip().lower().startswith(stem)]
+
+    def statuses(self) -> dict[str, tuple[str, str]]:
+        """Ref -> (Status, Correct?) across the pod tabs: what the pods see now. A row a person has
+        changed or removed is theirs; the morning report (intake/report.py) follows the sheet."""
+        out: dict[str, tuple[str, str]] = {}
+        for tab in self.pod_tabs():
+            for row in self._call("GET", f"/values/{self._a1_of(tab, 'N:Q')}").get("values", [])[1:]:
+                row = row + [""] * (4 - len(row))
+                if row[3]:
+                    out[str(row[3])] = (str(row[0]), str(row[1]))
+        return out
+
     def _a1_of(self, tab: str, cells: str) -> str:
         return urllib.parse.quote(f"'{tab}'!{cells}")
 
