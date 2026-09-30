@@ -1744,12 +1744,30 @@ def without_repeats_across(members: list[Decision]) -> None:
                 seen[key] = (m, n)
                 continue
             first, fn = seen[key]
+            if not same_page_by_numbers(first.ex, m.ex, p.doc_ref):
+                # One doc_ref, two documents: load 2600102 (30 Sep 2026), a USPS Vehicle Record and an
+                # Extra Trip Authorization for the same route and trip. Their other numbers disagree, so
+                # they are not two copies of one page and both go up.
+                continue
             first_signed = bool(next((q.signed for q in first.ex.pages if q.page == fn), False))
             loser, ln = (first, fn) if p.signed and not first_signed else (m, n)
             loser.pages.remove(ln)
             loser.left_out = sorted(loser.left_out + [(ln, "repeat")])
             if loser is first:
                 seen[key] = (m, n)
+
+
+def same_page_by_numbers(a, b, doc_ref: str | None) -> bool:
+    """Whether two files that read the same doc_ref hold the same page. Two scans of one page carry
+    the same other numbers - the van, the seal, the barcode; two forms for one trip do not. When
+    either reading has no number beyond the document number, the doc_ref alone decides, as before."""
+    ref = {t for t in re.split(r"[^A-Z0-9]+", str(doc_ref or "").upper()) if t}
+    def others(ex) -> set[str]:
+        return {v for v in (_norm_ref(n.value) for n in (ex.numbers if ex is not None else [])) if v and v not in ref}
+    oa, ob = others(a), others(b)
+    if not oa or not ob:
+        return True
+    return bool(oa & ob)
 
 
 def only_pages(data: bytes, keep: list[int] | None) -> bytes:

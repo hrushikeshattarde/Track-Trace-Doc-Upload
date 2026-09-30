@@ -432,7 +432,8 @@ is the hand-off to a person.
   with it (page role `packing_list`). It never goes up on its own. Certificates of analysis,
   inspection forms and lumper receipts stay out.
 - **Repeats across files go up once** (`without_repeats_across`): the same `doc_ref` and role in two
-  photos is one page, the signed copy kept.
+  photos is one page, the signed copy kept - provided their other numbers agree (`same_page_by_numbers`,
+  30 Sep 2026: two USPS forms for one trip shared a doc_ref and one was dropped as a repeat).
 - Texted pages decided in an earlier run are judged again (`_batch_mates`), so page 1 can still go
   up with a page 2 that arrived later.
 

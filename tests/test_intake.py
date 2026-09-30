@@ -744,6 +744,42 @@ def test_the_morning_report() -> None:
     check("a quiet day says so", quiet.empty and quiet.subject == "Doc Intake: nothing held - 2026-09-30" and "  none" in quiet.text, quiet.subject)
 
 
+def test_two_usps_forms_for_one_trip_are_two_pages() -> None:
+    """Load 2600102 (30 Sep 2026): the carrier emailed the Contract Route Vehicle Record and the Extra
+    Trip Authorization for the same route and trip as two files. Both read as the BOL and both were
+    given doc_ref "002D7-2A8BB 1/1", so the cross-file repeat rule took the second for a copy of the
+    first and filed one page - the authorization, not the Vehicle Record. Two files with one doc_ref
+    are one page only when their other numbers agree; and the reader now names the form in the doc_ref."""
+    print("two USPS forms for one trip are two pages")
+    from intake import autofile
+    from pod_intake import reader
+    from pod_intake.schema import Extraction
+
+    check("the reader names the form in a USPS doc_ref", '"5398A-<route>-<trip> 1/1"' in reader.READER_SYSTEM and "5397-A" in reader.READER_SYSTEM)
+
+    def member(order, numbers, doc_ref="002D7-2A8BB 1/1", signed=True):
+        r = _reading(2600102, numbers=numbers, city=None)
+        r["pages"] = [{"page": 1, "role": "bol", "legibility": 0.8, "doc_ref": doc_ref, "signed": signed}]
+        d = autofile.Doc(f"sha{order}", f"f{order}.pdf", "email:m", "Email", message_id="m", order=order, batch="email:m")
+        dec = autofile.Decision(d, "ready", kind="BOL", ex=Extraction.model_validate(r))
+        dec.pages, dec.left_out = [1], []
+        return dec
+
+    record = member(1, [("Route No.", "002D7"), ("Trip", "2A8BB"), ("Van No.", "265306795"), ("Seal Number(s)", "009268396")])
+    extra = member(2, [("1. Contract Route No.", "002D7"), ("14. Outbound Trip No.", "2A8BB"), ("8. Trailer-Truck No.", "265306798")])
+    autofile.without_repeats_across([record, extra])
+    check("one doc_ref, different other numbers: both pages go up", record.pages == [1] and extra.pages == [1], str((record.pages, extra.pages, extra.left_out)))
+    again = member(2, [("Route No.", "002D7"), ("Trip", "2A8BB"), ("Van No.", "265306795"), ("Seal Number(s)", "009268396")])
+    rec2 = member(1, [("Route No.", "002D7"), ("Trip", "2A8BB"), ("Van No.", "265306795"), ("Seal Number(s)", "009268396")])
+    autofile.without_repeats_across([rec2, again])
+    check("the same numbers: a repeat, as before", rec2.pages == [1] and again.pages == [] and again.left_out == [(1, "repeat")], str((rec2.pages, again.pages)))
+    bare = member(2, [("BOL", "2249892")], doc_ref="2249892 2/3")
+    bare1 = member(1, [("BOL", "2249892")], doc_ref="2249892 2/3")
+    autofile.without_repeats_across([bare1, bare])
+    check("with nothing beyond the document number the doc_ref alone decides, as before", bare1.pages == [1] and bare.pages == [])
+    check("and distinct doc_refs never collide", autofile.same_page_by_numbers(record.ex, extra.ex, "5398A-002D7-2A8BB 1/1") is False)
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -3928,6 +3964,7 @@ if __name__ == "__main__":
     test_sheet_times_are_eastern()
     test_usps_paperwork_matches_on_route_trip_and_facility()
     test_the_morning_report()
+    test_two_usps_forms_for_one_trip_are_two_pages()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()
