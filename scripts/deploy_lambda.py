@@ -550,9 +550,13 @@ def cmd_schedule(args) -> int:
     sch = _aws().client("scheduler")
     cur = sch.get_schedule(Name=name)
     state = "ENABLED" if args.state == "on" else "DISABLED"
+    # update_schedule replaces the whole schedule: carry the timezone, or a cron in America/New_York
+    # comes back as UTC (the report schedule, 30 Sep 2026).
+    tz = cur.get("ScheduleExpressionTimezone") or FUNCS[args.target].get("timezone")
     sch.update_schedule(Name=name, ScheduleExpression=cur["ScheduleExpression"],
                         FlexibleTimeWindow=cur["FlexibleTimeWindow"], Target=cur["Target"],
-                        Description=cur.get("Description", ""), State=state)
+                        Description=cur.get("Description", ""), State=state,
+                        **({"ScheduleExpressionTimezone": tz} if tz else {}))
     print(f"schedule {name}: {state}")
     return 0
 
