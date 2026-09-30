@@ -20,7 +20,7 @@ from typing import Any, Callable
 SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 API = "https://sheets.googleapis.com/v4/spreadsheets"
 TAB = "Upload log"
-COLUMNS = ["Logged (UTC)", "Load", "Customer", "Pod", "Document(s)", "Arrived by", "AI read it as", "How sure",
+COLUMNS = ["Logged (ET)", "Load", "Customer", "Pod", "Document(s)", "Arrived by", "AI read it as", "How sure",
            "Matches TransportPro on", "Checks", "Upload as", "Comment", "TransportPro file", "Status",
            "Correct? (pod)", "Pod note", "Ref"]
 BOT_COLUMNS = 14            # A..N: what the bot writes on every row

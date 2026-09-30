@@ -574,6 +574,40 @@ def test_a_new_pod_tab_is_styled_like_the_first() -> None:
     check("and the header row stays frozen", len(frozen) == 1 and frozen[0]["updateSheetProperties"]["properties"]["gridProperties"] == {"frozenRowCount": 1})
 
 
+def test_sheet_times_are_eastern() -> None:
+    """30 Sep 2026: the pods read the sheet on their own clock. Every time the sheet shows - Logged,
+    Arrived by, the status - is US Eastern by rule (EDT in summer, EST in winter), labelled ET.
+    Logs and the ledger's timestamps stay UTC."""
+    print("the sheet's times are Eastern")
+    import re as _re
+    import time as _time
+    from intake import autofile, sheets
+
+    check("a September instant is EDT", autofile.eastern("2026-09-30T16:27:06+00:00") == "2026-09-30 12:27 ET", autofile.eastern("2026-09-30T16:27:06+00:00"))
+    check("a January instant is EST", autofile.eastern("2026-01-15T16:27:06Z") == "2026-01-15 11:27 ET")
+    check("daylight saving starts the second Sunday of March at 2:00",
+          autofile.eastern("2026-03-08T06:59:00Z") == "2026-03-08 01:59 ET" and autofile.eastern("2026-03-08T07:00:00Z") == "2026-03-08 03:00 ET")
+    check("and ends the first Sunday of November at 2:00",
+          autofile.eastern("2026-11-01T05:59:00Z") == "2026-11-01 01:59 ET" and autofile.eastern("2026-11-01T06:00:00Z") == "2026-11-01 01:00 ET")
+    check("a bare ledger stamp and a datetime work too, and the suffix can be left off",
+          autofile.eastern("2026-09-30 16:27") == "2026-09-30 12:27 ET"
+          and autofile.eastern(autofile.dt.datetime(2026, 9, 30, 16, 27, tzinfo=autofile.dt.timezone.utc), suffix=False) == "2026-09-30 12:27")
+    check("text that is not a time comes back unchanged, and nothing gives nothing", autofile.eastern("Kendyl") == "Kendyl" and autofile.eastern(None) == "")
+    check("the header says so", sheets.COLUMNS[0] == "Logged (ET)")
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    load_row(2600140, "pod_expected", "at consignee")
+    tpro.add(2600140)
+    (sha,) = mail(2600140, "m140", [(_picture(140), _reading(2600140, "proof_of_delivery", receiver=True))])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    row = log.rows[autofile.ref(2600140, sha)]
+    check("Logged is an Eastern wall-clock time with no zone tag", bool(_re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", row[0])), row[0])
+    check("Arrived by shows the email's Eastern time", row[5] == "Email 2026-09-24 08:00 ET from shipwell.com", row[5])
+    check("and the status stamps the upload in Eastern", _re.match(r"UPLOADED \d{4}-\d{2}-\d{2} \d{2}:\d{2} ET as Bill Of Lading", row[13]) is not None, row[13])
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -3610,7 +3644,7 @@ def test_upload_log_sheet() -> None:
     from urllib.parse import unquote
     from intake import sheets
 
-    tab = {"Q": [["Ref"]], "A": [["Logged (UTC)"]]}
+    tab = {"Q": [["Ref"]], "A": [["Logged (ET)"]]}
     sent: list[dict] = []
 
     class _Resp(io.BytesIO):
@@ -3755,6 +3789,7 @@ if __name__ == "__main__":
     test_a_dock_check_in_sheet_rides_with_the_pod()
     test_a_pod_with_a_tab_of_its_own()
     test_a_new_pod_tab_is_styled_like_the_first()
+    test_sheet_times_are_eastern()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

@@ -4,7 +4,9 @@ A handover guide for the next developer. It describes what runs in AWS as of 25 
 [README](../README.md) covers the prototype and the local tools this grew out of. Where the two
 disagree, this file describes production.
 
-Times in logs, the ledger and the Upload log sheet are UTC. Working hours are US Eastern.
+Times in logs and in the ledger's timestamp columns are UTC. Every time the Upload log sheet shows is US
+Eastern, labelled ET (`autofile.eastern`, since 30 Sep 2026: the pods read it on their own clock). Working
+hours are US Eastern.
 
 ---
 

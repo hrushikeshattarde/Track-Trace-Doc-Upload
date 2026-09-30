@@ -133,6 +133,50 @@ UNLOGGED = (NOT_PAPERWORK, PERSONAL_ID, UNREADABLE)
 SHEET_OUTCOMES = (UPLOADED, HELD)
 
 
+# -------------------------------------------------------------------------------- times ----
+
+EASTERN = "ET"
+
+
+def _dst(t_utc: "dt.datetime") -> bool:
+    """Whether US daylight saving is in force at this UTC instant: from the second Sunday of March at
+    2:00 local (07:00Z) to the first Sunday of November at 2:00 local (06:00Z)."""
+    y = t_utc.year
+
+    def nth_sunday(month: int, n: int) -> "dt.date":
+        d = dt.date(y, month, 1)
+        d += dt.timedelta(days=(6 - d.weekday()) % 7)
+        return d + dt.timedelta(days=7 * (n - 1))
+
+    start = dt.datetime.combine(nth_sunday(3, 2), dt.time(7), tzinfo=dt.timezone.utc)
+    end = dt.datetime.combine(nth_sunday(11, 1), dt.time(6), tzinfo=dt.timezone.utc)
+    return start <= t_utc < end
+
+
+def eastern(when, suffix: bool = True) -> str:
+    """'2026-09-30 12:27 ET' for a UTC instant - an ISO string ('2026-09-30T16:27:06+00:00', a 'Z'
+    ending, or '2026-09-30 16:27') or a datetime. US Eastern by rule, so the Lambda needs no tz
+    database. The pods read the sheet on their own clock (30 Sep 2026); logs and the ledger's
+    timestamps stay UTC. Text that is not a time comes back as it was."""
+    if isinstance(when, dt.datetime):
+        t = when
+    else:
+        s = str(when or "").strip().replace("Z", "+00:00")
+        if not s:
+            return ""
+        if "T" not in s and " " in s:
+            s = s.replace(" ", "T", 1)
+        try:
+            t = dt.datetime.fromisoformat(s)
+        except ValueError:
+            return str(when)
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    t = t.astimezone(dt.timezone.utc)
+    local = t + dt.timedelta(hours=-4 if _dst(t) else -5)
+    return local.strftime("%Y-%m-%d %H:%M") + (f" {EASTERN}" if suffix else "")
+
+
 # ------------------------------------------------------------------------------ settings ----
 
 @dataclass
@@ -214,8 +258,7 @@ class OnFile:
         return str(self.file.get("comments") or "").startswith(BOT)
 
     def named(self) -> str:
-        when = str(self.file.get("dateCreated") or "")[:16].replace("T", " ")
-        return f"{self.file.get('fileTypeName') or self.type_id} {self.file.get('id')} ({when} UTC)"
+        return f"{self.file.get('fileTypeName') or self.type_id} {self.file.get('id')} ({eastern(self.file.get('dateCreated'))})"
 
 
 @dataclass
@@ -648,9 +691,8 @@ def _email_docs(conn, load_id: int) -> list[Doc]:
         if r["sha256"] in seen:
             continue
         seen.add(r["sha256"])
-        when = (r["internal_date"] or "")[:16].replace("T", " ")
         out.append(Doc(r["sha256"], r["filename"] or r["sha256"][:12], f"email:{r['message_id']}",
-                       f"Email {when} UTC from {r['from_domain'] or 'an unknown sender'}",
+                       f"Email {eastern(r['internal_date'])} from {r['from_domain'] or 'an unknown sender'}",
                        message_id=r["message_id"], order=i, batch=f"email:{r['message_id']}",
                        batches=frozenset(sent_in[r["sha256"]])))
     return out
@@ -726,12 +768,12 @@ def _docs_received(load: dict) -> bool:
 
 
 def _arrived_on_file(f: dict) -> str:
-    when = str(f.get("dateCreated") or "")[:16].replace("T", " ")
+    when = eastern(f.get("dateCreated"))
     comment = str(f.get("comments") or "").strip()
     if f.get("uploadById") == 1 and comment.startswith("Driver Supplied Image"):
         # TransportPro files a driver's picture-only text reply itself, as System Admin, the same second.
-        return f"Text message from the driver, {when} UTC (TransportPro filed it as {f.get('fileTypeName')})"
-    return f"File History: {f.get('fileTypeName')} uploaded {when} UTC" + (f" ('{comment[:60]}')" if comment else "")
+        return f"Text message from the driver, {when} (TransportPro filed it as {f.get('fileTypeName')})"
+    return f"File History: {f.get('fileTypeName')} uploaded {when}" + (f" ('{comment[:60]}')" if comment else "")
 
 
 def on_file(conn, tpro, load_id: int, files: list[dict]) -> list[OnFile]:
@@ -1555,7 +1597,7 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
         listed = bool(file_id) and any(str(f.get("id")) == file_id for f in tpro.files(load_id))
     except TProError:
         listed = False
-    status = (f"UPLOADED {now[:16].replace('T', ' ')} UTC as {upload_as}"
+    status = (f"UPLOADED {eastern(now)} as {upload_as}"
               + ("" if listed else " (TransportPro accepted it; not listed in File History yet)"))
     sha = hashlib.sha256(data).hexdigest()
     new_file = {"id": int(file_id) if file_id.isdigit() else file_id, "fileTypeId": TYPE_IDS.get(upload_as),
@@ -1820,7 +1862,7 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
     checks = ("FAILED: " + "; ".join(dec.failed)) if dec.failed else (
         ("all passed" + (f" ({'; '.join(dec.allowed)})" if dec.allowed else "")) if dec.outcome in (UPLOADED, DRY) else "")
     shows_upload = dec.outcome in (UPLOADED, DRY) or (dec.outcome in (WAITING, HELD) and upload_as)
-    return [db.now_iso()[:16].replace("T", " "), int(row["load_id"]), row["customer"] or "",
+    return [eastern(db.now_iso(), suffix=False), int(row["load_id"]), row["customer"] or "",
             s.pods.get(int(row["terminal"] or 0), str(row["terminal"] or "")), name, d.arrived, read_as,
             f"{dec.conf:.0%}" if dec.conf is not None else "", facts, checks,
             upload_as if shows_upload else "", comment if shows_upload else "",
