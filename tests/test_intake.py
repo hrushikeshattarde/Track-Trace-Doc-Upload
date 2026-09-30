@@ -608,6 +608,92 @@ def test_sheet_times_are_eastern() -> None:
     check("and the status stamps the upload in Eastern", _re.match(r"UPLOADED \d{4}-\d{2}-\d{2} \d{2}:\d{2} ET as Bill Of Lading", row[13]) is not None, row[13])
 
 
+def test_usps_paperwork_matches_on_route_trip_and_facility() -> None:
+    """Load 2600101 (30 Sep 2026, Klingler pod): the manager's rules for USPS loads. The Contract Route
+    Vehicle Record (PS Form 5398-A) is the BOL, the same form with the receiving facility's red date
+    stamp is the POD, and the route and trip codes on it are the reference numbers - TransportPro
+    carries them joined, "002D7-2A8BD". The plain form was held: 78%, and nothing matched because
+    each code is five characters and the partial-match rule wants six."""
+    print("USPS paperwork matches on route, trip and facility")
+    import time as _time
+    from intake import autofile
+    from pod_intake import reader
+    from pod_intake.schema import Extraction
+
+    check("the reader and the quick look are told about the form",
+          "Contract Route Vehicle Record" in reader.READER_SYSTEM and "Contract Route Vehicle Record" in reader.QUICK_SYSTEM)
+
+    load = {"id": 2600101, "status": {"documentStatus": "Waiting for Documents"},
+            "reference": {"pickupNumber": "002D7-2A8BD", "poNumber": "002D7-2A8BD", "referenceNumber": "125427103",
+                          "numberOfPieces": 60, "weight": 1},
+            "waypoints": [{"type": "SH", "location": {"city": "WARRENDALE", "companyName": "15Z", "timezone": -4}},
+                          {"type": "CN", "location": {"city": "JERSEY CITY", "companyName": "07Z", "timezone": -4},
+                           "appointmentTime": {"open": "2026-09-30T22:16:00Z"}}]}
+    plain = _reading(2600101, numbers=[("Route No.", "002D7"), ("Trip", "2A8BD"), ("Van No.", "536088"), ("Seal Number(s)", "0089692436")], city=None)
+    plain["shipper"] = {"name": "PITTSBURGH (PA) NDC - Dispatch Fac.", "city": "Pittsburgh", "state": "PA"}
+    plain["consignee"] = {"name": "07Z-NJI (NJ) NDC", "city": None, "state": "NJ"}
+    plain["signatures"] = {"shipper_signed": False, "driver_signed": False, "receiver_signed": False,
+                           "receiver_name": None, "receiver_date": None, "stamp_present": False}
+    facts, strong = autofile.match_facts_detail(Extraction.model_validate(plain), load)
+    check("route and trip each match the joined pick number, and the destination code matches the stop",
+          strong == ["pickup # 002D7-2A8BD (002D7)", "pickup # 002D7-2A8BD (2A8BD)"] and "consignee facility 07Z" in facts, str((facts, strong)))
+    spindrift = {"id": 1, "reference": {"pickupNumber": "TO326574/P027S"}, "waypoints": []}
+    facts, strong = autofile.match_facts_detail(Extraction.model_validate(_reading(1, numbers=[("Order", "TO326574"), ("Pickup", "P027S")], city=None)), spindrift)
+    check("a Spindrift order/pickup pair matches on both halves too", len(strong) == 2, str(strong))
+    facts, strong = autofile.match_facts_detail(Extraction.model_validate(_reading(1, numbers=[("Ref", "SH")], city=None)), {"id": 1, "reference": {"pickupNumber": "SH-332918600"}, "waypoints": []})
+    check("a two-letter prefix is not a fact", strong == [], str(strong))
+
+    s = autofile.Settings(terminals=frozenset({1138}), mode="on", pods={1138: "Jesse Klingler"})
+    # The plain form on a loaded truck goes up as the BOL.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2600150, "bol_expected", "loaded", terminal=1138)
+    tpro.add(2600150)
+    tpro.loads[2600150]["load"].update({"reference": {**load["reference"]}, "waypoints": load["waypoints"]})
+    form = {**plain, "document_type": "bill_of_lading", "document_type_confidence": 0.9}
+    (b_sha,) = mail(2600150, "m150", [(_picture(150), form)])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    check("the plain Contract Route Vehicle Record goes up as Driver Supplied BOL",
+          [u["type"] for u in tpro.uploads] == ["Driver Supplied BOL"], str([(u["type"], u["comment"]) for u in tpro.uploads]))
+    # The red-stamped form at the consignee goes up as the POD, with or without a signature.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2600151, "pod_expected", "at consignee", terminal=1138)
+    tpro.add(2600151)
+    tpro.loads[2600151]["load"].update({"reference": {**load["reference"]}, "waypoints": load["waypoints"]})
+    stamped = {**plain, "document_type": "proof_of_delivery", "document_type_confidence": 0.9,
+               "signatures": {"shipper_signed": False, "driver_signed": False, "receiver_signed": False,
+                              "receiver_name": None, "receiver_date": "SEP 30 2026", "stamp_present": True},
+               "pages": [{"page": 1, "role": "pod", "legibility": 0.9, "doc_ref": "002D7-2A8BD 1/1", "signed": True}]}
+    (p_sha,) = mail(2600151, "m151", [(_picture(151), stamped)])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    check("the stamped form goes up as Bill Of Lading, the POD type, on the stamp alone",
+          [u["type"] for u in tpro.uploads] == ["Bill Of Lading"], str([(u["type"], u["comment"]) for u in tpro.uploads]))
+    # The plain form read at 78%, as the real one was: two matching reference numbers carry it.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2600152, "bol_expected", "loaded", terminal=1138)
+    tpro.add(2600152)
+    tpro.loads[2600152]["load"].update({"reference": {**load["reference"]}, "waypoints": load["waypoints"]})
+    unsure = {**plain, "document_type": "bill_of_lading", "document_type_confidence": 0.78}
+    (u_sha,) = mail(2600152, "m152", [(_picture(152), unsure)])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    row = log.rows.get(autofile.ref(2600152, u_sha)) or [""] * 14
+    check("a BOL at 78% with two matching reference numbers goes up, and the sheet says why",
+          [u["type"] for u in tpro.uploads] == ["Driver Supplied BOL"] and "78% sure, under 85% but accepted: 2 reference numbers match" in row[9],
+          str((row[9], [(u["type"], u["comment"]) for u in tpro.uploads])))
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2600153, "bol_expected", "loaded", terminal=1138)
+    tpro.add(2600153)
+    tpro.loads[2600153]["load"].update({"reference": {**load["reference"]}, "waypoints": load["waypoints"]})
+    one_ref = {**unsure, "numbers": [n for n in unsure["numbers"] if n["value"] != "2A8BD"]}
+    (o_sha,) = mail(2600153, "m153", [(_picture(153), one_ref)])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    got = conn.execute("SELECT outcome FROM autofile WHERE load_id=2600153 AND sha256=?", (o_sha,)).fetchone()
+    check("with only one reference number matching it is held, as before", not tpro.uploads and got[0] == autofile.HELD, str(got))
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -3790,6 +3876,7 @@ if __name__ == "__main__":
     test_a_pod_with_a_tab_of_its_own()
     test_a_new_pod_tab_is_styled_like_the_first()
     test_sheet_times_are_eastern()
+    test_usps_paperwork_matches_on_route_trip_and_facility()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

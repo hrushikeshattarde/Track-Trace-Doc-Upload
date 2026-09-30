@@ -376,7 +376,9 @@ ways (`corroborated_pod`, 28 Sep 2026): the receiver's signature or stamp is on 
 the delivery appointment day or the day after, and at least two facts match including a reference number.
 The sheet's Checks column then reads `all passed (AI 83% sure, under 85% but accepted: ...)`. Loads 2568382,
 2565691, 2572625 and 2587025 were held on confidence alone with all three present, and a person filed each.
-`INTAKE_AUTO_POD_FLOOR` moves the floor.
+`INTAKE_AUTO_POD_FLOOR` moves the floor. A BOL between the floor and the bar is accepted when at least two
+reference numbers on it match the load (`corroborated_bol`, 30 Sep 2026: USPS's Contract Route Vehicle Record
+reads as a BOL at 78% however it is described, and its route and trip are the pick number).
 
 **Matching facts** (`match_facts_detail`) compares every number on the page with the load.
 
@@ -386,6 +388,9 @@ The sheet's Checks column then reads `all passed (AI 83% sure, under 85% but acc
 - Exact matches are tried first. Then loose ones: one number contains the other (6 or more
   characters), or they share a core of 5 or more digits with only letters around it, so
   `PO18650` = `18650`.
+- A compound reference matches on each part (30 Sep 2026): USPS's pick number `002D7-2A8BD` is the
+  route and the trip printed as two fields on the Contract Route Vehicle Record, and each is a fact.
+- A stop named by a facility code, USPS's `15Z` / `07Z`, matches the code on the page, as a weak fact.
 
 **Final decisions are never re-decided.** Held, on_file, not_needed and uploaded are final
 (`autofile.final = 1`). Only waiting, and dry-run rows, are looked at again. A held row on the sheet

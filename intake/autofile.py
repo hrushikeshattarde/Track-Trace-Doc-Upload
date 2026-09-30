@@ -1190,6 +1190,24 @@ def corroborated_pod(ex, facts: list[str], strong: list[str], load: dict | None,
             f"{ex.signatures.receiver_date} on {on}, {len(facts)} facts incl. a reference number")
 
 
+def corroborated_bol(ex, facts: list[str], strong: list[str], s: Settings) -> str | None:
+    """Why a BOL the AI is less than min_confidence sure of may still go up - or None.
+
+    Load 2600101 (30 Sep 2026): a USPS Contract Route Vehicle Record, the BOL for a Postal Service load,
+    read as a BOL at 78% even when the reader was told what it is, and the form's route and trip codes
+    matched TransportPro's pick number exactly. From `pod_floor`, a page that reads as a bill of lading
+    is accepted when at least two reference numbers on it match the load: two independent references
+    tie the page to the load whatever the reader made of the form. A BOL goes up as Driver Supplied
+    BOL, which does not clear billing, so the bar is lower than a POD's."""
+    conf = ex.document_type_confidence
+    if conf < s.pod_floor or conf >= s.min_confidence or ex.document_type != "bill_of_lading":
+        return None
+    if len(strong) < 2 or len(facts) < s.min_facts:
+        return None
+    return (f"AI {conf:.0%} sure, under {s.min_confidence:.0%} but accepted: {len(strong)} reference numbers match "
+            f"({'; '.join(strong)})")
+
+
 def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, reading: dict, *,
           sig: Callable[[], list]) -> Decision | None:
     """What should happen to this document on this load. Makes no TransportPro call and records
@@ -1255,7 +1273,8 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
 
     # The checks.
     if ex.document_type_confidence < s.min_confidence:
-        allowed = corroborated_pod(ex, dec.facts, dec.strong, load, s) if kind == "POD" else None
+        allowed = (corroborated_pod(ex, dec.facts, dec.strong, load, s) if kind == "POD"
+                   else corroborated_bol(ex, dec.facts, dec.strong, s))
         if allowed:
             dec.allowed.append(allowed)
         else:
@@ -1379,6 +1398,17 @@ def load_facts(load: dict) -> list[tuple[str, str, bool, str]]:
         v = _norm(raw) if strong else _whole(raw)
         if len(v) >= (4 if strong else 3) and all(v != f[1] for f in facts):
             facts.append((label, v, strong, str(raw)))
+        if strong:
+            # A compound reference matches on each of its parts (30 Sep 2026): USPS's pick number
+            # "002D7-2A8BD" is route 002D7 and trip 2A8BD, printed as two fields on the form, and
+            # Spindrift's "TO326574/P027S" is an order and a pickup number. Each part is a fact of its
+            # own, so a page carrying both route and trip matches twice.
+            parts = [p for p in re.split(r"[-/,;\s]+", str(raw)) if p]
+            if len(parts) > 1:
+                for part in parts:
+                    pv = _norm(part)
+                    if len(pv) >= 4 and all(pv != f[1] for f in facts):
+                        facts.append((label, pv, True, f"{raw} ({part})"))
 
     add("load #", load.get("id"), True)
     for k, v in (load.get("reference") or {}).items():
@@ -1448,6 +1478,16 @@ def match_facts_detail(ex, load: dict) -> tuple[list[str], list[str]]:
             city = (wp.get("location") or {}).get("city")
             if paper and wp.get("type") == wp_type and city and _norm(city) == paper:
                 hits.append(f"{side} city {city}")
+                break
+        # A stop named by a facility code - USPS's "15Z" and "07Z" (30 Sep 2026) - matches the code
+        # on the page: in the party's name ("07Z-NJI (NJ) NDC") or among its numbers. Weak, like a city.
+        tokens = {t for t in re.split(r"[^A-Z0-9]+", str(getattr(ex, side).name or "").upper()) if t}
+        tokens |= {t for n in ex.numbers for t in re.split(r"[^A-Z0-9]+", str(n.value).upper()) if t}
+        for wp in load.get("waypoints") or []:
+            code = _norm((wp.get("location") or {}).get("companyName") or "")
+            if (wp.get("type") == wp_type and 2 <= len(code) <= 5 and any(ch.isdigit() for ch in code)
+                    and code in tokens):
+                hits.append(f"{side} facility {code}")
                 break
     return hits, strong
 
