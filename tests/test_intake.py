@@ -742,6 +742,9 @@ def test_the_morning_report() -> None:
           "2597516  (Jesse Klingler, TireHub c/o Penske Logistics (FTL)): 1 document held - 2 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number) (reviewed by the pod: No - Other (see notes))" in fol.text, fol.text)
     quiet = report.build(fresh_db(), now=now, terminals={1160}, pods={})
     check("a quiet day says so", quiet.empty and quiet.subject == "Doc Intake: nothing held - 2026-09-30" and "  none" in quiet.text, quiet.subject)
+    from intake import aws_report
+    check("recipients are parsed from a comma list, once each, in order",
+          aws_report.addresses(" a@x.com, b@x.com;c@x.com  a@X.com ") == ["a@x.com", "b@x.com", "c@x.com"] and aws_report.addresses(None) == [])
 
 
 def test_two_usps_forms_for_one_trip_are_two_pages() -> None:

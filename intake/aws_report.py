@@ -8,7 +8,7 @@ list still empty is harmless.
 Environment:
     INTAKE_S3_BUCKET, INTAKE_LEDGER_KEY, INTAKE_POD_CONFIG_KEY   where the ledger and the pod map are
     INTAKE_AUTO_TERMINALS                                         the pilot pods, e.g. "1160,1138"
-    INTAKE_REPORT_FROM, INTAKE_REPORT_TO                          sender; recipients, comma-separated
+    INTAKE_REPORT_FROM, INTAKE_REPORT_TO, INTAKE_REPORT_CC        sender; recipients and copies, comma-separated
     INTAKE_REPORT_HOURS                                           the window, default 24
     INTAKE_UPLOAD_SHEET_ID, INTAKE_GMAIL_SECRET                   the sheet: rows a person has changed are
                                                                   followed, and the link at the foot of the mail
@@ -24,6 +24,16 @@ from pathlib import Path
 from typing import Any
 
 from . import autofile, report, sheets
+
+
+def addresses(value: str | None) -> list[str]:
+    """'a@x.com, b@x.com; c@x.com' -> the three addresses, each once, in order."""
+    out: list[str] = []
+    for a in re.split(r"[,;\s]+", value or ""):
+        a = a.strip()
+        if a and a.lower() not in {x.lower() for x in out}:
+            out.append(a)
+    return out
 
 
 def handler(event: dict | None, context: Any) -> dict:
@@ -54,13 +64,15 @@ def handler(event: dict | None, context: Any) -> dict:
                            pods=pods, sheet_id=env.get("INTAKE_UPLOAD_SHEET_ID", ""), sheet_status=sheet_status)
     finally:
         conn.close()
-    to = [a.strip() for a in re.split(r"[,;\s]+", env.get("INTAKE_REPORT_TO") or "") if a.strip()]
+    to = addresses(env.get("INTAKE_REPORT_TO"))
+    cc = [a for a in addresses(env.get("INTAKE_REPORT_CC")) if a.lower() not in {x.lower() for x in to}]
     sender = env.get("INTAKE_REPORT_FROM") or ""
     sent = False
     message_id = ""
     if to and sender:
         ses = boto3.client("sesv2")
-        r = ses.send_email(FromEmailAddress=f"Doc Intake Bot <{sender}>", Destination={"ToAddresses": to},
+        destination = {"ToAddresses": to, **({"CcAddresses": cc} if cc else {})}
+        r = ses.send_email(FromEmailAddress=f"Doc Intake Bot <{sender}>", Destination=destination,
                            Content={"Simple": {"Subject": {"Data": rep.subject, "Charset": "UTF-8"},
                                                "Body": {"Text": {"Data": rep.text, "Charset": "UTF-8"}}}})
         sent, message_id = True, r.get("MessageId", "")
@@ -68,6 +80,6 @@ def handler(event: dict | None, context: Any) -> dict:
         print(rep.text)
     summary = {"report": {"subject": rep.subject, "held_loads": rep.held_loads, "held_documents": rep.held_documents,
                           "resolved_by_a_person": rep.resolved, "sheet_read": sheet_status is not None,
-                          "to": to, "sent": sent, "message_id": message_id}}
+                          "to": to, "cc": cc, "sent": sent, "message_id": message_id}}
     print(json.dumps(summary))
     return summary

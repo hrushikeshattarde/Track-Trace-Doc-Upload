@@ -80,7 +80,7 @@ DEPS = ["boto3==1.43.98", "google-auth==2.58.0", "cryptography==50.0.1", "tzdata
 # the original "Upload log" tab became "Upload Log - Saiz"); a pod left out of UPLOAD_TABS would write
 # to the log's default tab, "Upload log".
 # The morning report (intake/report.py): sent from a verified SES domain of Circle's. Recipients live in
-# .env as INTAKE_REPORT_TO, comma-separated, not in this public repository.
+# .env as INTAKE_REPORT_TO and INTAKE_REPORT_CC, comma-separated, not in this public repository.
 REPORT_FROM = "DocIntake@circle-analytics.com"
 AUTO_TERMINALS = "1160,1138"
 UPLOAD_TABS = {1160: "Upload Log - Saiz", 1138: "Upload Log - Klinger"}
@@ -126,6 +126,7 @@ def _report_env(env: dict) -> dict:
     return {"INTAKE_S3_BUCKET": env["INTAKE_S3_BUCKET"], "INTAKE_LEDGER_KEY": LEDGER_KEY,
             "INTAKE_POD_CONFIG_KEY": POD_CONFIG_KEY, "INTAKE_AUTO_TERMINALS": AUTO_TERMINALS,
             "INTAKE_REPORT_FROM": REPORT_FROM, "INTAKE_REPORT_TO": env.get("INTAKE_REPORT_TO", ""),
+            "INTAKE_REPORT_CC": env.get("INTAKE_REPORT_CC", ""),
             "INTAKE_REPORT_HOURS": "24", "INTAKE_UPLOAD_SHEET_ID": env["INTAKE_UPLOAD_SHEET_ID"],
             "INTAKE_GMAIL_SECRET": GMAIL_SECRET}
 
