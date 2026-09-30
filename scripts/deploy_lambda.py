@@ -552,7 +552,7 @@ def cmd_schedule(args) -> int:
     state = "ENABLED" if args.state == "on" else "DISABLED"
     # update_schedule replaces the whole schedule: carry the timezone, or a cron in America/New_York
     # comes back as UTC (the report schedule, 30 Sep 2026).
-    tz = cur.get("ScheduleExpressionTimezone") or FUNCS[args.target].get("timezone")
+    tz = FUNCS[args.target].get("timezone") or cur.get("ScheduleExpressionTimezone")
     sch.update_schedule(Name=name, ScheduleExpression=cur["ScheduleExpression"],
                         FlexibleTimeWindow=cur["FlexibleTimeWindow"], Target=cur["Target"],
                         Description=cur.get("Description", ""), State=state,
