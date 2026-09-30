@@ -31,6 +31,16 @@ class SheetError(RuntimeError):
     pass
 
 
+def template_tab(titles: list[str], new: str) -> str | None:
+    """The tab a new pod tab is styled like: the first other tab whose name starts with the log's
+    ("Upload Log - Saiz" for "Upload Log - Klinger"), else the default tab if it is there."""
+    stem = TAB.split(" - ")[0].strip().lower()
+    for t in titles:
+        if t != new and t.strip().lower().startswith(stem):
+            return t
+    return None
+
+
 class UploadLog:
     def __init__(self, spreadsheet_id: str, token: Callable[[], str], *, tab: str = TAB,
                  opener: Callable[..., Any] | None = None) -> None:
@@ -64,17 +74,59 @@ class UploadLog:
 
     # -- the tab -----------------------------------------------------------
     def _grid(self) -> tuple[int | None, int]:
-        """(sheetId, rowCount) of the tab, creating it with its header row if it is not there."""
+        """(sheetId, rowCount) of the tab, creating it with its header row if it is not there. A new
+        tab is styled like the pod tab already there (`template_tab`), so every pod's log looks the
+        same: the pod formatted the first one by hand (30 Sep 2026)."""
         meta = self._call("GET", "?fields=sheets.properties")
+        titles = []
         for s in meta.get("sheets", []):
             p = s.get("properties") or {}
+            titles.append(str(p.get("title") or ""))
             if p.get("title") == self.tab:
                 return p.get("sheetId"), int((p.get("gridProperties") or {}).get("rowCount") or 1000)
         made = self._call("POST", ":batchUpdate", {"requests": [{"addSheet": {"properties": {
             "title": self.tab, "gridProperties": {"frozenRowCount": 1}}}}]})
         self._call("PUT", f"/values/{self._a1('A1')}?valueInputOption=RAW", {"values": [COLUMNS]})
         props = ((made.get("replies") or [{}])[0].get("addSheet") or {}).get("properties") or {}
+        template = template_tab(titles, self.tab)
+        if template:
+            self.style_like(template)
         return props.get("sheetId"), int((props.get("gridProperties") or {}).get("rowCount") or 1000)
+
+    def style_like(self, template: str, tab: str | None = None) -> None:
+        """Give `tab` (the log's own by default) the look of `template`: cell formats and the
+        Correct? dropdown (PASTE_FORMAT, PASTE_DATA_VALIDATION), the red and green status rules (PASTE_CONDITIONAL_FORMATTING),
+        the column widths, and a frozen header row. Values are not touched."""
+        with self._on(tab):
+            meta = self._call("GET", "?fields=" + urllib.parse.quote(
+                "sheets(properties(title,sheetId,gridProperties),data(columnMetadata(pixelSize)))")
+                + "&ranges=" + self._a1_of(template, "A1:Q1") + "&ranges=" + self._a1("A1:Q1"))
+            sheets_ = {(s.get("properties") or {}).get("title"): s for s in meta.get("sheets", [])}
+            src, dst = sheets_.get(template), sheets_.get(self.tab)
+            if not src or not dst:
+                return
+            sid, did = src["properties"]["sheetId"], dst["properties"]["sheetId"]
+            rows = min(int((src["properties"].get("gridProperties") or {}).get("rowCount") or 1000),
+                       int((dst["properties"].get("gridProperties") or {}).get("rowCount") or 1000))
+            cols = len(COLUMNS)
+            box = lambda i: {"sheetId": i, "startRowIndex": 0, "endRowIndex": rows, "startColumnIndex": 0, "endColumnIndex": cols}
+            requests = [
+                {"copyPaste": {"source": box(sid), "destination": box(did), "pasteType": "PASTE_FORMAT", "pasteOrientation": "NORMAL"}},
+                {"copyPaste": {"source": box(sid), "destination": box(did), "pasteType": "PASTE_CONDITIONAL_FORMATTING", "pasteOrientation": "NORMAL"}},
+                {"copyPaste": {"source": box(sid), "destination": box(did), "pasteType": "PASTE_DATA_VALIDATION", "pasteOrientation": "NORMAL"}},
+                {"updateSheetProperties": {"properties": {"sheetId": did, "gridProperties": {"frozenRowCount": 1}},
+                                           "fields": "gridProperties.frozenRowCount"}},
+            ]
+            widths = [c.get("pixelSize") for d in src.get("data", []) for c in d.get("columnMetadata", [])]
+            for i, w in enumerate(widths[:cols]):
+                if w:
+                    requests.append({"updateDimensionProperties": {
+                        "range": {"sheetId": did, "dimension": "COLUMNS", "startIndex": i, "endIndex": i + 1},
+                        "properties": {"pixelSize": int(w)}, "fields": "pixelSize"}})
+            self._call("POST", ":batchUpdate", {"requests": requests})
+
+    def _a1_of(self, tab: str, cells: str) -> str:
+        return urllib.parse.quote(f"'{tab}'!{cells}")
 
     @contextlib.contextmanager
     def _on(self, tab: str | None):

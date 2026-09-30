@@ -505,6 +505,75 @@ def test_a_pod_with_a_tab_of_its_own() -> None:
           str((log.rows[kr][3], log.rows[fr][3])))
 
 
+def test_a_new_pod_tab_is_styled_like_the_first() -> None:
+    """30 Sep 2026: the pod formatted "Upload Log - Saiz" by hand - wrapped text, a bold header, column
+    widths, the red and green status rules and the Correct? dropdown - and the new Klingler tab came
+    out bare. A tab the log creates is now styled like the pod tab already there: formats and the
+    dropdown, the conditional rules, the widths, and a frozen header row. Values are never copied."""
+    print("a new pod tab is styled like the first")
+    import io
+    import json as _json
+    from urllib.parse import unquote
+    from intake import sheets
+
+    check("the template is the other tab named like the log", sheets.template_tab(
+        ["Review queue", "Upload Log - Saiz", "Upload Log - Klinger"], "Upload Log - Klinger") == "Upload Log - Saiz")
+    check("and there is none on a sheet with no other pod tab", sheets.template_tab(["Review queue", "Upload Log - Klinger"], "Upload Log - Klinger") is None)
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    posted: list[dict] = []
+    made = {"done": False}
+
+    def opener(req, timeout=60):
+        url = unquote(req.full_url)
+        if req.get_method() == "GET" and "fields=sheets.properties" in url:
+            body = {"sheets": [{"properties": {"title": "Review queue", "sheetId": 1}},
+                               {"properties": {"title": "Upload Log - Saiz", "sheetId": 7, "gridProperties": {"rowCount": 888}}}]}
+        elif req.get_method() == "GET" and "fields=sheets(properties" in url:
+            body = {"sheets": [
+                {"properties": {"title": "Upload Log - Saiz", "sheetId": 7, "gridProperties": {"rowCount": 888}},
+                 "data": [{"columnMetadata": [{"pixelSize": w} for w in (152, 98, 190)]}]},
+                {"properties": {"title": "Upload Log - Klinger", "sheetId": 9, "gridProperties": {"rowCount": 1000}},
+                 "data": [{"columnMetadata": [{"pixelSize": 100}] * 3}]}]}
+        elif req.get_method() == "POST":
+            body = _json.loads(req.data)
+            posted.append(body)
+            if "addSheet" in _json.dumps(body):
+                made["done"] = True
+                body = {"replies": [{"addSheet": {"properties": {"sheetId": 9, "title": "Upload Log - Klinger",
+                                                                  "gridProperties": {"rowCount": 1000}}}}]}
+            else:
+                body = {}
+        else:
+            body = {}
+        return _Resp(_json.dumps(body).encode())
+
+    log = sheets.UploadLog("sheet", lambda: "token", tab="Upload Log - Klinger", opener=opener)
+    sheet_id, rows = log._grid()
+    check("the tab is created with a frozen header", made["done"] and sheet_id == 9 and rows == 1000)
+    style = next((b for b in posted if "copyPaste" in _json.dumps(b)), None)
+    reqs = (style or {}).get("requests", [])
+    pastes = [r["copyPaste"]["pasteType"] for r in reqs if "copyPaste" in r]
+    check("formats with the dropdown, and the conditional rules, are pasted from the template",
+          pastes == ["PASTE_FORMAT", "PASTE_CONDITIONAL_FORMATTING", "PASTE_DATA_VALIDATION"]
+          and all(r["copyPaste"]["source"]["sheetId"] == 7 and r["copyPaste"]["destination"]["sheetId"] == 9 for r in reqs if "copyPaste" in r),
+          str(pastes))
+    box = next(r["copyPaste"]["source"] for r in reqs if "copyPaste" in r)
+    check("over the rows both tabs have and the log's 17 columns, values untouched",
+          box["endRowIndex"] == 888 and box["endColumnIndex"] == 17 and "PASTE_NORMAL" not in pastes)
+    widths = [(r["updateDimensionProperties"]["range"]["startIndex"], r["updateDimensionProperties"]["properties"]["pixelSize"])
+              for r in reqs if "updateDimensionProperties" in r]
+    check("the column widths come across", widths == [(0, 152), (1, 98), (2, 190)], str(widths))
+    frozen = [r for r in reqs if "updateSheetProperties" in r]
+    check("and the header row stays frozen", len(frozen) == 1 and frozen[0]["updateSheetProperties"]["properties"]["gridProperties"] == {"frozenRowCount": 1})
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -3685,6 +3754,7 @@ if __name__ == "__main__":
     test_a_pod_short_of_the_confidence_bar_goes_up_when_the_page_corroborates_it()
     test_a_dock_check_in_sheet_rides_with_the_pod()
     test_a_pod_with_a_tab_of_its_own()
+    test_a_new_pod_tab_is_styled_like_the_first()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

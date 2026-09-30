@@ -475,6 +475,9 @@ In `dry-run` mode nothing is uploaded and no sheet rows are written. Decisions a
   row number, so the pod can sort and filter the tab safely.
 - A row is rewritten only when its status changes; `autofile.logged_status` records what the sheet
   last showed.
+- A tab the worker creates is styled like the pod tab already there (`UploadLog.style_like`, 30 Sep 2026):
+  cell formats and the Correct? dropdown, the red and green status rules, the column widths, and a frozen
+  header row. The first pod tab was formatted by hand; every later one copies it.
 - A row that should no longer show, such as a page that went up inside another row, is deleted,
   unless the pod has written something in O or P.
 
