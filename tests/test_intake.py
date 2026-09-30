@@ -471,6 +471,40 @@ def test_a_dock_check_in_sheet_rides_with_the_pod() -> None:
           str((outcome, [(u["type"], u["comment"]) for u in tpro.uploads])))
 
 
+def test_a_pod_with_a_tab_of_its_own() -> None:
+    """30 Sep 2026: Jesse Klingler's pod (terminal 1138) joins the pilot with its own sheet tab,
+    "Upload Log - Klinger". Rows are routed by the load's terminal; every other pod keeps the
+    log's own tab, and the Pod column names the pod."""
+    print("a pod with a tab of its own")
+    import time as _time
+    from intake import autofile
+
+    s = autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_AUTO_TERMINALS": "1160, 1138, 1099",
+                                    "INTAKE_UPLOAD_TABS": '{"1160": "Upload Log - Saiz", "1138": "Upload Log - Klinger"}'},
+                                   pods={1160: "Frankie Saiz", 1138: "Jesse Klingler", 1099: "Nobody"})
+    check("the tab map comes from the environment",
+          s.tabs == {1160: "Upload Log - Saiz", 1138: "Upload Log - Klinger"} and s.terminals == frozenset({1160, 1138, 1099}))
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2600130, "pod_expected", "at consignee", terminal=1138)
+    tpro.add(2600130)
+    (k_sha,) = mail(2600130, "m130", [(_picture(130), _reading(2600130, "proof_of_delivery", receiver=True))])
+    load_row(2600131, "pod_expected", "at consignee", terminal=1160)
+    tpro.add(2600131)
+    (f_sha,) = mail(2600131, "m131", [(_picture(131), _reading(2600131, "proof_of_delivery", receiver=True))])
+    load_row(2600132, "pod_expected", "at consignee", terminal=1099)
+    tpro.add(2600132)
+    (n_sha,) = mail(2600132, "m132", [(_picture(132), _reading(2600132, "proof_of_delivery", receiver=True))])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    kr, fr, nr = autofile.ref(2600130, k_sha), autofile.ref(2600131, f_sha), autofile.ref(2600132, n_sha)
+    check("every pod's POD goes up", [u["type"] for u in tpro.uploads] == ["Bill Of Lading"] * 3, str(tpro.uploads))
+    check("the Klingler load's row goes to its tab", log.tabs.get(kr) == "Upload Log - Klinger", str(log.tabs))
+    check("the Frankie Saiz load's row goes to its tab", log.tabs.get(fr) == "Upload Log - Saiz", str(log.tabs))
+    check("a pod with no tab of its own stays on the log's default tab", nr in log.rows and log.tabs.get(nr) is None, str(log.tabs))
+    check("the Pod column names the pod", log.rows[kr][3] == "Jesse Klingler" and log.rows[fr][3] == "Frankie Saiz",
+          str((log.rows[kr][3], log.rows[fr][3])))
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -2632,19 +2666,21 @@ class _AutoTPro:
 class _AutoLog:
     def __init__(self):
         self.rows: dict[str, list] = {}
+        self.tabs: dict[str, str | None] = {}
         self.writes = 0
         self.removed: set[str] = set()
 
-    def remove(self, refs):
+    def remove(self, refs, tab=None):
         for r in refs:
             if self.rows.pop(r, None) is not None:
                 self.removed.add(r)
         return len(refs)
 
-    def write(self, entries):
+    def write(self, entries, tab=None):
         self.writes += 1
         for ref, values in entries:
             self.rows[ref] = values
+            self.tabs[ref] = tab
         return len(entries)
 
 
@@ -3648,6 +3684,7 @@ if __name__ == "__main__":
     test_a_receiving_label_counts_the_facts_of_the_bol_sent_with_it()
     test_a_pod_short_of_the_confidence_bar_goes_up_when_the_page_corroborates_it()
     test_a_dock_check_in_sheet_rides_with_the_pod()
+    test_a_pod_with_a_tab_of_its_own()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

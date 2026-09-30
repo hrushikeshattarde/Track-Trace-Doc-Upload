@@ -145,6 +145,7 @@ class Settings:
     daily_usd: float = 50.0      # a safety limit against a runaway, not a budget: a normal day is ~$1
     max_reads: int = 60
     pods: dict[int, str] = field(default_factory=dict)
+    tabs: dict[int, str] = field(default_factory=dict)   # terminal -> its own sheet tab; the rest use the log's
 
     @classmethod
     def from_env(cls, env, pods: dict[int, str] | None = None) -> "Settings":
@@ -157,7 +158,8 @@ class Settings:
                    pod_floor=float(env.get("INTAKE_AUTO_POD_FLOOR") or 0.75),
                    min_facts=int(env.get("INTAKE_AUTO_MIN_FACTS") or 2),
                    daily_usd=float(env.get("INTAKE_AUTO_DAILY_USD") or 50),
-                   max_reads=int(env.get("INTAKE_AUTO_MAX_READS") or 60), pods=pods or {})
+                   max_reads=int(env.get("INTAKE_AUTO_MAX_READS") or 60), pods=pods or {},
+                   tabs={int(k): str(v) for k, v in json.loads(env.get("INTAKE_UPLOAD_TABS") or "{}").items()})
 
 
 @dataclass
@@ -361,7 +363,7 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
     # 4. log
     if log is not None and s.mode == ON:
         try:
-            stats.logged = flush_log(conn, log)
+            stats.logged = flush_log(conn, log, s.tabs)
         except Exception as e:                                   # noqa: BLE001 - reported; rows stay pending
             stats.sheet_error = f"{type(e).__name__}: {str(e)[:200]}"
     return stats
@@ -1825,30 +1827,50 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
             dec.tpro_file_id or "", dec.status]
 
 
-def flush_log(conn, log) -> int:
+def flush_log(conn, log, tabs: dict[int, str] | None = None) -> int:
     """Send every row whose status the sheet does not show yet. A failure leaves them pending.
 
     Only SHEET_OUTCOMES reach the sheet. Every decision is still recorded in the ledger - the audit
     trail is complete - but the pod asked (24 Sep 2026) for the sheet to hold what the bot uploaded
-    and what it held back and why, not the pages it found already on file or not needed."""
+    and what it held back and why, not the pages it found already on file or not needed.
+
+    `tabs` maps a terminal to a tab of its own (Settings.tabs, from INTAKE_UPLOAD_TABS): Jesse
+    Klingler's pod writes to "Upload Log - Klinger" (30 Sep 2026). Every other pod's rows go to the
+    log's own tab. Rows are routed by the load's terminal, and a tab is created with its header the
+    first time it is written."""
+    tabs = tabs or {}
     marks = ",".join("?" * len(SHEET_OUTCOMES))
+
+    def tab_of(terminal) -> str | None:
+        return tabs.get(int(terminal)) if terminal is not None else None
+
     # Rows the sheet showed that it should not any more: a page that went up inside another page's
     # row. Removed by Ref; a row the pod has marked (Correct? / Pod note) is never removed.
     gone = conn.execute(
-        "SELECT load_id, sha256 FROM autofile WHERE logged_status IS NOT NULL "
-        f"AND (logged = 0 OR outcome NOT IN ({marks}))", SHEET_OUTCOMES).fetchall()
+        "SELECT a.load_id, a.sha256, l.terminal FROM autofile a LEFT JOIN load l ON l.load_id = a.load_id "
+        f"WHERE a.logged_status IS NOT NULL AND (a.logged = 0 OR a.outcome NOT IN ({marks}))", SHEET_OUTCOMES).fetchall()
     if gone and hasattr(log, "remove"):
-        log.remove({ref(r["load_id"], r["sha256"]) for r in gone})
+        by_tab: dict[str | None, set[str]] = {}
+        for r in gone:
+            by_tab.setdefault(tab_of(r["terminal"]), set()).add(ref(r["load_id"], r["sha256"]))
+        for tab, refs in by_tab.items():
+            log.remove(refs, tab=tab)
         for r in gone:
             conn.execute("UPDATE autofile SET logged_status=NULL WHERE load_id=? AND sha256=?",
                          (r["load_id"], r["sha256"]))
     rows = conn.execute(
-        "SELECT load_id, sha256, status, row_json FROM autofile WHERE logged=1 AND row_json IS NOT NULL "
-        f"AND outcome IN ({marks}) AND (logged_status IS NULL OR logged_status != status) "
-        "ORDER BY decided_at, load_id", SHEET_OUTCOMES).fetchall()
+        "SELECT a.load_id, a.sha256, a.status, a.row_json, l.terminal FROM autofile a "
+        "LEFT JOIN load l ON l.load_id = a.load_id WHERE a.logged=1 AND a.row_json IS NOT NULL "
+        f"AND a.outcome IN ({marks}) AND (a.logged_status IS NULL OR a.logged_status != a.status) "
+        "ORDER BY a.decided_at, a.load_id", SHEET_OUTCOMES).fetchall()
     if not rows:
         return 0
-    n = log.write([(ref(r["load_id"], r["sha256"]), json.loads(r["row_json"])) for r in rows])
+    entries: dict[str | None, list] = {}
+    for r in rows:
+        entries.setdefault(tab_of(r["terminal"]), []).append((ref(r["load_id"], r["sha256"]), json.loads(r["row_json"])))
+    n = 0
+    for tab, batch in entries.items():
+        n += log.write(batch, tab=tab)
     for r in rows:
         conn.execute("UPDATE autofile SET logged_status=? WHERE load_id=? AND sha256=?",
                      (r["status"], r["load_id"], r["sha256"]))

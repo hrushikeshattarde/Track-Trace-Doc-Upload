@@ -9,6 +9,7 @@ Pod note - belong to the pod and the bot never writes them, not even when it upd
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 import urllib.error
@@ -75,11 +76,33 @@ class UploadLog:
         props = ((made.get("replies") or [{}])[0].get("addSheet") or {}).get("properties") or {}
         return props.get("sheetId"), int((props.get("gridProperties") or {}).get("rowCount") or 1000)
 
-    def write(self, entries: list[tuple[str, list]]) -> int:
+    @contextlib.contextmanager
+    def _on(self, tab: str | None):
+        """Address another tab for one call: a pod with a tab of its own (Jesse Klingler's pod,
+        "Upload Log - Klinger", 30 Sep 2026). None means the log's own tab."""
+        if not tab or tab == self.tab:
+            yield
+            return
+        was, self.tab = self.tab, tab
+        try:
+            yield
+        finally:
+            self.tab = was
+
+    def ensure(self, tab: str | None = None) -> None:
+        """Create the tab, with its header row, if it is not there yet."""
+        with self._on(tab):
+            self._grid()
+
+    def write(self, entries: list[tuple[str, list]], tab: str | None = None) -> int:
         """Write (ref, [14 values for A..N]) entries: a ref already on the tab is updated in place,
         a new one goes on the first empty row. Returns how many rows were written."""
         if not entries:
             return 0
+        with self._on(tab):
+            return self._write(entries)
+
+    def _write(self, entries: list[tuple[str, list]]) -> int:
         sheet_id, grid_rows = self._grid()
         refs = self._call("GET", f"/values/{self._a1('Q:Q')}").get("values", [])
         where = {row[0]: i + 1 for i, row in enumerate(refs) if row and row[0]}
@@ -101,11 +124,15 @@ class UploadLog:
         return len(entries)
 
 
-    def remove(self, refs: set[str]) -> int:
+    def remove(self, refs: set[str], tab: str | None = None) -> int:
         """Delete the rows carrying these Refs, bottom up so the row numbers stay right. A row the pod
         has marked - anything in O (Correct?) or P (Pod note) - is kept: that is their work."""
         if not refs:
             return 0
+        with self._on(tab):
+            return self._remove(refs)
+
+    def _remove(self, refs: set[str]) -> int:
         sheet_id, _ = self._grid()
         values = self._call("GET", f"/values/{self._a1('A:Q')}").get("values", [])
         doomed = []

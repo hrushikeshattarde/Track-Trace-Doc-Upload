@@ -57,7 +57,7 @@ bookkeeping and load checks run for all 16 pod terminals. Reading and uploading 
 | IAM roles | `circle-doc-intake-collector`, `-worker`, `-scheduler` | least-privilege policies are in `scripts/deploy_lambda.py` |
 | Logs | `/aws/lambda/<function>` | 90-day retention; one JSON summary line per run |
 | S3 bucket | `INTAKE_S3_BUCKET` in `.env` | kept out of this public repository |
-| Upload log | `INTAKE_UPLOAD_SHEET_ID` in `.env`, tab `Upload log` | shared with the service account as an editor |
+| Upload log | `INTAKE_UPLOAD_SHEET_ID` in `.env`, one tab per pod from `INTAKE_UPLOAD_TABS`: `Upload Log - Saiz` (1160) and `Upload Log - Klinger` (1138) since 30 Sep 2026; a pod with no tab named falls back to `Upload log` | shared with the service account as an editor |
 | Region | us-east-1 | the AWS account behind `AWS_PROFILE` in `.env`, shared with other projects |
 
 Both functions run from the same zip (`deploy/collector.zip`). Each handler picks its entry point.
@@ -693,7 +693,9 @@ bucket and secrets, plus the "Claude Opus 5 (Amazon Bedrock Edition)" service li
 **Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 475 offline checks: no network, no
 model, no credentials. Run it before every deploy.
 
-**Changing the pilot's pods.** Change `AUTO_TERMINALS` in `scripts/deploy_lambda.py` and deploy.
+**Changing the pilot's pods.** Change `AUTO_TERMINALS` in `scripts/deploy_lambda.py` and deploy. A pod that
+wants its own tab goes in `UPLOAD_TABS` there (terminal -> tab name); the worker creates the tab with its header
+on the first write, and rows are routed by the load's terminal (`flush_log`, `Settings.tabs`).
 The sheet has a Pod column, so one sheet serves several pods.
 
 ---

@@ -74,8 +74,12 @@ BUILD = HERE / "build" / "lambda"
 # iPhone HEIC photos (pillow-heif). With it the unpacked package is ~200 MB of Lambda's 250.
 DEPS = ["boto3==1.43.98", "google-auth==2.58.0", "cryptography==50.0.1", "tzdata==2026.4",
         "anthropic==1.5.0", "pydantic==2.13.5", "pymupdf==1.28.2", "pillow==12.3.0", "pillow-heif==1.7.0"]
-# The auto-upload pilot's pods, by TransportPro terminal: Frankie Saiz, 24 Sep 2026.
-AUTO_TERMINALS = "1160"
+# The auto-upload pilot's pods, by TransportPro terminal: Frankie Saiz (1160) from 24 Sep 2026, and
+# Jesse Klingler (1138) from 30 Sep 2026. Each pod has a sheet tab of its own, named here (30 Sep 2026:
+# the original "Upload log" tab became "Upload Log - Saiz"); a pod left out of UPLOAD_TABS would write
+# to the log's default tab, "Upload log".
+AUTO_TERMINALS = "1160,1138"
+UPLOAD_TABS = {1160: "Upload Log - Saiz", 1138: "Upload Log - Klinger"}
 
 
 def _collector_env(env: dict) -> dict:
@@ -101,6 +105,7 @@ def _worker_env(env: dict) -> dict:
             # Auto-upload (intake/autofile.py). `autoupload off` stops it without a redeploy. The
             # sheet id is Circle's and lives in .env, not in this public repository.
             "INTAKE_AUTO_UPLOAD": env.get("INTAKE_AUTO_UPLOAD", "on"), "INTAKE_AUTO_TERMINALS": AUTO_TERMINALS,
+            "INTAKE_UPLOAD_TABS": json.dumps({str(k): v for k, v in UPLOAD_TABS.items()}),
             # A safety limit, not a budget (24 Sep 2026): with the quick look and the brief full read a
             # normal day for the pilot pod is about $1. The limit only stops a runaway.
             "INTAKE_AUTO_DAILY_USD": "50", "INTAKE_AUTO_MAX_READS": "60",
