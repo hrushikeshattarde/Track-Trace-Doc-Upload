@@ -8,6 +8,7 @@ Plain asserts rather than pytest, which is not in the project virtualenv.
 """
 from __future__ import annotations
 
+import json
 import base64
 import datetime as dt
 import hashlib
@@ -692,6 +693,52 @@ def test_usps_paperwork_matches_on_route_trip_and_facility() -> None:
     autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
     got = conn.execute("SELECT outcome FROM autofile WHERE load_id=2600153 AND sha256=?", (o_sha,)).fetchone()
     check("with only one reference number matching it is held, as before", not tpro.uploads and got[0] == autofile.HELD, str(got))
+
+
+def test_the_morning_report() -> None:
+    """30 Sep 2026: the pods' leads get a mail at 07:00 Eastern listing the loads the bot did not file
+    in the last day - one line per load - and the delivered loads still waiting for documents with no
+    POD of the bot's. Nothing in the ledger is written."""
+    print("the morning report")
+    import datetime as _dt
+    from intake import report
+    conn = fresh_db()
+    now = _dt.datetime(2026, 9, 30, 11, 0, tzinfo=_dt.timezone.utc)      # 07:00 ET
+    fresh, old = "2026-09-30T10:12:00+00:00", "2026-09-28T10:12:00+00:00"
+    for load_id, terminal, customer, stage, doc_status in (
+            (2597516, 1138, "TireHub c/o Penske Logistics (FTL)", "delivered", "Waiting for Documents"),
+            (2600101, 1138, "United States Postal Service", "loaded", "Waiting for Documents"),
+            (2585966, 1160, "Spindrift Beverage Co Inc. c/o Shipwell", "delivered", "Documents Received"),
+            (2571093, 1160, "Spindrift Beverage Co Inc. c/o Shipwell", "delivered", "Waiting for Documents"),
+            (2599999, 1075, "Somebody else's pod", "delivered", "Waiting for Documents")):
+        conn.execute("INSERT INTO load (load_id, state, stage, terminal, customer, doc_status, in_view, last_checked_at, next_check_at, source) "
+                     "VALUES (?,?,?,?,?,?,1,?,?,'dashboard')", (load_id, "wrong_doc_type", stage, terminal, customer, doc_status, fresh, fresh))
+    def held(load_id, sha, status, when, pod, customer):
+        row = ["2026-09-30 06:12", load_id, customer, pod, f"{sha}.pdf", "Text", "POD", "92%", "", "", "", "", "", status]
+        conn.execute("INSERT INTO autofile (load_id, sha256, source, outcome, final, status, row_json, logged, attempts, decided_at) "
+                     "VALUES (?,?,?,?,1,?,?,1,0,?)", (load_id, sha, f"tpro:{sha}", "held", status, json.dumps(row), when))
+    for i in range(3):
+        held(2597516, f"a{i}", "HELD - 2 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number); not uploaded, a person should look", fresh, "Jesse Klingler", "TireHub c/o Penske Logistics (FTL)")
+    held(2600101, "b0", "HELD - AI only 78% sure (needs 85%); 0 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number); not uploaded, a person should look", fresh, "Jesse Klingler", "United States Postal Service")
+    held(2585966, "c0", "HELD - AI only 60% sure (needs 85%); not uploaded, a person should look", old, "Frankie Saiz", "Spindrift Beverage Co Inc. c/o Shipwell")
+    conn.execute("INSERT INTO filing (load_id, sha256, tpro_file_id, document_type, comment, filed_at) VALUES (2585966, 'x', '1', 'Bill Of Lading', 'POD', ?)", (fresh,))
+    conn.commit()
+    rep = report.build(conn, now=now, terminals={1160, 1138}, pods={1160: "Frankie Saiz", 1138: "Jesse Klingler"}, sheet_id="SHEET")
+    check("the subject counts loads held and loads waiting, dated in Eastern",
+          rep.subject == "Doc Intake: 2 load(s) held, 2 delivered and waiting - 2026-09-30", rep.subject)
+    check("one line per held load, documents counted, the reason in the bot's words without its wrapping",
+          "2597516  (Jesse Klingler, TireHub c/o Penske Logistics (FTL)): 3 documents held - 2 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number)" in rep.text
+          and "2600101  (Jesse Klingler, United States Postal Service): 1 document held - AI only 78% sure (needs 85%); 0 fact(s) match TransportPro, 0 a reference number (needs 2, one a reference number)" in rep.text,
+          rep.text)
+    check("a hold older than the window is left out", "2585966  (" not in rep.text.split("DELIVERED")[0])
+    check("delivered loads still waiting with no POD from the bot are listed, other pods' and filed ones are not",
+          f"2571093  (Frankie Saiz, {report._short('Spindrift Beverage Co Inc. c/o Shipwell')}): delivered, still Waiting for Documents - nothing from the bot" in rep.text
+          and "2597516  (Jesse Klingler, TireHub c/o Penske Logistics (FTL)): delivered, still Waiting for Documents - held above" in rep.text
+          and "2599999" not in rep.text and "2585966" not in rep.text.split("DELIVERED")[1], rep.text)
+    check("the sheet is linked and the times are called Eastern", "spreadsheets/d/SHEET" in rep.text and "Times are US Eastern" in rep.text)
+    check("the counts are on the report", (rep.held_loads, rep.held_documents, rep.waiting_loads) == (2, 4, 2))
+    quiet = report.build(fresh_db(), now=now, terminals={1160}, pods={})
+    check("a quiet day says so", quiet.empty and quiet.subject == "Doc Intake: nothing held - 2026-09-30" and "  none" in quiet.text, quiet.subject)
 
 
 def test_comment_never_prints_a_non_name() -> None:
@@ -3877,6 +3924,7 @@ if __name__ == "__main__":
     test_a_new_pod_tab_is_styled_like_the_first()
     test_sheet_times_are_eastern()
     test_usps_paperwork_matches_on_route_trip_and_facility()
+    test_the_morning_report()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

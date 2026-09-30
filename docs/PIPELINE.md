@@ -51,6 +51,7 @@ bookkeeping and load checks run for all 16 pod terminals. Reading and uploading 
 |---|---|---|
 | Collector Lambda | `circle-doc-intake-collector` | python3.12, 512 MB, 10 min timeout, handler `intake.aws_lambda.handler` |
 | Worker Lambda | `circle-doc-intake-worker` | python3.12, 1.5 GB, 10 min timeout, handler `intake.aws_worker.handler` |
+| Report Lambda | `circle-doc-intake-report` | python3.12, 512 MB, handler `intake.aws_report.handler`; 07:00 America/New_York daily; mails the loads the bot did not file from `DocIntake@circle-analytics.com` (SES) to `INTAKE_REPORT_TO` in `.env` |
 | Schedules (EventBridge Scheduler) | `circle-doc-intake-every-15-min`, `circle-doc-intake-worker-every-15-min` | `rate(15 minutes)`, no retries |
 | Concurrency | both functions | Reserved concurrency 1. A trigger older than 60 s is dropped, so a run that fires while another is going is skipped. The next quarter-hour is the retry. |
 | Secrets | `circle-doc-intake/gmail-service-account` | Google service-account key: Gmail (delegated, read-only) and the Upload log sheet |

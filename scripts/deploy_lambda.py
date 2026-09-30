@@ -37,6 +37,7 @@ What it creates, all in the account and region the .env's AWS_PROFILE points at:
     logs        /aws/lambda/<function>                    90-day retention
     schedules   circle-doc-intake-every-15-min            the collector; rate(15 minutes)
                 circle-doc-intake-worker-every-15-min     the worker; rate(15 minutes); created DISABLED
+                circle-doc-intake-report-daily            the report; cron 07:00 America/New_York; created DISABLED
 """
 from __future__ import annotations
 
@@ -78,6 +79,9 @@ DEPS = ["boto3==1.43.98", "google-auth==2.58.0", "cryptography==50.0.1", "tzdata
 # Jesse Klingler (1138) from 30 Sep 2026. Each pod has a sheet tab of its own, named here (30 Sep 2026:
 # the original "Upload log" tab became "Upload Log - Saiz"); a pod left out of UPLOAD_TABS would write
 # to the log's default tab, "Upload log".
+# The morning report (intake/report.py): sent from a verified SES domain of Circle's. Recipients live in
+# .env as INTAKE_REPORT_TO, comma-separated, not in this public repository.
+REPORT_FROM = "DocIntake@circle-analytics.com"
 AUTO_TERMINALS = "1160,1138"
 UPLOAD_TABS = {1160: "Upload Log - Saiz", 1138: "Upload Log - Klinger"}
 
@@ -116,6 +120,24 @@ def _worker_env(env: dict) -> dict:
             # Secrets Manager as JSON {username, password}. Until then uploads go in as the reading login.
             **({"INTAKE_TPRO_UPLOAD_SECRET": env["INTAKE_TPRO_UPLOAD_SECRET"]}
                if env.get("INTAKE_TPRO_UPLOAD_SECRET") else {})}
+
+
+def _report_env(env: dict) -> dict:
+    return {"INTAKE_S3_BUCKET": env["INTAKE_S3_BUCKET"], "INTAKE_LEDGER_KEY": LEDGER_KEY,
+            "INTAKE_POD_CONFIG_KEY": POD_CONFIG_KEY, "INTAKE_AUTO_TERMINALS": AUTO_TERMINALS,
+            "INTAKE_REPORT_FROM": REPORT_FROM, "INTAKE_REPORT_TO": env.get("INTAKE_REPORT_TO", ""),
+            "INTAKE_REPORT_HOURS": "24", "INTAKE_UPLOAD_SHEET_ID": env["INTAKE_UPLOAD_SHEET_ID"]}
+
+
+def _report_policy(b: str, secret_arns: list[str], region: str, account: str) -> dict:
+    domain = REPORT_FROM.split("@", 1)[1]
+    return {"Version": "2012-10-17", "Statement": [
+        {"Sid": "ReadLedgerAndConfig", "Effect": "Allow", "Action": "s3:GetObject",
+         "Resource": [f"{b}/ledger/*", f"{b}/config/*"]},
+        {"Sid": "TellMissingFromForbidden", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": b},
+        {"Sid": "SendTheReport", "Effect": "Allow", "Action": ["ses:SendEmail", "ses:SendRawEmail"],
+         "Resource": [f"arn:aws:ses:{region}:{account}:identity/{domain}",
+                      f"arn:aws:ses:{region}:{account}:identity/{REPORT_FROM}"]}]}
 
 
 def _collector_policy(b: str, secret_arns: list[str], region: str, account: str) -> dict:
@@ -160,6 +182,13 @@ FUNCS = {
         "description": "Every 15 min: new mail from S3 into the ledger; in working hours, dashboard sweep and "
                        "load checks against TransportPro; for the pilot pod, AI reads and BOL/POD uploads "
                        "logged to the Upload log sheet."},
+    "report": {
+        "name": "circle-doc-intake-report", "schedule": "circle-doc-intake-report-daily",
+        "expression": "cron(0 7 * * ? *)", "timezone": "America/New_York",
+        "handler": "intake.aws_report.handler", "memory": 512, "secrets": lambda env: [],
+        "env": _report_env, "policy": _report_policy, "log_filter": '"report"',
+        "description": "Every morning at 07:00 Eastern: the loads the bot did not file in the last day, "
+                       "mailed to the pods' leads from DocIntake@circle-analytics.com."},
 }
 
 
@@ -317,9 +346,13 @@ def ensure_schedule(sess, key: str, fn_arn: str, account: str) -> None:
         exists = True
     except sch.exceptions.ResourceNotFoundException:
         current, exists = "DISABLED", False
-    body = dict(Name=spec["schedule"], ScheduleExpression="rate(15 minutes)", FlexibleTimeWindow={"Mode": "OFF"},
+    expression = spec.get("expression", "rate(15 minutes)")
+    body = dict(Name=spec["schedule"], ScheduleExpression=expression, FlexibleTimeWindow={"Mode": "OFF"},
                 Target={"Arn": fn_arn, "RoleArn": role, "RetryPolicy": {"MaximumRetryAttempts": 0}},
-                State=current, Description=f"Runs the doc-intake {key} every 15 minutes")
+                State=current, Description=f"Runs the doc-intake {key}: {expression}"
+                + (f" {spec['timezone']}" if spec.get("timezone") else ""))
+    if spec.get("timezone"):
+        body["ScheduleExpressionTimezone"] = spec["timezone"]
     for attempt in range(6):
         try:
             (sch.update_schedule if exists else sch.create_schedule)(**body)
