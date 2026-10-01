@@ -60,7 +60,7 @@ bookkeeping and load checks run for all 16 pod terminals. Reading and uploading 
 | IAM roles | `circle-doc-intake-collector`, `-worker`, `-scheduler` | least-privilege policies are in `scripts/deploy_lambda.py` |
 | Logs | `/aws/lambda/<function>` | 90-day retention; one JSON summary line per run |
 | S3 bucket | `INTAKE_S3_BUCKET` in `.env` | kept out of this public repository |
-| Upload log | `INTAKE_UPLOAD_SHEET_ID` in `.env`, one tab per pod from `INTAKE_UPLOAD_TABS`: `Upload Log - Saiz` (1160) and `Upload Log - Klinger` (1138) since 30 Sep 2026; a pod with no tab named falls back to `Upload log` | shared with the service account as an editor |
+| Upload log | `INTAKE_UPLOAD_SHEET_ID` in `.env`, one tab per pod from `INTAKE_UPLOAD_TABS`: `Upload Log - Saiz` (1160) and `Upload Log - Klingler` (1138) since 30 Sep 2026; a pod with no tab named falls back to `Upload log` | shared with the service account as an editor |
 | Region | us-east-1 | the AWS account behind `AWS_PROFILE` in `.env`, shared with other projects |
 
 Both functions run from the same zip (`deploy/collector.zip`). Each handler picks its entry point.
