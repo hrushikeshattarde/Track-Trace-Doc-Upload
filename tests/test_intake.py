@@ -339,9 +339,11 @@ def test_a_receiving_label_counts_the_facts_of_the_bol_sent_with_it() -> None:
 def test_a_pod_short_of_the_confidence_bar_goes_up_when_the_page_corroborates_it() -> None:
     """Loads 2568382, 2565691, 2572625 and 2587025 (25-28 Sep 2026): signed or stamped PODs read at
     78-83% and held on confidence alone, each with facts matching and the receiver's date on the
-    delivery day, and a person filed every one. From 75% such a page goes up when it carries the
-    receiver's signature or stamp, its receiver date is the delivery appointment day or the day
-    after, and two facts match, one a reference number. Any of those missing, or 74%, holds it."""
+    delivery day, and a person filed every one. From 70% (75% until load 2587817, 1 Oct 2026: a Kraft
+    Heinz BOL signed by the receiver in the shipper's block, read at 72%, filed by a person two minutes
+    after the hold) such a page goes up when it carries the receiver's signature or stamp, its receiver
+    date is the delivery appointment day or the day after, and two facts match, one a reference number.
+    Any of those missing, or 69%, holds it."""
     print("a POD short of the confidence bar goes up when the page corroborates it")
     import time as _time
     from intake import autofile
@@ -386,8 +388,15 @@ def test_a_pod_short_of_the_confidence_bar_goes_up_when_the_page_corroborates_it
     ups, got, _ = world(2600103, pod(2600103, date="9/26/26"))
     check("dated two days before the appointment: held on confidence, as before",
           not ups and got[0] == autofile.HELD and "AI only 80% sure" in got[1], str(got))
-    ups, got, _ = world(2600104, pod(2600104, conf=0.74))
-    check("74% is under the floor: held", not ups and got[0] == autofile.HELD, str(got))
+    ups, got, log = world(2600108, pod(2600108, conf=0.72))
+    check("72%, signed on the delivery day with facts matching: uploaded (load 2587817, 1 Oct 2026)",
+          ups == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str(got))
+    check("and the sheet says so", "AI 72% sure, under 85% but accepted" in next(iter(log.rows.values()))[9])
+    ups, got, _ = world(2600104, pod(2600104, conf=0.69))
+    check("69% is under the floor: held", not ups and got[0] == autofile.HELD, str(got))
+    from pod_intake import reader
+    check("the reader knows a BOL with no receiver line is signed wherever there is room",
+          "no printed line for the receiver" in reader.READER_SYSTEM and "2587817" in reader.READER_SYSTEM)
     ups, got, _ = world(2600105, pod(2600105, date=None))
     check("no receiver date on the page: held", not ups and got[0] == autofile.HELD, str(got))
     ups, got, _ = world(2600106, pod(2600106), delivery=None)

@@ -184,7 +184,7 @@ class Settings:
     terminals: frozenset[int] = frozenset()
     mode: str = OFF
     min_confidence: float = 0.85
-    pod_floor: float = 0.75       # a corroborated POD (corroborated_pod) may go up from here
+    pod_floor: float = 0.70       # a corroborated POD (corroborated_pod) may go up from here
     min_facts: int = 2
     daily_usd: float = 50.0      # a safety limit against a runaway, not a budget: a normal day is ~$1
     max_reads: int = 60
@@ -199,7 +199,7 @@ class Settings:
         terminals = frozenset(int(x) for x in re.split(r"[,\s]+", env.get("INTAKE_AUTO_TERMINALS") or "") if x)
         return cls(terminals=terminals, mode=mode,
                    min_confidence=float(env.get("INTAKE_AUTO_MIN_CONFIDENCE") or 0.85),
-                   pod_floor=float(env.get("INTAKE_AUTO_POD_FLOOR") or 0.75),
+                   pod_floor=float(env.get("INTAKE_AUTO_POD_FLOOR") or 0.70),
                    min_facts=int(env.get("INTAKE_AUTO_MIN_FACTS") or 2),
                    daily_usd=float(env.get("INTAKE_AUTO_DAILY_USD") or 50),
                    max_reads=int(env.get("INTAKE_AUTO_MAX_READS") or 60), pods=pods or {},
@@ -1169,7 +1169,11 @@ def corroborated_pod(ex, facts: list[str], strong: list[str], load: dict | None,
 
     Loads 2568382, 2565691, 2572625 and 2587025 (25-28 Sep 2026): signed or stamped PODs read at 78-83%
     and held on confidence alone, each with facts matching and the receiver's date on the delivery day,
-    and a person filed every one. From `pod_floor` such a page is accepted when the page itself
+    and a person filed every one. Load 2587817 (1 Oct 2026): a Kraft Heinz BOL the receiver signed
+    in the shipper's block, the only signature block the form has, read as a POD at 72% with two
+    references matching and the date on the delivery day; a person filed it two minutes after the
+    hold. Loads 2579182 and 2562048, 72% each, were filed by hand the same way, so the floor came down
+    from 75% to 70%. From `pod_floor` such a page is accepted when the page itself
     corroborates the reading three ways: the receiver's signature or stamp is on it, the receiver's
     date is the delivery appointment day (or the day after - trucks run late), and at least min_facts
     facts match, one a reference number. A shipper's form dated at loading fails on the date; a page

@@ -372,11 +372,16 @@ truck's stage.
 | A page the AI called a POD | must show a receiver signature, stamp or delivery time |
 | A POD | needs a receiver signature or stamp. An in/out time alone isn't enough: on load 2562069 it was the truck's dashboard clock. |
 
-A POD the AI is 75% to 84% sure of is still accepted when the page corroborates the reading three
+A POD the AI is 70% to 84% sure of is still accepted when the page corroborates the reading three
 ways (`corroborated_pod`, 28 Sep 2026): the receiver's signature or stamp is on it, the receiver's date is
 the delivery appointment day or the day after, and at least two facts match including a reference number.
 The sheet's Checks column then reads `all passed (AI 83% sure, under 85% but accepted: ...)`. Loads 2568382,
 2565691, 2572625 and 2587025 were held on confidence alone with all three present, and a person filed each.
+The floor was 75% until 1 Oct 2026: load 2587817, a Kraft Heinz BOL the receiver signed in the shipper's
+block (the form has no receiver line), read as a POD at 72% with two references matching and the date on the
+delivery day, and a person filed it two minutes after the hold; 2579182 and 2562048, 72% each, were filed by
+hand the same way, and no reading between 65% and 75% with that evidence was ever a wrong page. The reader
+is also told that on such forms a signature dated after the ship date is the receiver's.
 `INTAKE_AUTO_POD_FLOOR` moves the floor. A BOL between the floor and the bar is accepted when at least two
 reference numbers on it match the load (`corroborated_bol`, 30 Sep 2026: USPS's Contract Route Vehicle Record
 reads as a BOL at 78% however it is described, and its route and trip are the pick number).
