@@ -386,6 +386,20 @@ is also told that on such forms a signature dated after the ship date is the rec
 reference numbers on it match the load (`corroborated_bol`, 30 Sep 2026: USPS's Contract Route Vehicle Record
 reads as a BOL at 78% however it is described, and its route and trip are the pick number).
 
+**A page with none of the load's numbers** (`lane_match`, 2 Oct 2026) goes up when the paperwork cannot
+carry them. Load 2598125: a TireHub BOL for a Mavis store names TireHub's LD numbers while TransportPro
+holds Penske's shipment number; load 2599137: a Baker Hughes delivery note names the shipper's invoice
+while TransportPro holds nothing at all. Both were held with the cities matching and no reference number.
+Now, when no reference number matches, the page is accepted if its shipper and consignee are the load's
+two stops - each in the stop's city and sharing its street (`same_street`: house number and a street word)
+or its name (`same_name`: two of the stop's words, or its only one, and every word with a digit) - its date
+puts it on this trip (the ship date on the pickup day or the receiver's date on the delivery day, a day's
+slack), and a TransportPro search finds no other load of the customer between those cities within a day of
+the pickup (`lane_loads`, one search per load per run). The sheet's Checks column reads
+`all passed (lane match: ...)`; a rival load on the lane is named in the hold. `INTAKE_AUTO_LANE_RULE=off`
+switches it off. The reader now transcribes each party's street line (`Party.address`); readings made
+before 2 Oct 2026 match by name alone.
+
 **Matching facts** (`match_facts_detail`) compares every number on the page with the load.
 
 - Strong facts (reference numbers): load #, pickup #, PO #, reference #, manifest #, EDI reference #,

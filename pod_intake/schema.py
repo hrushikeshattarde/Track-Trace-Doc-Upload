@@ -27,6 +27,7 @@ class Party(BaseModel):
     name: Optional[str] = None
     city: Optional[str] = None
     state: Optional[str] = None
+    address: Optional[str] = Field(default=None, description="The street line as printed - number and street, e.g. '831 N OLD LAKE WILSON RD' - without city, state or ZIP.")
 
 
 class Signatures(BaseModel):

@@ -792,6 +792,111 @@ def test_two_usps_forms_for_one_trip_are_two_pages() -> None:
     check("and distinct doc_refs never collide", autofile.same_page_by_numbers(record.ex, extra.ex, "5398A-002D7-2A8BB 1/1") is False)
 
 
+def test_a_page_with_none_of_the_loads_numbers_goes_up_on_the_lane_and_the_date() -> None:
+    """Loads 2598125 and 2599137 (1-2 Oct 2026): a TireHub BOL for a Mavis store names only TireHub's
+    LD numbers, a Baker Hughes delivery note only the shipper's invoice; TransportPro held Penske's
+    shipment number on the one and nothing on the other. Both read as signed PODs at 90%+ and were held
+    with the cities matching and no reference number. A person files these by the lane and the date:
+    now, when no reference number matches, a page goes up if its shipper and consignee are the load's
+    stops (street or facility name, not city alone), its date puts it on this trip, and the customer
+    has no other load between those cities within a day of the pickup."""
+    print("a page with none of the load's numbers goes up on the lane and the date")
+    import time as _time
+    from intake import autofile
+
+    check("a street matches on its number and a word",
+          autofile.same_street("831 N OLD LAKE WILSON RD", "831 N Old Lake Wilson Rd")
+          and autofile.same_street("450 GILLS DR STE 100", "450 GILLS DR STE 100")
+          and not autofile.same_street("7105 Business Park Drive", "16111 Park Entry Dr")
+          and not autofile.same_street("831 N OLD LAKE WILSON RD", "831 Main St")
+          and not autofile.same_street(None, "831 Main St"))
+    check("a name matches on two words, or its only one, and every word with a digit",
+          autofile.same_name("MAVIS - 735", "MAVIS 735 KISSIMMEE") and autofile.same_name("PII North America LLC", "PII North America")
+          and autofile.same_name("Enbridge", "Enbridge") and autofile.same_name("TLC 107 ORLANDO", "TLC 107 ORLANDO")
+          and not autofile.same_name("Pete's Tire Barns", "james tire") and not autofile.same_name("WALMART DC 7012", "WALMART DC 6012")
+          and not autofile.same_name("Sysco", "Sysco Metro New York") and not autofile.same_name(None, "Enbridge"))
+    check("the env switch", autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_AUTO_LANE_RULE": "off"}).lane_rule is False
+          and autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on"}).lane_rule is True)
+
+    def tirehub(load_id):
+        return {"id": load_id, "status": {"documentStatus": "Waiting for Documents", "loadStatus": "Delivered"},
+                "billingInfo": {"customerId": 10609},
+                "reference": {"billOfLading": "312957762", "poNumber": "312957762", "referenceNumber": "312957762",
+                              "pickupNumber": "TL", "weight": 1, "numberOfPieces": 1},
+                "waypoints": [{"type": "SH", "location": {"companyName": "TLC 107 ORLANDO", "address": "450 GILLS DR STE 100",
+                                                          "city": "ORLANDO", "state": "FL", "timezone": -4},
+                               "appointmentTime": {"open": "2026-09-30T14:00:00Z"}, "reference": []},
+                              {"type": "CN", "location": {"companyName": "MAVIS 735 KISSIMMEE", "address": "831 N OLD LAKE WILSON RD",
+                                                          "city": "KISSIMMEE", "state": "FL", "timezone": -4},
+                               "appointmentTime": {"open": "2026-10-01T17:00:00Z"}, "reference": []}]}
+
+    def pod(load_id, *, shipper=None, consignee=None, ship_date="9/30/2026", receiver_date="9-1-26", conf=0.9):
+        r = _reading(load_id, "proof_of_delivery", receiver=True, conf=conf, numbers=[("BOL", "LD3206969"), ("Seal #", "031680")], city=None)
+        r["shipper"] = shipper or {"name": "TLC 107 ORLANDO", "address": "450 GILLS DR STE 100", "city": "ORLANDO", "state": "FL"}
+        r["consignee"] = consignee or {"name": "MAVIS - 735", "address": "831 N OLD LAKE WILSON RD", "city": "KISSIMMEE", "state": "FL"}
+        r["ship_date"] = ship_date
+        r["signatures"]["receiver_name"], r["signatures"]["receiver_date"] = "George Frisby", receiver_date
+        return r
+
+    def world(load_id, reading, load=None, rivals=(), lane_rule=True):
+        conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+        log = _AutoLog()
+        load_row(load_id, "pod_expected", "at consignee", terminal=1138)
+        tpro.add(load_id)
+        tpro.loads[load_id]["load"] = load or tirehub(load_id)
+        tpro.lane_loads = None if rivals is None else list(rivals)
+        (sha,) = mail(load_id, f"m{load_id}", [(_picture(load_id % 1000), reading)])
+        settings = autofile.Settings(terminals=frozenset({1138}), mode="on", pods={1138: "Jesse Klingler"}, lane_rule=lane_rule)
+        autofile.run(conn, tpro, store, read, log, settings, deadline=_time.monotonic() + 600)
+        got = conn.execute("SELECT outcome, status FROM autofile WHERE load_id=? AND sha256=?", (load_id, sha)).fetchone()
+        return [u["type"] for u in tpro.uploads], tuple(got) if got else None, log, tpro
+
+    ups, got, log, tpro = world(2598125, pod(2598125))
+    check("TireHub: both stops by street, the ship date on the pickup day, the only load on the lane: uploaded as Bill Of Lading",
+          ups == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str((got, ups)))
+    row = next(iter(log.rows.values()))
+    check("the sheet says why",
+          row[9].startswith("all passed (lane match: shipper at 450 GILLS DR STE 100, ORLANDO; consignee at 831 N OLD LAKE WILSON RD, "
+                            "KISSIMMEE; ship date 9/30/2026 on the pickup day; the customer's only load on this lane that day"), row[9])
+    check("TransportPro was asked for the customer's loads a day either side of the pickup, once",
+          tpro.searches == [{"customerId": "10609", "pickupDateStart": "2026-09-29", "pickupDateEnd": "2026-10-01"}], str(tpro.searches))
+    ups, got, _, _ = world(2598125, pod(2598125), rivals=[tirehub(2598126)])
+    check("a second load of the customer between the same cities that day: held, and the status names it",
+          not ups and got[0] == autofile.HELD and "also has load 2598126 between these cities that day" in got[1], str(got))
+    other_lane = tirehub(2598127)
+    other_lane["waypoints"][1]["location"]["city"] = "TAMPA"
+    ups, got, _, _ = world(2598125, pod(2598125), rivals=[other_lane])
+    check("a load of the customer to another city that day is no rival", ups == ["Bill Of Lading"], str(got))
+    ups, got, _, _ = world(2598125, pod(2598125, consignee={"name": "Pete's Tire Barns", "address": "114 New Athol Rd", "city": "KISSIMMEE", "state": "FL"}))
+    check("the consignee's street and name both differ: held on facts, as before",
+          not ups and got[0] == autofile.HELD and "0 a reference number" in got[1], str(got))
+    ups, got, _, _ = world(2598125, pod(2598125, consignee={"name": "MAVIS - 735", "address": "831 N OLD LAKE WILSON RD", "city": "ORLANDO", "state": "FL"}))
+    check("the right street in the wrong city: held", not ups and got[0] == autofile.HELD, str(got))
+    ups, got, _, _ = world(2598125, pod(2598125, ship_date="9/20/2026", receiver_date="9/21/26"))
+    check("dates that put the page on another trip: held", not ups and got[0] == autofile.HELD, str(got))
+    ups, got, _, _ = world(2598125, pod(2598125), rivals=None)
+    check("TransportPro could not be asked: held, as before", not ups and got[0] == autofile.HELD, str(got))
+    ups, got, _, _ = world(2598125, pod(2598125), lane_rule=False)
+    check("INTAKE_AUTO_LANE_RULE=off: held", not ups and got[0] == autofile.HELD, str(got))
+
+    pii = {"id": 2599137, "status": {"documentStatus": "Waiting for Documents"}, "billingInfo": {"customerId": 7245},
+           "reference": {"weight": 1000, "numberOfPieces": 1},
+           "waypoints": [{"type": "SH", "location": {"companyName": "PII North America", "address": "16111 Park Entry Dr", "city": "Houston", "state": "TX", "timezone": -5},
+                          "appointmentTime": {"open": "2026-09-30T19:00:00Z"}, "reference": []},
+                         {"type": "CN", "location": {"companyName": "Enbridge", "address": "46552 Swazey Rd", "city": "Lewisville", "state": "OH", "timezone": -4},
+                          "appointmentTime": {"open": "2026-10-02T12:00:00Z"}, "reference": []}]}
+    note = pod(2599137, shipper={"name": "PII North America LLC", "address": "7105 Business Park Drive", "city": "Houston", "state": "Texas"},
+               consignee={"name": "Enbridge", "address": "46552 Swazey Rd", "city": "Lewisville", "state": "OH"},
+               ship_date=None, receiver_date="10/2/26", conf=0.94)
+    note["numbers"] = [{"label": "Shipping Invoice", "kind": "other", "value": "454227/M008/1", "handwritten": False, "confidence": 0.9}]
+    ups, got, log, _ = world(2599137, note, load=pii)
+    check("Baker Hughes: no reference numbers on the load, the office address on the ship-from, the receiver's date on the delivery day: uploaded",
+          ups == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str(got))
+    row = next(iter(log.rows.values()))
+    check("by name where the street differs, by street where it matches",
+          "shipper PII North America, Houston; consignee at 46552 Swazey Rd, Lewisville; receiver's date 10/2/26 on the delivery day" in row[9], row[9])
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -2912,6 +3017,8 @@ class _AutoTPro:
         self.next_id = 900
         self.fail_uploads = 0
         self.calls = 0
+        self.lane_loads: list[dict] | None = []     # what /load/search answers; None makes it fail
+        self.searches: list[dict] = []
 
     def add(self, load_id, doc="Waiting for Documents", files=(), delivery=None):
         self.loads[load_id] = {"load": _tp_auto(load_id, doc, delivery), "files": [], "bytes": {}}
@@ -2926,6 +3033,14 @@ class _AutoTPro:
     def files(self, load_id):
         self.calls += 1
         return [dict(f) for f in self.loads[load_id]["files"]]
+
+    def search_all_pages(self, params):
+        self.calls += 1
+        self.searches.append(dict(params))
+        if self.lane_loads is None:
+            from intake.tpro import TProError
+            raise TProError(500, "/load/search", "down")
+        return [dict(x) for x in self.lane_loads]
 
     def download_file(self, file_id):
         self.calls += 1
@@ -3977,6 +4092,7 @@ if __name__ == "__main__":
     test_usps_paperwork_matches_on_route_trip_and_facility()
     test_the_morning_report()
     test_two_usps_forms_for_one_trip_are_two_pages()
+    test_a_page_with_none_of_the_loads_numbers_goes_up_on_the_lane_and_the_date()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

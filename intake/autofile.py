@@ -24,7 +24,10 @@ A document is uploaded only when all of these hold:
     - there is no personal ID on it. Never uploaded, never logged
     - the AI is at least 85% sure what it is
     - at least two facts on the page match the load in TransportPro, one of them a reference number
-      (a city or a piece count alone matches every load on a lane)
+      (a city or a piece count alone matches every load on a lane) - or, when the paperwork carries
+      none of the load's numbers, the page names both stops by street or facility name, its date
+      puts it on this trip, and the customer has no other load between those cities within a day
+      of the pickup (lane_match, 2 Oct 2026: TireHub's and Baker Hughes's forms never carry them)
     - a receiver-signed page waits until TransportPro has the truck at the consignee
     - it is not already on the load: the same file, or the same picture. A BOL on file under any
       paperwork type counts; a POD counts only under a type that clears (Bill Of Lading, Proof of
@@ -190,6 +193,7 @@ class Settings:
     max_reads: int = 60
     pods: dict[int, str] = field(default_factory=dict)
     tabs: dict[int, str] = field(default_factory=dict)   # terminal -> its own sheet tab; the rest use the log's
+    lane_rule: bool = True        # lane_match: a page with none of the load's numbers may go up on the lane and the date
 
     @classmethod
     def from_env(cls, env, pods: dict[int, str] | None = None) -> "Settings":
@@ -203,7 +207,8 @@ class Settings:
                    min_facts=int(env.get("INTAKE_AUTO_MIN_FACTS") or 2),
                    daily_usd=float(env.get("INTAKE_AUTO_DAILY_USD") or 50),
                    max_reads=int(env.get("INTAKE_AUTO_MAX_READS") or 60), pods=pods or {},
-                   tabs={int(k): str(v) for k, v in json.loads(env.get("INTAKE_UPLOAD_TABS") or "{}").items()})
+                   tabs={int(k): str(v) for k, v in json.loads(env.get("INTAKE_UPLOAD_TABS") or "{}").items()},
+                   lane_rule=(env.get("INTAKE_AUTO_LANE_RULE") or "on").strip().lower() != "off")
 
 
 @dataclass
@@ -319,6 +324,7 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
         stats.mode = OFF
         return stats
     uploader = uploader or tpro
+    _LANE_CACHE.clear()
     day = dt.datetime.now(dt.timezone.utc).date().isoformat()
     stats.spent_today = float(db.get_state(conn, f"ai_spend:{day}") or 0)
     if reopen_too_long(conn):
@@ -614,7 +620,7 @@ def _batch_mates(conn, store, tpro, s: Settings, row, load: dict, filed: list[On
             continue
         d = file_doc(of, filed)
         dec = judge(conn, s, row, load, filed, d, json.loads(att["extraction_json"]),
-                    sig=lambda d=d: doc_sig(conn, store, tpro, d))
+                    sig=lambda d=d: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load))
         if dec is not None:
             out.append(dec)
     return out
@@ -632,7 +638,7 @@ def _sent_mates(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnF
         if att is None or att["extraction_json"] is None:
             continue
         dec = judge(conn, s, row, load, filed, d, json.loads(att["extraction_json"]),
-                    sig=lambda d=d: doc_sig(conn, store, tpro, d))
+                    sig=lambda d=d: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load))
         if dec is not None:
             out.append(dec)
     return out
@@ -1098,7 +1104,7 @@ def _decide(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnFile]
             return quick_decision(d, q)
         return None                                   # not read yet: next run
     return judge(conn, s, row, load, filed, d, json.loads(att["extraction_json"]),
-                 sig=lambda: doc_sig(conn, store, tpro, d))
+                 sig=lambda: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load))
 
 
 def quick_decision(d: Doc, q: tuple[str, float]) -> Decision:
@@ -1142,12 +1148,22 @@ def page_date(text) -> dt.date | None:
         return None
 
 
+def stop_of(load: dict | None, kind: str) -> dict | None:
+    """The load's pickup ("SH", the first) or delivery ("CN", the last) stop."""
+    stops = [w for w in (load or {}).get("waypoints") or [] if w.get("type") == kind]
+    return (stops[0] if kind == "SH" else stops[-1]) if stops else None
+
+
 def delivery_day(load: dict | None) -> dt.date | None:
     """The consignee appointment's date, on the consignee's own clock (the stop's UTC offset)."""
-    stops = [w for w in (load or {}).get("waypoints") or [] if w.get("type") == "CN"]
-    if not stops:
+    return stop_day(load, "CN")
+
+
+def stop_day(load: dict | None, kind: str) -> dt.date | None:
+    """The date of a stop's appointment, on the stop's own clock (its UTC offset)."""
+    w = stop_of(load, kind)
+    if w is None:
         return None
-    w = stops[-1]
     when = (w.get("appointmentTime") or {}).get("open") or (w.get("appointmentTime") or {}).get("close")
     if not when:
         return None
@@ -1212,8 +1228,138 @@ def corroborated_bol(ex, facts: list[str], strong: list[str], s: Settings) -> st
             f"({'; '.join(strong)})")
 
 
+STREET_NOISE = frozenset("RD ROAD DR DRIVE ST STREET AVE AVENUE STE SUITE BLVD BOULEVARD HWY HIGHWAY LN LANE CT COURT "
+                         "PKWY PARKWAY WAY PL PLACE N S E W NORTH SOUTH EAST WEST NE NW SE SW UNIT BLDG FL RM ROOM".split())
+NAME_NOISE = frozenset("LLC INC CO CORP CORPORATION COMPANY LTD LP LLP THE OF AND DBA".split())
+_LANE_CACHE: dict[int, list | None] = {}     # load id -> lane_loads, for one run
+
+
+def _words(text: Any) -> list[str]:
+    return [t for t in re.split(r"[^A-Z0-9]+", str(text or "").upper()) if t]
+
+
+def same_street(page: str | None, stop: str | None) -> bool:
+    """'831 N OLD LAKE WILSON RD' on the page is TransportPro's '831 N Old Lake Wilson Rd': the house
+    number and one street word agree. Suffixes and compass points decide nothing."""
+    a, b = _words(page), _words(stop)
+    if not a or not b or not a[0].isdigit() or a[0] != b[0]:
+        return False
+
+    def words(ws: list[str]) -> set[str]:
+        return {t for t in ws[1:] if len(t) >= 3 and t not in STREET_NOISE}
+    return bool(words(a) & words(b))
+
+
+def same_name(page: str | None, stop: str | None) -> bool:
+    """'MAVIS - 735' is the stop 'MAVIS 735 KISSIMMEE'; 'PII North America LLC' is 'PII North America';
+    'Enbridge' is 'Enbridge'; "Pete's Tire Barns" is not 'james tire'. Two of the stop's words on the
+    page (or its only one), and every word with a digit in it: 'WALMART DC 7012' is not 'WALMART DC 6012'."""
+    want = [t for t in _words(stop) if t not in NAME_NOISE]
+    have = {t for t in _words(page) if t not in NAME_NOISE}
+    if not want or not have:
+        return False
+    if any(any(c.isdigit() for c in t) and t not in have for t in want):
+        return False
+    hits = [t for t in want if t in have]
+    return len(hits) >= 2 or (len(want) == 1 and len(hits) == 1)
+
+
+def lane_evidence(ex, load: dict) -> list[str] | None:
+    """How the page's shipper and consignee are the load's two stops, or None. Each party must sit in
+    the stop's city and share its street or its name: a city alone is every load on the lane."""
+    out: list[str] = []
+    for side, kind in (("shipper", "SH"), ("consignee", "CN")):
+        party = getattr(ex, side)
+        loc = (stop_of(load, kind) or {}).get("location") or {}
+        if not party.city or not loc.get("city") or _norm(party.city) != _norm(loc["city"]):
+            return None
+        if same_street(getattr(party, "address", None), loc.get("address")):
+            out.append(f"{side} at {loc['address']}, {loc['city']}")
+        elif same_name(party.name, loc.get("companyName")):
+            out.append(f"{side} {loc['companyName']}, {loc['city']}")
+        else:
+            return None
+    return out
+
+
+def page_on_trip(ex, load: dict) -> str | None:
+    """The date on the page that puts it on this trip: the ship date on the pickup day, or the
+    receiver's date on the delivery day, a day's slack either way."""
+    pick, deliver = stop_day(load, "SH"), stop_day(load, "CN")
+    for label, text, day, name in (("ship date", ex.ship_date, pick, "pickup"),
+                                   ("receiver's date", ex.signatures.receiver_date, deliver, "delivery"),
+                                   ("delivery date", ex.delivery_date, deliver, "delivery")):
+        when = page_date(text)
+        if when is not None and day is not None and abs((when - day).days) <= DELIVERY_DAY_SLACK:
+            return f"{label} {text} on the {name} day"
+    return None
+
+
+def same_lane(a: dict, b: dict) -> bool:
+    """Two loads between the same two cities."""
+    for kind in ("SH", "CN"):
+        la = (stop_of(a, kind) or {}).get("location") or {}
+        lb = (stop_of(b, kind) or {}).get("location") or {}
+        if (not la.get("city") or _norm(la.get("city")) != _norm(lb.get("city") or "")
+                or _norm(la.get("state") or "") != _norm(lb.get("state") or "")):
+            return False
+    return True
+
+
+def lane_loads(tpro, load: dict) -> list[dict] | None:
+    """The customer's other loads picking up within a day of this one - what a lane match has to be
+    unique among. None when TransportPro could not be asked, which is not the same as none."""
+    load_id = int(load.get("id") or 0)
+    if load_id in _LANE_CACHE:
+        return _LANE_CACHE[load_id]
+    customer = (load.get("billingInfo") or {}).get("customerId")
+    day = stop_day(load, "SH")
+    out: list[dict] | None
+    if not customer or day is None:
+        out = None
+    else:
+        try:
+            found = tpro.search_all_pages({"customerId": str(customer),
+                                           "pickupDateStart": (day - dt.timedelta(days=1)).isoformat(),
+                                           "pickupDateEnd": (day + dt.timedelta(days=1)).isoformat()})
+            out = [x for x in found if int(x.get("id") or 0) != load_id]
+        except Exception as e:  # noqa: BLE001 - the page is held, as it would have been
+            print(f"  ! lane check for load {load_id} failed: {type(e).__name__}: {str(e)[:120]}")
+            out = None
+    _LANE_CACHE[load_id] = out
+    return out
+
+
+def lane_match(ex, load: dict, s: Settings, others: Callable[[], list[dict] | None]) -> tuple[str | None, str | None]:
+    """Why a page carrying none of the load's reference numbers may still go up - or why not.
+
+    Loads 2598125 and 2599137 (1-2 Oct 2026): a TireHub BOL for a Mavis store names only TireHub's own
+    LD numbers, and a Baker Hughes delivery note only the shipper's invoice, while TransportPro held
+    Penske's shipment number on the one and nothing at all on the other. A person files these by the
+    lane and the date, and so does this: the page names both stops (street or facility name, not city
+    alone), its date puts it on this trip, and the customer has no other load between those cities
+    within a day of the pickup - so there is no other load it could be. Returns (reason, None) when
+    accepted, (None, blocker) when the lane and the date fit but another load shares them, and
+    (None, None) when the rule does not reach."""
+    if not s.lane_rule:
+        return None, None
+    evidence = lane_evidence(ex, load)
+    if not evidence:
+        return None, None
+    when = page_on_trip(ex, load)
+    if when is None:
+        return None, None
+    rivals = others()
+    if rivals is None:
+        return None, None
+    same = [str(r.get("id")) for r in rivals if same_lane(load, r)]
+    if same:
+        return None, f"the lane and the date fit, but the customer also has load {', '.join(same)} between these cities that day"
+    return f"lane match: {'; '.join(evidence)}; {when}; the customer's only load on this lane that day", None
+
+
 def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, reading: dict, *,
-          sig: Callable[[], list]) -> Decision | None:
+          sig: Callable[[], list], others: Callable[[], list[dict] | None] | None = None) -> Decision | None:
     """What should happen to this document on this load. Makes no TransportPro call and records
     nothing; `sig` may fetch the document from the archive once, to thumbnail it."""
     from pod_intake.matcher import classify_type
@@ -1285,9 +1431,13 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
             dec.failed.append(f"AI only {ex.document_type_confidence:.0%} sure (needs {s.min_confidence:.0%})")
             dec.why.add("confidence")
     if len(dec.facts) < s.min_facts or strong < 1:
-        dec.why.add("facts")
-        dec.failed.append(f"{len(dec.facts)} fact(s) match TransportPro, {strong} a reference number "
-                          f"(needs {s.min_facts}, one a reference number)")
+        lane, blocker = lane_match(ex, load, s, others) if strong < 1 and others is not None else (None, None)
+        if lane:
+            dec.allowed.append(lane)
+        else:
+            dec.why.add("facts")
+            dec.failed.append(f"{len(dec.facts)} fact(s) match TransportPro, {strong} a reference number "
+                              f"(needs {s.min_facts}, one a reference number)" + (f"; {blocker}" if blocker else ""))
     if d.message_id:
         routing, conflicted = filing._routing_of(conn, int(row["load_id"]), d.sha256)
         if conflicted:
@@ -1573,7 +1723,7 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
             _record(conn, s, row, dec)
             continue
         again = judge(conn, s, row, load, filed, dec.doc, json.loads(db.get_attachment(conn, dec.doc.sha256)["extraction_json"]),
-                      sig=lambda d=dec.doc: doc_sig(conn, store, tpro, d))
+                      sig=lambda d=dec.doc: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load))
         rejudged.append((dec, again))
     # The set is judged again as a set: a lead that stood on pooled facts must stand on them still.
     pool_set_facts([a for _, a in rejudged if a is not None], row, s,
