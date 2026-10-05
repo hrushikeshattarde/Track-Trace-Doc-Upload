@@ -897,6 +897,81 @@ def test_a_page_with_none_of_the_loads_numbers_goes_up_on_the_lane_and_the_date(
           "shipper PII North America, Houston; consignee at 46552 Swazey Rd, Lewisville; receiver's date 10/2/26 on the delivery day" in row[9], row[9])
 
 
+def test_a_bare_signature_page_takes_the_facts_of_the_page_texted_with_it() -> None:
+    """Load 2604225 (5 Oct 2026): the driver texted page 1 of an A3 straight BOL (BOL AA260640454 and
+    NNS PO 4300601775, both on the load) and, 17 seconds later, its certification page signed by the
+    receiver James O'Neill 10-5-26 - a page with no numbers on it at all. Page 1 was already on the
+    load as the Driver Supplied BOL TransportPro files for a text; the signed page matched nothing and
+    was held. The set rule needed a shared reference number, which a bare page cannot have. Now a
+    signed page naming nothing takes the facts of a page sent with it that matched the load on its own,
+    and the two go up as one POD. A page with numbers that match nothing is not bare and stays held."""
+    print("a bare signature page takes the facts of the page texted with it")
+    import time as _time
+    from intake import autofile
+
+    def text(fid, when):
+        return {"id": fid, "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL", "uploadById": 1,
+                "comments": "Driver Supplied Image - load", "dateCreated": when}
+
+    def load_of(load_id):
+        return {"id": load_id, "status": {"documentStatus": "Waiting for Documents", "loadStatus": "Dispatched"},
+                "billingInfo": {"customerId": 9833},
+                "reference": {"billOfLading": "AA260640454", "poNumber": "4300601775", "weight": 10000, "numberOfPieces": 1},
+                "waypoints": [{"type": "SH", "location": {"companyName": "Palmer Holland", "address": "7715 S 78th Ave", "city": "Bridgeview",
+                                                          "state": "IL", "timezone": -5}, "appointmentTime": {"open": "2026-10-02T12:00:00Z"}, "reference": []},
+                              {"type": "CN", "location": {"companyName": "Williford Plastics", "address": "2300 Steppingstone Square", "city": "Chesapeake",
+                                                          "state": "VA", "timezone": -4}, "appointmentTime": {"open": "2026-10-05T11:00:00Z"}, "reference": []}]}
+
+    def page1(load_id, numbers=(("BOL#", "AA260640454"), ("NNS PO Number", "4300601775"))):
+        r = _reading(load_id, conf=0.94, numbers=list(numbers), city="Chesapeake")
+        r["signatures"].update({"shipper_signed": False, "driver_signed": False})
+        r["pages"] = [{"page": 1, "role": "bol", "legibility": 0.9, "doc_ref": "AA260640454 1/2"}]
+        return r
+
+    def page2(load_id, numbers=()):
+        r = _reading(load_id, "proof_of_delivery", receiver=True, conf=0.86, numbers=list(numbers), city=None)
+        r["signatures"].update({"shipper_signed": False, "driver_signed": False, "receiver_name": "James O'Neill", "receiver_date": "10-5-26"})
+        r["pages"] = [{"page": 1, "role": "pod", "legibility": 0.8}]
+        return r
+
+    def world(load_id, first, second, *, alone=False):
+        conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+        log = _AutoLog()
+        load_row(load_id, "pod_expected", "at consignee", terminal=1138)
+        files = [(text(702, "2026-10-05T11:55:14Z"), _picture(32))]
+        if not alone:
+            files.insert(0, (text(701, "2026-10-05T11:54:57Z"), _picture(31)))
+        tpro.add(load_id, files=files)
+        tpro.loads[load_id]["load"] = load_of(load_id)
+        on_load(_picture(31), first)
+        on_load(_picture(32), second)
+        s = autofile.Settings(terminals=frozenset({1138}), mode="on", pods={1138: "Jesse Klingler"})
+        autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+        outcome = {r[0]: r[1] for r in conn.execute("SELECT source, outcome FROM autofile WHERE load_id=?", (load_id,))}
+        return tpro.uploads, outcome, log
+
+    ups, outcome, log = world(2604225, page1(2604225), page2(2604225))
+    check("the signed page and the BOL page texted with it go up as one two-page Bill Of Lading",
+          len(ups) == 1 and ups[0]["type"] == "Bill Of Lading" and len(autofile.picture_sig(ups[0]["data"])) == 2,
+          str([(u["type"], u["comment"]) for u in ups]))
+    check("naming both texts it copies", ups and "copy of Driver Supplied BOL 701 + 702" in ups[0]["comment"], ups[0]["comment"] if ups else "")
+    check("both pages are recorded as uploaded",
+          outcome == {"tpro:701": autofile.UPLOADED, "tpro:702": autofile.UPLOADED}, str(outcome))
+    facts = next(iter(log.rows.values()))[8] if log.rows else ""
+    check("one sheet row, whose facts say they were counted with page 1, texted together",
+          len(log.rows) == 1 and "counted with 701" in facts and "texted together" in facts and "BOL # AA260640454" in facts,
+          f"{len(log.rows)} rows; {facts}")
+
+    ups, outcome, _ = world(2604226, page1(2604226), page2(2604226, numbers=[("PO", "PO7777777")]))
+    check("a signed page with a number of its own that matches nothing is not bare: held, nothing goes up",
+          not ups and outcome.get("tpro:702") == autofile.HELD, str((outcome, len(ups))))
+    ups, outcome, _ = world(2604227, page1(2604227, numbers=[("BOL#", "ZZ9999"), ("PO", "PO7777777")]), page2(2604227))
+    check("a bare signed page whose mate does not match the load: held, nothing goes up",
+          not ups and outcome.get("tpro:702") == autofile.HELD, str((outcome, len(ups))))
+    ups, outcome, _ = world(2604228, page1(2604228), page2(2604228), alone=True)
+    check("a bare signed page texted on its own: held", not ups and outcome.get("tpro:702") == autofile.HELD, str((outcome, len(ups))))
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -4093,6 +4168,7 @@ if __name__ == "__main__":
     test_the_morning_report()
     test_two_usps_forms_for_one_trip_are_two_pages()
     test_a_page_with_none_of_the_loads_numbers_goes_up_on_the_lane_and_the_date()
+    test_a_bare_signature_page_takes_the_facts_of_the_page_texted_with_it()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

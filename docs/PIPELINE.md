@@ -439,7 +439,10 @@ is the hand-off to a person.
   facts, and both were held; as a set the label leads, the BOL joins, and one POD goes up. The receiver's
   evidence and the confidence are never borrowed, and a promoted lead still waits for the consignee stage.
   A BOL page the classifier typed as a POD claim for its times alone joins a POD set on its facts. A mate that already went up as Driver Supplied BOL in an
-  earlier run still counts (`_sent_mates`).
+  earlier run still counts (`_sent_mates`). A signed page that names nothing at all - load 2604225 (5 Oct
+  2026), the certification page of an A3 straight BOL texted 17 seconds after page 1 - has no reference
+  number to share; it takes the facts of a page sent with it that matched the load on its own, and the two
+  go up as one POD. A page with numbers of its own that match nothing is not bare and stays held.
 - **Other pages of the same document join it** even when they match nothing in TransportPro on their
   own: a page whose `doc_ref` carries a document number already in the set (load 2593890's signed
   page 3 of 3, whose only number was the BOL number).

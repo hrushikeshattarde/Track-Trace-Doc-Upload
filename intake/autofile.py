@@ -542,7 +542,14 @@ def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[
 
     `more` supplies, on demand, the pages of the load decided for good in an earlier run, judged
     again (_sent_mates): the BOL that went up as Driver Supplied BOL while TransportPro still had
-    the truck loaded is the label's mate all the same once the truck is at the consignee."""
+    the truck loaded is the label's mate all the same once the truck is at the consignee.
+
+    A signed page that names nothing at all - load 2604225 (5 Oct 2026): the certification page of an
+    A3 straight BOL, signed by the receiver, texted 17 seconds after page 1, which carried the BOL and
+    the PO - has no reference number to share with anything. It takes the facts of a page sent with it
+    that matched the load on its own (min_facts facts, one a reference number): the burst and the
+    matching page are the tie, and the two go up as one POD. A page with numbers of its own that
+    match nothing is not bare - it may be another load's - and stays held."""
     pool: list[Decision] | None = None
     for dec in decisions:
         if dec.outcome != HELD or dec.kind != "POD" or dec.why != {"facts"} or dec.ex is None:
@@ -551,10 +558,12 @@ def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[
             continue
         if pool is None:
             pool = decisions + (more() if more is not None else [])
+        bare = not dec.ex.numbers and not dec.strong          # a signature page naming nothing (2604225)
         mates = [m for m in pool if m is not dec and m.ex is not None and m.kind is not None
                  and same_sending(m.doc, dec.doc) and (m.conf or 0) >= s.min_confidence
                  and m.why <= {"pod_evidence"} and m.outcome in ("ready", HELD, ON_FILE, NOT_NEEDED, UPLOADED)
-                 and set(m.strong) & set(dec.strong)]
+                 and (set(m.strong) & set(dec.strong)
+                      or (bare and m.strong and len(m.facts) >= s.min_facts))]
         if not mates:
             continue
         facts = list(dec.facts) + [f for m in mates for f in m.facts if f not in dec.facts]
@@ -2070,7 +2079,8 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
     facts = ((f"{len(dec.facts)} fact(s): " + "; ".join(dec.facts)) if dec.facts
              else "not checked - not read in full" if ex is None else "nothing on the page matches")
     if dec.pooled:
-        facts += " (counted with " + ", ".join(dec.pooled) + ", sent in the same email)"
+        together = "texted together" if str(dec.doc.batch or "").startswith("text:") else "sent in the same email"
+        facts += " (counted with " + ", ".join(dec.pooled) + f", {together})"
     checks = ("FAILED: " + "; ".join(dec.failed)) if dec.failed else (
         ("all passed" + (f" ({'; '.join(dec.allowed)})" if dec.allowed else "")) if dec.outcome in (UPLOADED, DRY) else "")
     shows_upload = dec.outcome in (UPLOADED, DRY) or (dec.outcome in (WAITING, HELD) and upload_as)
