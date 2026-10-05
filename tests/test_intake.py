@@ -1034,6 +1034,66 @@ def test_a_number_in_a_stops_notes_is_a_reference_number() -> None:
     check("without the note it is one fact, held as before", not ups and got[0] == autofile.HELD and "1 fact(s)" in got[1], str(got))
 
 
+def test_a_checked_pod_goes_up_once_the_delivery_appointment_has_passed() -> None:
+    """Loads 2591186, 2579837, 2580421, 2586987, 2577903, 2555932 and 2598344 (25 Sep - 5 Oct 2026):
+    stamped or signed PODs that passed every check sat waiting for a dispatch status the carriers move
+    late or never - 2591186's still said Loaded two days after delivery - and a person filed six of
+    the seven. Now, once the delivery appointment has passed, a POD whose receiver date is not before
+    the delivery day goes up whatever the dispatch says; a page dated before the delivery day (2577911:
+    a signature of 1 Oct on a delivery of 9 Oct) waits for the stage as before, and so does a load with
+    no delivery appointment. A year-less stamp date like "10-3" is read in the appointment's year."""
+    print("a checked POD goes up once the delivery appointment has passed")
+    import time as _time
+    from intake import autofile
+
+    check("a year-less date takes the year it is given, and an explicit year wins",
+          autofile.page_date("10-3", year=2026) == autofile.dt.date(2026, 10, 3) and autofile.page_date("10/3", year=2026) == autofile.dt.date(2026, 10, 3)
+          and autofile.page_date("10-3") is None and autofile.page_date("10/03/26", year=2025) == autofile.dt.date(2026, 10, 3)
+          and autofile.page_date("HW", year=2026) is None)
+
+    def pod(load_id, date="10-3", conf=0.94):
+        r = _reading(load_id, "proof_of_delivery", receiver=True, conf=conf)
+        r["signatures"].update({"receiver_name": "HW", "receiver_date": date, "stamp_present": True})
+        r["pages"] = [{"page": 1, "role": "pod", "legibility": 0.8}]
+        return r
+
+    def world(load_id, reading, delivery="2026-10-03", stage="loaded"):
+        conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+        log = _AutoLog()
+        load_row(load_id, "pod_expected", stage)
+        tpro.add(load_id, delivery=delivery)
+        (sha,) = mail(load_id, f"m{load_id}", [(_picture(load_id % 1000), reading)])
+        s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+        autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+        got = conn.execute("SELECT outcome, status, final FROM autofile WHERE load_id=? AND sha256=?", (load_id, sha)).fetchone()
+        return [u["type"] for u in tpro.uploads], tuple(got) if got else None, log
+
+    ups, got, log = world(2591186, pod(2591186))
+    check("the truck still 'loaded' two days after the appointment, the stamp dated the delivery day: uploaded as Bill Of Lading",
+          ups == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str(got))
+    row = next(iter(log.rows.values()))
+    check("and the sheet says why", "all passed (the delivery appointment (2026-10-03 08:00 ET) has passed, receiver's date 10-3 on the delivery day)" in row[9], row[9])
+    ups, got, _ = world(2591187, pod(2591187, date="10/4/26"))
+    check("dated the day after the appointment: still goes up", ups == ["Bill Of Lading"], str(got))
+    ups, got, _ = world(2591188, pod(2591188, date="HW"))
+    check("a date the parser cannot read does not block it", ups == ["Bill Of Lading"], str(got))
+    ups, got, _ = world(2577915, pod(2577915, date="10/9/26"), delivery="2026-10-09")
+    check("the appointment still ahead: waits, and the status says what would release it",
+          not ups and got[0] == autofile.WAITING and got[2] == 0 and "or the delivery appointment (2026-10-09 08:00 ET) passes" in got[1], str(got))
+    ups, got, _ = world(2577911, pod(2577911, date="10-01-26"), delivery="2026-10-09")
+    check("2577911's shape - signed 1 Oct for a 9 Oct delivery: waits, and says the date will not release it either",
+          not ups and got[0] == autofile.WAITING and "the page's date 10-01-26 is before the delivery day (Oct 09)" in got[1], str(got))
+    ups, got, _ = world(2577912, pod(2577912, date="9/25/26"))
+    check("the appointment passed but the page is dated before the delivery day: waits for the stage, and says so",
+          not ups and got[0] == autofile.WAITING and "is before the delivery day (Oct 03)" in got[1], str(got))
+    ups, got, _ = world(2577913, pod(2577913), delivery=None)
+    check("no delivery appointment on the load: waits, as before",
+          not ups and got[0] == autofile.WAITING and got[1].endswith("uploads once it reaches the consignee"), str(got))
+    ups, got, _ = world(2577914, pod(2577914, conf=0.8, date="9/25/26"))
+    check("under the confidence bar with the date off the delivery day: held on confidence, not released",
+          not ups and got[0] == autofile.HELD, str(got))
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -4232,6 +4292,7 @@ if __name__ == "__main__":
     test_a_page_with_none_of_the_loads_numbers_goes_up_on_the_lane_and_the_date()
     test_a_bare_signature_page_takes_the_facts_of_the_page_texted_with_it()
     test_a_number_in_a_stops_notes_is_a_reference_number()
+    test_a_checked_pod_goes_up_once_the_delivery_appointment_has_passed()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

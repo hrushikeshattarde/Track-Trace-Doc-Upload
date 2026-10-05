@@ -359,7 +359,7 @@ truck's stage.
 | **the load already has one**. For a BOL: type 12, or a Driver Supplied BOL that reads as a BOL or POD. For a POD: type 360 or 53, or type 12 with a POD comment or that reads as a POD. | not_needed | no |
 | a Driver Supplied BOL on the load isn't read yet, so there's no telling whether a BOL is there | no decision this run | – |
 | **any check fails** (next table) | **held** | yes |
-| a POD, but TransportPro doesn't have the truck at the consignee or delivered | **waiting** (not final) | no |
+| a POD, but TransportPro doesn't have the truck at the consignee or delivered, and the delivery appointment has not passed (or the page is dated before the delivery day) | **waiting** (not final) | no |
 | otherwise | ready to upload | – |
 
 **The checks behind "held":**
@@ -399,6 +399,18 @@ the pickup (`lane_loads`, one search per load per run). The sheet's Checks colum
 `all passed (lane match: ...)`; a rival load on the lane is named in the hold. `INTAKE_AUTO_LANE_RULE=off`
 switches it off. The reader now transcribes each party's street line (`Party.address`); readings made
 before 2 Oct 2026 match by name alone.
+
+**A checked POD goes up once the delivery appointment has passed** (`delivery_due`, 5 Oct 2026). A
+receiver-signed page used to wait for TransportPro's dispatch to reach the consignee, and carriers move
+that status late or never: seven Spindrift PODs that had passed every check sat waiting between 25 Sep
+and 5 Oct (2591186's dispatch still said Loaded two days after delivery), and a person filed six of them
+first. Now, once the appointment time has passed, the page's own date decides: a receiver's date on or
+after the delivery day, a day's slack, releases it, and the sheet's Checks column says
+`all passed (the delivery appointment (...) has passed, receiver's date ... on the delivery day)`. A
+year-less stamp date such as "10-3" is read in the appointment's year (`page_date(text, year)`). A page
+dated before the delivery day (2577911: a signature of 1 Oct on a delivery of 9 Oct) still waits for the
+stage, as does a load with no appointment, and the waiting status now says what would release it.
+Waiting decisions stay in the ledger only, as the pod asked on 24 Sep.
 
 **Matching facts** (`match_facts_detail`) compares every number on the page with the load.
 
@@ -571,7 +583,7 @@ object, and the same file read twice is one paid read.
 | No reading yet | No `autofile` row | Decided once it's read |
 | An unread Driver Supplied BOL blocks "does the load have a BOL?" | No decision | Decided once that file is read |
 | POD whose email has another document not read yet | Nothing uploaded | Uploaded with it once it is read |
-| POD, but the truck isn't at the consignee in TransportPro | **Waiting** (`final=0`) | Decided again whenever the bot looks at the load: after each load check, or when new mail arrives |
+| POD, but the truck isn't at the consignee in TransportPro and the delivery appointment has not passed | **Waiting** (`final=0`) | Decided again whenever the bot looks at the load: after each load check, or when new mail arrives; released by the stage, or by the appointment passing (`delivery_due`) |
 | Out of time before deciding or uploading | – | Next run |
 | The upload call fails | **Waiting**, `attempts+1`; on the 3rd failure, **held** | Retried next run after a fresh File History check |
 | Upload accepted but not listed in File History yet | Uploaded, with a note in the status | – |

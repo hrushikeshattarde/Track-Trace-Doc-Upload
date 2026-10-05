@@ -28,7 +28,8 @@ A document is uploaded only when all of these hold:
       none of the load's numbers, the page names both stops by street or facility name, its date
       puts it on this trip, and the customer has no other load between those cities within a day
       of the pickup (lane_match, 2 Oct 2026: TireHub's and Baker Hughes's forms never carry them)
-    - a receiver-signed page waits until TransportPro has the truck at the consignee
+    - a receiver-signed page waits until TransportPro has the truck at the consignee, or until the
+      delivery appointment has passed with the page's date not before the delivery day (delivery_due)
     - it is not already on the load: the same file, or the same picture. A BOL on file under any
       paperwork type counts; a POD counts only under a type that clears (Bill Of Lading, Proof of
       Delivery, Delivery Receipt). So a POD a driver texted in - which TransportPro files as Driver
@@ -360,7 +361,7 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
         try:
             decided = [(doc, _decide(conn, store, tpro, s, row, load, filed, doc)) for doc in docs]
             decisions = [d for _, d in decided if d]
-            pool_set_facts(decisions, row, s, more=lambda: _sent_mates(conn, store, tpro, s, row, load, filed, docs))
+            pool_set_facts(decisions, row, s, more=lambda: _sent_mates(conn, store, tpro, s, row, load, filed, docs), load=load)
             # Documents with no decision yet because nobody has read them. A POD waits for the rest of
             # its sending: a long BOL packet takes longer to read than the one-page sticker beside it
             # (load 2571670), and going up without it would file the receipt and leave the BOL behind.
@@ -529,7 +530,8 @@ def set_marks(group: list[Decision]) -> tuple[frozenset[str], frozenset[str]]:
             frozenset(n for g in lead for n in shipment_numbers(g.ex)))
 
 
-def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[], list[Decision]] | None = None) -> None:
+def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[], list[Decision]] | None = None,
+                   load: dict | None = None) -> None:
     """Judge the documents of one sending as a set when they name the same shipment.
 
     A stamped or signed POD page short of facts on its own takes the facts of the pages sent with it
@@ -573,11 +575,15 @@ def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[
         dec.facts, dec.strong, dec.pooled = facts, strong, [m.doc.filename for m in mates]
         dec.failed, dec.why = [], set()
         stage = (row["stage"] or "").lower()
-        if stage not in AT_CONSIGNEE:
+        due = delivery_due(dec.ex, load) if stage not in AT_CONSIGNEE and load is not None else None
+        if stage not in AT_CONSIGNEE and not due:
             dec.outcome, dec.final = WAITING, False
             dec.status = (f"WAITING - receiver-signed, but TransportPro has the truck "
-                          f"{stage or 'at an unknown stage'}; uploads once it reaches the consignee")
+                          f"{stage or 'at an unknown stage'}; uploads once it reaches the consignee"
+                          + (waiting_note(dec.ex, load) if load is not None else ""))
         else:
+            if due:
+                dec.allowed.append(due)
             dec.outcome, dec.final, dec.status = "ready", True, ""
 
 
@@ -1130,8 +1136,9 @@ def quick_decision(d: Doc, q: tuple[str, float]) -> Decision:
 DELIVERY_DAY_SLACK = 1        # a receiver may date the copy the day after the appointment
 
 
-def page_date(text) -> dt.date | None:
-    """A date as a page writes it - 9/28/26, 9-26-26, 09/27/2026, September 25, 2026, 2026-09-28 - or None."""
+def page_date(text, year: int | None = None) -> dt.date | None:
+    """A date as a page writes it - 9/28/26, 9-26-26, 09/27/2026, September 25, 2026, 2026-09-28 - or None.
+    With `year`, a year-less "10-3" (Sam's DC 6596's stamp, load 2591186) is read in that year."""
     t = str(text or "").strip()
     if not t:
         return None
@@ -1143,6 +1150,9 @@ def page_date(text) -> dt.date | None:
         if m:
             mo, d, y = int(m[1]), int(m[2]), int(m[3])
             y = y + 2000 if y < 100 else y
+        elif year and re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})", t):
+            m = re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})", t)
+            mo, d, y = int(m[1]), int(m[2]), int(year)
         else:
             m = re.search(r"([A-Za-z]{3,9})\.? (\d{1,2}),? (\d{4})", t)
             if not m:
@@ -1210,7 +1220,8 @@ def corroborated_pod(ex, facts: list[str], strong: list[str], load: dict | None,
         return None
     if len(facts) < s.min_facts or not strong:
         return None
-    when, day = page_date(ex.signatures.receiver_date), delivery_day(load)
+    day = delivery_day(load)
+    when = page_date(ex.signatures.receiver_date, year=day.year if day else None)
     if when is None or day is None or not (0 <= (when - day).days <= DELIVERY_DAY_SLACK):
         return None
     evidence = "receiver signature" if ex.signatures.receiver_signed else "receiving stamp"
@@ -1235,6 +1246,63 @@ def corroborated_bol(ex, facts: list[str], strong: list[str], s: Settings) -> st
         return None
     return (f"AI {conf:.0%} sure, under {s.min_confidence:.0%} but accepted: {len(strong)} reference numbers match "
             f"({'; '.join(strong)})")
+
+
+def _appointment(load: dict | None) -> tuple[dt.datetime | None, dt.date | None]:
+    """The delivery appointment as an instant, and its date on the consignee's clock."""
+    appt = (stop_of(load, "CN") or {}).get("appointmentTime") or {}
+    when = appt.get("open") or appt.get("close")
+    day = delivery_day(load)
+    if not when or day is None:
+        return None, None
+    try:
+        t = dt.datetime.fromisoformat(str(when).replace("Z", "+00:00"))
+    except ValueError:
+        return None, None
+    return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)), day
+
+
+def delivery_due(ex, load: dict | None, now: dt.datetime | None = None) -> str | None:
+    """Why a receiver-signed POD may go up before TransportPro has the truck at the consignee - or None.
+
+    Loads 2591186, 2579837, 2580421, 2586987, 2577903, 2555932 and 2598344 (25 Sep - 5 Oct 2026):
+    stamped or signed PODs that passed every check waited for a dispatch status the carriers move
+    late or never - 2591186's still said Loaded two days after delivery - and a person filed six of
+    the seven. Once the delivery appointment has passed, the page's own date decides: a receiver's
+    date on or after the delivery day (a day's slack; a year-less "10-3" takes the appointment's
+    year) says the truck was there, whatever the dispatch says. A page dated before the delivery day
+    - load 2577911's signature of 1 Oct on a delivery of 9 Oct - waits for the stage, as before; so
+    does a load with no delivery appointment."""
+    t, day = _appointment(load)
+    if t is None:
+        return None
+    if (now or dt.datetime.now(dt.timezone.utc)) < t:
+        return None
+    written = ex.signatures.receiver_date
+    rd = page_date(written, year=day.year)
+    if rd is not None and (day - rd).days > DELIVERY_DAY_SLACK:
+        return None
+    if rd is None:
+        dated = ""
+    elif rd == day:
+        dated = f", receiver's date {written} on the delivery day"
+    elif rd > day:
+        dated = f", receiver's date {written} after the delivery day"
+    else:
+        dated = f", receiver's date {written} the day before the delivery day"
+    return f"the delivery appointment ({eastern(t)}) has passed{dated}"
+
+
+def waiting_note(ex, load: dict | None) -> str:
+    """What else would release a waiting POD, for its status line."""
+    t, day = _appointment(load)
+    if t is None:
+        return ""
+    written = ex.signatures.receiver_date
+    rd = page_date(written, year=day.year)
+    if rd is not None and (day - rd).days > DELIVERY_DAY_SLACK:
+        return f"; the page's date {written} is before the delivery day ({day.strftime('%b %d')}), so the appointment passing does not release it"
+    return f" or the delivery appointment ({eastern(t)}) passes"
 
 
 STREET_NOISE = frozenset("RD ROAD DR DRIVE ST STREET AVE AVENUE STE SUITE BLVD BOULEVARD HWY HIGHWAY LN LANE CT COURT "
@@ -1466,10 +1534,14 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
         dec.status = f"HELD - {'; '.join(dec.failed)}; not uploaded, a person should look"
         return dec
     if kind == "POD" and stage not in AT_CONSIGNEE:
-        dec.outcome, dec.final = WAITING, False
-        dec.status = (f"WAITING - receiver-signed, but TransportPro has the truck "
-                      f"{stage or 'at an unknown stage'}; uploads once it reaches the consignee")
-        return dec
+        due = delivery_due(ex, load)
+        if due:
+            dec.allowed.append(due)
+        else:
+            dec.outcome, dec.final = WAITING, False
+            dec.status = (f"WAITING - receiver-signed, but TransportPro has the truck "
+                          f"{stage or 'at an unknown stage'}; uploads once it reaches the consignee" + waiting_note(ex, load))
+            return dec
     return dec
 
 
@@ -1748,7 +1820,7 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
         rejudged.append((dec, again))
     # The set is judged again as a set: a lead that stood on pooled facts must stand on them still.
     pool_set_facts([a for _, a in rejudged if a is not None], row, s,
-                   more=lambda: _sent_mates(conn, store, tpro, s, row, load, filed, [g.doc for g in group]))
+                   more=lambda: _sent_mates(conn, store, tpro, s, row, load, filed, [g.doc for g in group]), load=load)
     for dec, again in rejudged:
         if dec.companion:
             # Still only a page of this set, and still not on the load under a type that clears.
