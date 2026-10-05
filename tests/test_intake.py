@@ -972,6 +972,68 @@ def test_a_bare_signature_page_takes_the_facts_of_the_page_texted_with_it() -> N
     check("a bare signed page texted on its own: held", not ups and outcome.get("tpro:702") == autofile.HELD, str((outcome, len(ups))))
 
 
+def test_a_number_in_a_stops_notes_is_a_reference_number() -> None:
+    """Load 2579184 (2 Oct 2026, Spindrift): the Lineage BOL's consignee block named Carolina Beverage
+    Group in Dade City FL while the load delivers to Mooresville NC, and its shipper the shipper of
+    record in Westlake Hills, so no city matched; the PO matched the manifest number and that was the
+    one fact. The master BOL O013155718 that ties the page to the load was on the load - as the pickup
+    stop's note, which the matcher did not read. Both the BOL and the signed POD were held. Now a
+    number-like token in a stop's notes is a reference number, shown as "pickup note" or "delivery note"."""
+    print("a number in a stop's notes is a reference number")
+    import time as _time
+    from intake import autofile
+
+    def load_of(load_id, pickup_note="O013155718", delivery_note="Please check in at Suite B between doors 30 and 31"):
+        return {"id": load_id, "status": {"documentStatus": "Waiting for Documents", "loadStatus": "Dispatched"},
+                "billingInfo": {"customerId": 9701},
+                "reference": {"manifestNumber": "PO18734", "referenceNumber": "ECNT85", "ediReferenceNumber": "ECNT85",
+                              "weight": 40902.4, "numberOfPieces": 4480},
+                "waypoints": [{"type": "SH", "location": {"companyName": "Lineage", "address": "4000 W Military Hwy", "city": "McAllen",
+                                                          "state": "TX", "timezone": -5}, "notes": pickup_note,
+                               "appointmentTime": {"open": "2026-09-29T20:00:00Z"}, "reference": []},
+                              {"type": "CN", "location": {"companyName": "Carolina Beverage Group", "address": "119 East Super Sport Drive",
+                                                          "city": "Mooresville", "state": "NC", "timezone": -4}, "notes": delivery_note,
+                               "appointmentTime": {"open": "2026-10-02T12:00:00Z"}, "reference": []}]}
+
+    facts = {(f[0], f[3]) for f in autofile.load_facts(load_of(2579184))}
+    check("the pickup stop's note is a reference number; the delivery stop's words are not",
+          ("pickup note", "O013155718") in facts and not any(lb == "delivery note" for lb, _ in facts), str(sorted(facts)))
+    facts = {(f[0], f[3]) for f in autofile.load_facts(load_of(2584126, "SH-332920397 - TIREHUB10474882260930 WEIGHT: 1 PCS: 1"))}
+    check("a note with two numbers gives both, and a hyphenated one its number alone as well",
+          {("pickup note", "SH-332920397"), ("pickup note", "SH-332920397 (332920397)"), ("pickup note", "TIREHUB10474882260930")} <= facts
+          and not any(shown in ("WEIGHT", "PCS") for _, shown in facts), str(sorted(facts)))
+    facts = {(f[0], f[3]) for f in autofile.load_facts(load_of(2604225, "Call 757-495-1091 on arrival; appt 2026-10-05, door 12, ref 10-5-26"))}
+    check("a phone number, a date and a door are not reference numbers", not any(lb.endswith("note") for lb, _ in facts), str(sorted(facts)))
+
+    def pod(load_id):
+        r = _reading(load_id, "proof_of_delivery", receiver=True, conf=0.94, city=None,
+                     numbers=[("BILL OF LADING NO.", "17-0169704"), ("MBOL", "O013155718"), ("PO#", "18734-LIJPAB11-26"), ("Sales #", "18734")])
+        r["shipper"] = {"name": "CITRUS TEAM COMPANY LLC", "city": "WESTLAKE HILLS", "state": "TX"}
+        r["consignee"] = {"name": "CAROLINA BEVERAGE GROUP", "city": "DADE CITY", "state": "FL", "address": "37809 HOWARD AVENUE"}
+        r["signatures"].update({"receiver_name": "Michael Clark", "receiver_date": "10/02/2026"})
+        r["pages"] = [{"page": 1, "role": "pod", "legibility": 0.8, "doc_ref": "17-0169704 1/1"}]
+        return r
+
+    def world(load_id, load):
+        conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+        log = _AutoLog()
+        load_row(load_id, "pod_expected", "at consignee")
+        tpro.add(load_id)
+        tpro.loads[load_id]["load"] = load
+        (sha,) = mail(load_id, f"m{load_id}", [(_picture(load_id % 1000), pod(load_id))])
+        s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+        autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+        got = conn.execute("SELECT outcome, status FROM autofile WHERE load_id=? AND sha256=?", (load_id, sha)).fetchone()
+        return [u["type"] for u in tpro.uploads], tuple(got) if got else None, log
+
+    ups, got, log = world(2579184, load_of(2579184))
+    check("the Lineage POD goes up on the manifest PO and the pickup note", ups == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str(got))
+    facts = next(iter(log.rows.values()))[8]
+    check("and the sheet names both", "pickup note O013155718" in facts and "manifest # PO18734" in facts, facts)
+    ups, got, _ = world(2579185, load_of(2579185, pickup_note="Ask for Juan Jose at the gate"))
+    check("without the note it is one fact, held as before", not ups and got[0] == autofile.HELD and "1 fact(s)" in got[1], str(got))
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -4169,6 +4231,7 @@ if __name__ == "__main__":
     test_two_usps_forms_for_one_trip_are_two_pages()
     test_a_page_with_none_of_the_loads_numbers_goes_up_on_the_lane_and_the_date()
     test_a_bare_signature_page_takes_the_facts_of_the_page_texted_with_it()
+    test_a_number_in_a_stops_notes_is_a_reference_number()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

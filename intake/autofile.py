@@ -1534,6 +1534,11 @@ _REF_LABELS = {"pickupNumber": "pickup #", "poNumber": "PO #", "referenceNumber"
                "manifestNumber": "manifest #", "ediReferenceNumber": "EDI reference #",
                "billOfLading": "BOL #", "sealNumber": "seal #", "containerNumber": "container #"}
 _WEAK_REFS = {"numberOfPieces": "pieces", "weight": "weight"}
+# A reference number written into a stop's notes: six characters or more of letters, digits, hyphens
+# and underscores with at least four digits - "O013155718", "SH-332920397", "THUB36574150" - and never
+# a phone number or a date.
+NOTE_TOKEN = re.compile(r"[A-Z0-9][A-Z0-9_-]{5,}")
+PHONE_OR_DATE = re.compile(r"\d{3}-\d{3}-\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}-\d{1,2}-\d{2,4}")
 
 
 def _norm(v: Any) -> str:
@@ -1589,6 +1594,13 @@ def load_facts(load: dict) -> list[tuple[str, str, bool, str]]:
                 add("weight" if t == "WEIGHT" else "pieces", r.get("value"), False)
             else:
                 add(t.lower().replace("_", " ") + " #", r.get("value"), True)
+        # A stop's notes carry reference numbers too (load 2579184, 2 Oct 2026): Lineage's master BOL
+        # O013155718 sat only in the pickup stop's note, and the page's one other match, the PO, was
+        # not enough on its own. 24 of 60 pilot loads that week had such a number in a stop's note.
+        side = {"SH": "pickup", "CN": "delivery"}.get(str(wp.get("type") or "").upper(), "stop")
+        for tok in NOTE_TOKEN.findall(str(wp.get("notes") or "").upper()):
+            if sum(c.isdigit() for c in tok) >= 4 and not PHONE_OR_DATE.fullmatch(tok):
+                add(f"{side} note", tok, True)
     return facts
 
 

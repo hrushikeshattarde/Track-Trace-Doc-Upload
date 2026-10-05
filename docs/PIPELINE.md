@@ -402,6 +402,11 @@ before 2 Oct 2026 match by name alone.
 
 **Matching facts** (`match_facts_detail`) compares every number on the page with the load.
 
+- A number written into a stop's notes is a reference number too (`NOTE_TOKEN`, 2 Oct 2026): six
+  characters or more with at least four digits, never a phone number or a date, shown as `pickup note ...`
+  or `delivery note ...`. Load 2579184: Lineage's master BOL O013155718 sat only in the pickup stop's
+  note, and the page's one other match, the PO, was not enough; 24 of 60 pilot loads that week carried
+  such a number in a note.
 - Strong facts (reference numbers): load #, pickup #, PO #, reference #, manifest #, EDI reference #,
   BOL #, seal #, container #, and the stops' reference numbers.
 - Weak facts: pieces, weight, and the shipper or consignee city.
