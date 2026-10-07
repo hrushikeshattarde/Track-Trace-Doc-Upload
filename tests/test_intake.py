@@ -1211,6 +1211,58 @@ def test_a_stamped_copy_of_a_bol_already_on_the_load_counts_its_facts() -> None:
           not [u for u in tpro.uploads if u["type"] == "Bill Of Lading"] and got(conn, 2607410, p_sha)[0] == autofile.HELD, str(got(conn, 2607410, p_sha)))
 
 
+def test_a_leading_zero_does_not_hide_a_reference_number() -> None:
+    """Load 2609383 (7 Oct 2026, Ferguson): the carrier emailed a Ferguson Fast Sales Order signed on
+    the "I received the items" line. Its order number reads TD049406; TransportPro holds the pickup and
+    PO as TD49406. Exact text, containment and the digit core all saw two different numbers, and the
+    POD was held with one fact. Leading zeros in the digit core are now ignored."""
+    print("a leading zero does not hide a reference number")
+    import time as _time
+    from intake import autofile
+    from pod_intake.schema import Extraction
+
+    def load_of(load_id, pickup="TD49406"):
+        return {"id": load_id, "status": {"documentStatus": "Waiting for Documents", "loadStatus": "Dispatched"},
+                "billingInfo": {"customerId": 10539}, "reference": {"pickupNumber": pickup, "poNumber": pickup, "weight": 3000},
+                "waypoints": [{"type": "SH", "location": {"companyName": "Ferguson WW", "address": "11860 Mosteller Rd", "city": "Cincinnati", "state": "OH", "timezone": -4},
+                               "appointmentTime": {"open": "2026-10-07T16:00:00Z"}, "reference": []},
+                              {"type": "CN", "location": {"companyName": "Submar", "address": "8488 White Oak Rd NE", "city": "Mount Sterling", "state": "OH", "timezone": -4},
+                               "appointmentTime": {"open": "2026-10-07T16:00:00Z"}, "reference": []}]}
+
+    def pod(load_id, order="TD049406"):
+        r = _reading(load_id, "proof_of_delivery", receiver=True, conf=0.91, city=None,
+                     numbers=[("Order No:", order), ("Customer PO:", "J527-10604"), ("Cust No:", "39961"), ("Ship Whse:", "528")])
+        r["shipper"] = {"name": "FEL-CINCINNATI, OH WW (F528)", "city": "CINCINNATI", "state": "OH", "address": "11860 MOSTELLER ROAD"}
+        r["consignee"] = {"name": "FERGUSON WATERWORKS #527", "city": "COLUMBUS", "state": "OH", "address": "3845 GROVEPORT RD"}
+        r["signatures"].update({"receiver_name": None, "receiver_date": "10/7/2026"})
+        r["pages"] = [{"page": 1, "role": "pod", "legibility": 0.7, "doc_ref": "TD049406 1/1"}]
+        return r
+
+    ex = Extraction.model_validate(pod(2609383))
+    check("TD049406 on the page is TransportPro's TD49406",
+          autofile.match_facts_detail(ex, load_of(2609383)) == (["pickup # TD49406", "shipper city Cincinnati"], ["pickup # TD49406"]),
+          str(autofile.match_facts_detail(ex, load_of(2609383))))
+    check("the zero has to be leading: TD1049406 is not TD49406, and 49406 alone is still too short a core to stand in for TD049406",
+          autofile.match_facts_detail(Extraction.model_validate(pod(1, order="TD1049406")), load_of(1))[1] == []
+          and autofile.match_facts_detail(ex, load_of(2, pickup="4940"))[1] == [])
+    check("a page that prints the zeros TransportPro prints still matches, as before",
+          autofile.match_facts_detail(Extraction.model_validate(pod(3, order="00123")), load_of(3, pickup="PO00123"))[1] == ["pickup # PO00123"])
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2609383, "pod_expected", "at consignee")
+    tpro.add(2609383)
+    tpro.loads[2609383]["load"] = load_of(2609383)
+    (sha,) = mail(2609383, "mz", [(_picture(49), pod(2609383))])
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    got = conn.execute("SELECT outcome FROM autofile WHERE load_id=2609383 AND sha256=?", (sha,)).fetchone()
+    check("the signed sales order goes up as Bill Of Lading on the order number and the shipper city",
+          [u["type"] for u in tpro.uploads] == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str((got, [u["type"] for u in tpro.uploads])))
+    facts = next(iter(log.rows.values()))[8]
+    check("and the sheet names the pickup number", "pickup # TD49406" in facts, facts)
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -4411,6 +4463,7 @@ if __name__ == "__main__":
     test_a_number_in_a_stops_notes_is_a_reference_number()
     test_a_checked_pod_goes_up_once_the_delivery_appointment_has_passed()
     test_a_stamped_copy_of_a_bol_already_on_the_load_counts_its_facts()
+    test_a_leading_zero_does_not_hide_a_reference_number()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

@@ -1735,9 +1735,11 @@ def match_facts_detail(ex, load: dict) -> tuple[list[str], list[str]]:
         if min(len(norm), len(value)) >= 6 and (norm in value or value in norm):
             return True
         # "Cust PO 18650" on a Perricone Farms BOL is TransportPro's "PO18650" (load 2562069, 24 Sep
-        # 2026). The same digits with only letters round them, five of them at least.
+        # 2026). The same digits with only letters round them, five of them at least. Leading zeros
+        # are nothing: Ferguson prints its order as TD049406 and TransportPro holds TD49406 (load
+        # 2609383, 7 Oct 2026), and the signed sales order was held with the PO in plain sight.
         core = _core(value)
-        return core.isdigit() and len(core) >= 5 and _core(norm) == core
+        return core.isdigit() and len(core) >= 5 and _core(norm).lstrip("0") == core.lstrip("0")
 
     # Exact matches first, so "P2600001" is the pickup number it equals and not the load number it contains.
     for loose in (False, True):

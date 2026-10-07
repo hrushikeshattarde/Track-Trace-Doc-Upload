@@ -424,7 +424,8 @@ Waiting decisions stay in the ledger only, as the pod asked on 24 Sep.
 - Weak facts: pieces, weight, and the shipper or consignee city.
 - Exact matches are tried first. Then loose ones: one number contains the other (6 or more
   characters), or they share a core of 5 or more digits with only letters around it, so
-  `PO18650` = `18650`.
+  `PO18650` = `18650`. Leading zeros in that core are ignored: `TD049406` = `TD49406` (load 2609383,
+  7 Oct 2026, a Ferguson sales order held with the PO in plain sight).
 - A compound reference matches on each part (30 Sep 2026): USPS's pick number `002D7-2A8BD` is the
   route and the trip printed as two fields on the Contract Route Vehicle Record, and each is a fact.
 - A stop named by a facility code, USPS's `15Z` / `07Z`, matches the code on the page, as a weak fact.
