@@ -1094,6 +1094,123 @@ def test_a_checked_pod_goes_up_once_the_delivery_appointment_has_passed() -> Non
           not ups and got[0] == autofile.HELD, str(got))
 
 
+def test_a_stamped_copy_of_a_bol_already_on_the_load_counts_its_facts() -> None:
+    """Load 2607407 (6-7 Oct 2026, USPS): the carrier emailed Copy 1 of the PS Form 5398-A at pickup,
+    which matched the trip and the facility and went up as Driver Supplied BOL, and a day later Copy 2
+    with the Kansas City stamp - a faint, sideways photo on which the reader took the trip for 2A8E1
+    and the facility for 6608P. One fact matched and the POD was held, though its seal and barcode are
+    the BOL's. Now a stamped or signed page that fails only on facts counts the facts of a document
+    already read on the load when the two share two identity numbers, whatever sending it came in."""
+    print("a stamped copy of a BOL already on the load counts its facts")
+    import time as _time
+    from intake import autofile, db
+    from pod_intake.schema import Extraction
+
+    def num(label, value, kind):
+        return {"label": label, "kind": kind, "value": value, "handwritten": False, "confidence": 0.9}
+
+    def load_of(load_id):
+        return {"id": load_id, "status": {"documentStatus": "Waiting for Documents", "loadStatus": "Dispatched"},
+                "billingInfo": {"customerId": 8763},
+                "reference": {"pickupNumber": "002D7-2AEE1", "poNumber": "002D7-2AEE1", "referenceNumber": "126096873", "weight": 1, "numberOfPieces": 60},
+                "waypoints": [{"type": "SH", "location": {"companyName": "20Z", "address": "9201 EDGEWORTH DR", "city": "CAPITOL HEIGHTS", "state": "MD", "timezone": -4},
+                               "appointmentTime": {"open": "2026-10-06T12:00:00Z"}, "reference": []},
+                              {"type": "CN", "location": {"companyName": "660RP", "address": "17150 MERCURY ST", "city": "OLATHE", "state": "KS", "timezone": -5},
+                               "appointmentTime": {"open": "2026-10-07T10:55:00Z"}, "reference": []}]}
+
+    def bol(load_id, trip="2AEE1", seal="0093788086", barcode="99T000000521645"):
+        r = _reading(load_id, conf=0.91, numbers=[], city=None)
+        r["numbers"] = [num("Trip", trip, "pickup"), num("Route No.", "50207", "pickup"), num("Van No.", "50207", "trailer"),
+                        num("Seal Number(s)", seal, "seal"), num("Barcode", barcode, "other")]
+        r["shipper"], r["consignee"] = {"name": "WASHINGTON NDC"}, {"name": "660RP-LOG KANSAS CI"}
+        r["signatures"].update({"shipper_signed": False, "driver_signed": False})
+        r["pages"] = [{"page": 1, "role": "bol", "legibility": 0.8, "doc_ref": f"5398A-50207-{trip} 1/1"}]
+        return r
+
+    def pod(load_id, seal="0093788086", barcode="99T000000521645"):
+        r = _reading(load_id, "proof_of_delivery", receiver=False, conf=0.91, numbers=[], city=None)
+        r["numbers"] = [num("Route No.", "002D7", "pickup"), num("Trip", "2A8E1", "pickup"), num("Van No.", "30707", "trailer"),
+                        num("Seal Number(s)", seal, "seal"), num("barcode", barcode, "other")]
+        r["shipper"], r["consignee"] = {"name": "WASHINGTON NDC"}, {"name": "6608P-LOG KANSAS CI"}
+        r["signatures"] = {"shipper_signed": True, "driver_signed": True, "receiver_signed": False, "receiver_name": None,
+                           "receiver_date": "OCT 7 2026", "stamp_present": True}
+        r["pages"] = [{"page": 1, "role": "pod", "legibility": 0.6, "doc_ref": "5398A-002D7-2A8E1 1/1"}]
+        return r
+
+    check("two readings of one form share two identity numbers; one is not enough",
+          autofile.same_form(Extraction.model_validate(bol(1)), Extraction.model_validate(pod(1)))
+          and not autofile.same_form(Extraction.model_validate(bol(1)), Extraction.model_validate(pod(1, barcode="99T000000999999"))))
+
+    s = autofile.Settings(terminals=frozenset({1138}), mode="on", pods={1138: "Jesse Klingler"})
+
+    def again(conn, store, tpro, read, log, load_id):
+        conn.execute("UPDATE load SET stage='at consignee', last_checked_at=? WHERE load_id=?", (db.now_iso(), load_id))
+        autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+
+    def got(conn, load_id, sha):
+        r = conn.execute("SELECT outcome, status FROM autofile WHERE load_id=? AND sha256=?", (load_id, sha)).fetchone()
+        return tuple(r) if r else None
+
+    # A: Copy 1 by email on day 1, the stamped Copy 2 by email on day 2.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2607407, "pod_expected", "loaded", terminal=1138)
+    tpro.add(2607407)
+    tpro.loads[2607407]["load"] = load_of(2607407)
+    mail(2607407, "m1", [(_picture(41), bol(2607407))])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    check("day 1: the plain form goes up as Driver Supplied BOL", [u["type"] for u in tpro.uploads] == ["Driver Supplied BOL"], str([u["type"] for u in tpro.uploads]))
+    (p_sha,) = mail(2607407, "m2", [(_picture(42), pod(2607407))])
+    again(conn, store, tpro, read, log, 2607407)
+    pods = [u for u in tpro.uploads if u["type"] == "Bill Of Lading"]
+    check("day 2: the stamped copy counts the BOL's facts and goes up as Bill Of Lading, one page",
+          len(pods) == 1 and autofile.page_count(pods[0]["data"]) == 1 and got(conn, 2607407, p_sha)[0] == autofile.UPLOADED,
+          str((got(conn, 2607407, p_sha), [u["type"] for u in tpro.uploads])))
+    facts = log.rows[autofile.ref(2607407, p_sha)][8]
+    check("the sheet says what it was counted with", "counted with m1_0.png, the same form, sent earlier" in facts and "(2AEE1)" in facts, facts)
+
+    # B: the BOL texted at pickup - on the load as a Driver Supplied BOL the bot read - serves the same way.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2607408, "pod_expected", "at consignee", terminal=1138)
+    texted = {"id": 701, "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL", "uploadById": 1,
+              "comments": "Driver Supplied Image - load", "dateCreated": "2026-10-06T13:05:00Z"}
+    tpro.add(2607408, files=[(texted, _picture(43))])
+    tpro.loads[2607408]["load"] = load_of(2607408)
+    on_load(_picture(43), bol(2607408))
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    (p_sha,) = mail(2607408, "m3", [(_picture(44), pod(2607408))])
+    again(conn, store, tpro, read, log, 2607408)
+    check("a texted BOL already on the load is the same form too: the stamped copy goes up",
+          [u["type"] for u in tpro.uploads] == ["Bill Of Lading"] and got(conn, 2607408, p_sha)[0] == autofile.UPLOADED, str(got(conn, 2607408, p_sha)))
+
+    # C: only the seal in common - held, as before.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2607409, "pod_expected", "loaded", terminal=1138)
+    tpro.add(2607409)
+    tpro.loads[2607409]["load"] = load_of(2607409)
+    mail(2607409, "m4", [(_picture(45), bol(2607409))])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    (p_sha,) = mail(2607409, "m5", [(_picture(46), pod(2607409, barcode="99T000000999999"))])
+    again(conn, store, tpro, read, log, 2607409)
+    check("one identity number in common is not the same form: held on one fact",
+          not [u for u in tpro.uploads if u["type"] == "Bill Of Lading"] and got(conn, 2607409, p_sha)[0] == autofile.HELD, str(got(conn, 2607409, p_sha)))
+
+    # D: the earlier form is another trip's and matched nothing - nothing to count.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2607410, "pod_expected", "loaded", terminal=1138)
+    tpro.add(2607410)
+    tpro.loads[2607410]["load"] = load_of(2607410)
+    mail(2607410, "m6", [(_picture(47), bol(2607410, trip="2AZZZ"))])
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    (p_sha,) = mail(2607410, "m7", [(_picture(48), pod(2607410))])
+    again(conn, store, tpro, read, log, 2607410)
+    check("a same-form mate that did not match the load itself lends nothing: held",
+          not [u for u in tpro.uploads if u["type"] == "Bill Of Lading"] and got(conn, 2607410, p_sha)[0] == autofile.HELD, str(got(conn, 2607410, p_sha)))
+
+
 def test_comment_never_prints_a_non_name() -> None:
     """The reader says what it cannot read. Quoting that back produced "POD, signed by illegible
     handwritten SEP 15" on a row somebody has to make sense of."""
@@ -4293,6 +4410,7 @@ if __name__ == "__main__":
     test_a_bare_signature_page_takes_the_facts_of_the_page_texted_with_it()
     test_a_number_in_a_stops_notes_is_a_reference_number()
     test_a_checked_pod_goes_up_once_the_delivery_appointment_has_passed()
+    test_a_stamped_copy_of_a_bol_already_on_the_load_counts_its_facts()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()

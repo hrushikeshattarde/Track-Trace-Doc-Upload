@@ -302,6 +302,7 @@ class Decision:
     on_clearing: bool = False     # already on the load under a type that clears
     companion: bool = False       # another page of a POD from the same email, going up with it
     pooled: list[str] = field(default_factory=list)   # the pages sent with it whose facts it counts as its own
+    pooled_how: str = ""          # how the pooled pages relate when not sent together: "the same form, sent earlier"
     allowed: list[str] = field(default_factory=list)  # checks passed by another route, e.g. a corroborated POD
     quick: str = ""               # "BOL (quick look, 95% sure)" when only the quick look saw the page
     pages: list[int] | None = None                                 # the file's pages that go up, 1-based
@@ -507,6 +508,28 @@ def doc_numbers(ex) -> set[str]:
             if p.doc_ref and str(p.doc_ref).split()}
 
 
+IDENTITY_KINDS = frozenset({"seal", "trailer", "tractor"})
+
+
+def identity_numbers(ex) -> set[str]:
+    """The numbers that identify a physical form or a trailer rather than a shipment: seal, trailer,
+    tractor, and a long code of no named kind - a barcode."""
+    out: set[str] = set()
+    for n in (ex.numbers if ex is not None else []):
+        v = _norm_ref(n.value)
+        if n.kind in IDENTITY_KINDS and len(v) >= 4:
+            out.add(v)
+        elif n.kind == "other" and len(v) >= 8 and any(c.isdigit() for c in v):
+            out.add(v)
+    return out
+
+
+def same_form(a, b) -> bool:
+    """Two readings of one form: two identity numbers in common. Load 2607407 (7 Oct 2026): Copy 1 of
+    a USPS 5398-A at pickup and Copy 2 stamped at delivery share the seal and the barcode."""
+    return len(identity_numbers(a) & identity_numbers(b)) >= 2
+
+
 def shipment_numbers(ex) -> set[str]:
     """The numbers of a reference kind on the page - BOL, PO, order... - that are long enough to mean something."""
     return {v for v in (_norm_ref(n.value) for n in (ex.numbers if ex is not None else []) if n.kind in REFERENCE_KINDS)
@@ -551,7 +574,13 @@ def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[
     the PO - has no reference number to share with anything. It takes the facts of a page sent with it
     that matched the load on its own (min_facts facts, one a reference number): the burst and the
     matching page are the tie, and the two go up as one POD. A page with numbers of its own that
-    match nothing is not bare - it may be another load's - and stays held."""
+    match nothing is not bare - it may be another load's - and stays held.
+
+    A stamped or signed copy of a document already read on the load - load 2607407 (7 Oct 2026): the
+    USPS 5398-A's Copy 2, with the Kansas City stamp, emailed a day after Copy 1 went up as the BOL,
+    on a photo so faint the trip read 2A8E1 for 2AEE1 and the facility 6608P for 660RP - counts that
+    document's facts whatever sending it came in, when the two share two identity numbers (same_form:
+    the seal and the barcode here) and the document matched the load on its own."""
     pool: list[Decision] | None = None
     for dec in decisions:
         if dec.outcome != HELD or dec.kind != "POD" or dec.why != {"facts"} or dec.ex is None:
@@ -562,10 +591,10 @@ def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[
             pool = decisions + (more() if more is not None else [])
         bare = not dec.ex.numbers and not dec.strong          # a signature page naming nothing (2604225)
         mates = [m for m in pool if m is not dec and m.ex is not None and m.kind is not None
-                 and same_sending(m.doc, dec.doc) and (m.conf or 0) >= s.min_confidence
+                 and (same_sending(m.doc, dec.doc) or same_form(m.ex, dec.ex)) and (m.conf or 0) >= s.min_confidence
                  and m.why <= {"pod_evidence"} and m.outcome in ("ready", HELD, ON_FILE, NOT_NEEDED, UPLOADED)
                  and (set(m.strong) & set(dec.strong)
-                      or (bare and m.strong and len(m.facts) >= s.min_facts))]
+                      or ((bare or same_form(m.ex, dec.ex)) and m.strong and len(m.facts) >= s.min_facts))]
         if not mates:
             continue
         facts = list(dec.facts) + [f for m in mates for f in m.facts if f not in dec.facts]
@@ -573,6 +602,7 @@ def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[
         if len(facts) < s.min_facts or not strong:
             continue
         dec.facts, dec.strong, dec.pooled = facts, strong, [m.doc.filename for m in mates]
+        dec.pooled_how = "" if any(same_sending(m.doc, dec.doc) for m in mates) else "the same form, sent earlier"
         dec.failed, dec.why = [], set()
         stage = (row["stage"] or "").lower()
         due = delivery_due(dec.ex, load) if stage not in AT_CONSIGNEE and load is not None else None
@@ -642,16 +672,19 @@ def _batch_mates(conn, store, tpro, s: Settings, row, load: dict, filed: list[On
 
 
 def _sent_mates(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnFile], docs: list[Doc]) -> list[Decision]:
-    """Emailed pages of this load decided for good in an earlier run, judged again, so a receiving
-    label can still count their facts (pool_set_facts). Nothing is recorded here."""
+    """Pages of this load decided for good in an earlier run - emailed, or on the load as files the bot
+    has read - judged again, so a receiving label can still count their facts (pool_set_facts) and a
+    stamped copy can count the facts of the form it is a copy of (same_form). Nothing is recorded here."""
     have = {d.sha256 for d in docs}
     out = []
-    for d in _email_docs(conn, int(row["load_id"])):
+    earlier = list(_email_docs(conn, int(row["load_id"]))) + [file_doc(of, filed) for of in filed]
+    for d in earlier:
         if d.sha256 in have:
             continue
         att = db.get_attachment(conn, d.sha256)
         if att is None or att["extraction_json"] is None:
             continue
+        have.add(d.sha256)
         dec = judge(conn, s, row, load, filed, d, json.loads(att["extraction_json"]),
                     sig=lambda d=d: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load))
         if dec is not None:
@@ -2163,7 +2196,7 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
     facts = ((f"{len(dec.facts)} fact(s): " + "; ".join(dec.facts)) if dec.facts
              else "not checked - not read in full" if ex is None else "nothing on the page matches")
     if dec.pooled:
-        together = "texted together" if str(dec.doc.batch or "").startswith("text:") else "sent in the same email"
+        together = dec.pooled_how or ("texted together" if str(dec.doc.batch or "").startswith("text:") else "sent in the same email")
         facts += " (counted with " + ", ".join(dec.pooled) + f", {together})"
     checks = ("FAILED: " + "; ".join(dec.failed)) if dec.failed else (
         ("all passed" + (f" ({'; '.join(dec.allowed)})" if dec.allowed else "")) if dec.outcome in (UPLOADED, DRY) else "")

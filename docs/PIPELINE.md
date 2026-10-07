@@ -460,6 +460,12 @@ is the hand-off to a person.
   2026), the certification page of an A3 straight BOL texted 17 seconds after page 1 - has no reference
   number to share; it takes the facts of a page sent with it that matched the load on its own, and the two
   go up as one POD. A page with numbers of its own that match nothing is not bare and stays held.
+  A stamped or signed page that fails only on facts also counts the facts of a document already read on
+  the load, whatever sending it came in, when the two share two identity numbers - seal, trailer, tractor,
+  or a long unlabelled code such as a barcode (`same_form`, `identity_numbers`). Load 2607407 (7 Oct 2026):
+  the USPS 5398-A's stamped Copy 2 came a day after Copy 1 went up as the BOL, on a faint photo that misread
+  the trip and the facility code; its seal and barcode are the BOL's. `_sent_mates` now offers the load's
+  texted files the bot has read as mates too, not only emailed pages.
 - **Other pages of the same document join it** even when they match nothing in TransportPro on their
   own: a page whose `doc_ref` carries a document number already in the set (load 2593890's signed
   page 3 of 3, whose only number was the BOL number).
