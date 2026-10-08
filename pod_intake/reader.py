@@ -22,10 +22,19 @@ from .schema import Adjudication, Extraction, reader_json_schema
 # the ledger's spend column to stay useful, not close enough to bill anybody from. Put AWS's own
 # per-token numbers in before treating a Bedrock total as the truth.
 PRICES = {
+    "claude-opus-5-5": (4.00, 20.00),
     "claude-opus-5": (5.00, 25.00),
+    "claude-sonnet-5-5": (2.00, 10.00),
     "claude-sonnet-5": (2.00, 10.00),
+    "claude-haiku-5-5": (0.10, 0.50),     # prompts up to 100k tokens; ours are a few thousand
     "claude-haiku-4-5": (1.00, 5.00),
 }
+# A cache read costs a tenth of the input price, except on the 5.5 models, where it is a twentieth.
+CACHE_READ_RATE = {"claude-opus-5-5": 0.05, "claude-sonnet-5-5": 0.05}
+# The quick look's answer is one short JSON object, but a model that thinks before it answers spends
+# its thinking against max_tokens too (Haiku 5.5, 8 Oct 2026). 60 was enough for Haiku 4.5, which
+# does not think; with room to think and low effort the answer still comes, and costs under a cent.
+QUICK_MAX_TOKENS = 1024
 
 READER_SYSTEM = """You read freight documents for a truckload brokerage: bills of lading (BOL), proofs of delivery (POD), lumper receipts, scale tickets, reefer logs, carrier invoices, rate confirmations, other shipment paperwork (packing lists, certificates of analysis, customs and commercial invoices, temperature-recorder sheets), and photos of freight.
 
@@ -84,7 +93,8 @@ class Usage:
 
         key = base_model(self.model.split("/")[-1])          # tolerate openrouter's anthropic/... and bedrock's anthropic....
         inp, out = PRICES.get(key, PRICES.get(key.replace(".", "-"), (5.00, 25.00)))
-        return (self.input_tokens * inp + self.cache_read * inp * 0.1 + self.cache_write * inp * 1.25 + self.output_tokens * out) / 1_000_000
+        cache_read = CACHE_READ_RATE.get(key, 0.10)
+        return (self.input_tokens * inp + self.cache_read * inp * cache_read + self.cache_write * inp * 1.25 + self.output_tokens * out) / 1_000_000
 
     def as_dict(self) -> dict:
         return {"model": self.model, "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
@@ -168,7 +178,7 @@ def _structured_call(client, model: str, system: str, content: list[dict], schem
     schema_text = "Respond with ONLY a JSON object that validates against this JSON schema. No prose, no code fences.\n" + json.dumps(reader_json_schema(schema_model))
     schema_system = [{"type": "text", "text": system + "\n\n" + schema_text, "cache_control": {"type": "ephemeral"}}]
     output_config: dict = {"format": _output_format(schema_model)}
-    use_effort = bool(effort) and "haiku" not in model.lower()
+    use_effort = bool(effort) and not _no_effort_model(model)
     if use_effort:
         output_config["effort"] = effort
 
@@ -327,15 +337,31 @@ If you are unsure whether the receiver signed, answer pod. confidence is how sur
 QUICK_KINDS = ("pod", "bol", "other_paperwork", "photo", "not_freight")
 
 
+def _no_effort_model(model: str) -> bool:
+    """Haiku 4.5 is the one current model that rejects the effort parameter and does not think unasked."""
+    return "haiku-4-5" in model.lower()
+
+
 def quick_look(client, doc: Document, model: str) -> tuple[str, float, Usage]:
     """(kind, confidence, usage). A kind outside QUICK_KINDS comes back as "unknown", which callers
-    treat as a page that needs the full read."""
+    treat as a page that needs the full read. A model that thinks by default (Haiku 5.5) is asked for
+    low effort, so the thinking stays short and the answer fits; an endpoint that refuses the effort
+    parameter is asked once, then read without it, as the full read does."""
     from .provider import model_id
 
     model = model_id(model)
     content = _page_blocks(doc) + [{"type": "text", "text": f"{len(doc.pages)} page(s). JSON only."}]
-    response = client.messages.create(model=model, max_tokens=60, system=QUICK_SYSTEM,
-                                      messages=[{"role": "user", "content": content}])
+    kw = dict(model=model, max_tokens=QUICK_MAX_TOKENS, system=QUICK_SYSTEM, messages=[{"role": "user", "content": content}])
+    if _no_effort_model(model) or _NO_EFFORT.get(model):
+        response = client.messages.create(**kw)
+    else:
+        try:
+            response = client.messages.create(**kw, output_config={"effort": "low"})
+        except anthropic.BadRequestError as e:
+            if "effort" not in str(e).lower():
+                raise
+            _NO_EFFORT[model] = True
+            response = client.messages.create(**kw)
     text = next((b.text for b in response.content if b.type == "text"), "")
     found = re.search(r"\{.*\}", text, re.S)
     try:

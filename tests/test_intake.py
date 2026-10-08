@@ -4243,7 +4243,7 @@ def test_reader_is_brief_and_caches_the_schema() -> None:
                 raise refuse("output_config.format is not supported")
             if "effort" in oc and not self.effort_ok:
                 raise refuse("effort is not supported")
-            if kw.get("max_tokens") == 60:
+            if kw.get("max_tokens") == rd.QUICK_MAX_TOKENS:
                 return _Msg('{"kind": "photo", "confidence": 0.97}')
             return _Msg(json.dumps(_extraction("bill_of_lading")))
 
@@ -4264,8 +4264,26 @@ def test_reader_is_brief_and_caches_the_schema() -> None:
     check("an endpoint that refuses effort is asked once, then read without it",
           sum("effort" in (c.get("output_config") or {}) for c in calls) == 1 and "output_config" not in calls[-1])
     doc = type("D", (), {"pages": []})()
+    calls.clear()
     kind, conf, _u = rd.quick_look(_Client(), doc, "claude-haiku-4-5")
     check("the quick look answers a kind and how sure", (kind, conf) == ("photo", 0.97))
+    check("Haiku 4.5 is asked without effort", "output_config" not in calls[-1] and calls[-1]["max_tokens"] >= 512, str(calls[-1].keys()))
+    calls.clear()
+    rd._NO_EFFORT.clear()
+    kind, conf, _u = rd.quick_look(_Client(), doc, "claude-haiku-5-5")
+    check("Haiku 5.5, which thinks by default, is asked for low effort with room to think (8 Oct 2026)",
+          (kind, conf) == ("photo", 0.97) and calls[-1].get("output_config") == {"effort": "low"} and calls[-1]["max_tokens"] >= 512, str(calls[-1]))
+    calls.clear()
+    rd._NO_EFFORT.clear()
+    kind, conf, _u = rd.quick_look(_Client(effort_ok=False), doc, "claude-haiku-5-5")
+    kind2, _, _ = rd.quick_look(_Client(effort_ok=False), doc, "claude-haiku-5-5")
+    check("an endpoint that refuses effort on the quick look is asked once, then read without it",
+          (kind, kind2) == ("photo", "photo") and sum("output_config" in c for c in calls) == 1 and len(calls) == 3, str(len(calls)))
+    rd._NO_EFFORT.clear()
+    from pod_intake.reader import Usage
+    check("a read on Opus 5.5 is priced at $4/$20 with a twentieth for cache reads, Haiku 5.5 at $0.10/$0.50",
+          abs(Usage("anthropic.claude-opus-5-5", 1_000_000, 100_000, 1_000_000, 0).cost_usd - (4.0 + 2.0 + 0.2)) < 1e-6
+          and abs(Usage("claude-haiku-5-5", 1_000_000, 1_000_000, 0, 0).cost_usd - 0.6) < 1e-6)
 
 
 def test_auto_upload_dry_run_and_off() -> None:

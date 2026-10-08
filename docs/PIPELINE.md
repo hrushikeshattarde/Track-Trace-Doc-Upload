@@ -33,7 +33,7 @@ flowchart LR
     S3 -->|"new mail objects"| W["worker Lambda"]
     W <-->|"ledger/intake.sqlite3"| S3
     W <-->|"reads + POST /files/upload"| TP["TransportPro API"]
-    W -->|"quick look: Haiku 4.5<br/>full read: Opus 5"| BR["Amazon Bedrock"]
+    W -->|"quick look: Haiku 4.5<br/>full read: Opus 5.5"| BR["Amazon Bedrock"]
     W -->|"uploaded + held rows"| SH["Upload log sheet"]
     SM["Secrets Manager"] -.->|"Gmail key"| C
     SM -.->|"TransportPro login, Gmail key"| W
@@ -302,9 +302,9 @@ Each document without a reading goes down this ladder:
 | 1 | Get the bytes: from S3 `doc/` for email (checked against the SHA-256), from TransportPro for a file on the load | free |
 | 2 | **Too long?** Over 40 pages (`MAX_READ_PAGES`) or 25 MB (`MAX_READ_MB`): recorded as a permanent failure, "too long for the bot", and **held for a person**. It is never sent to the AI. Up to 25 Sep 2026 the limit was 10 pages. | free |
 | 3 | **Same picture already read on this load?** (every page within a mean difference of 3.0 of a read document's pages) Copy that reading. | $0 |
-| 4 | **Quick look**: Claude Haiku 4.5, first 3 pages at 1,100 px, 4 in parallel, 60 s timeout. Answers `pod`, `bol`, `other_paperwork`, `photo` or `not_freight`, with a confidence. Stored in `quicklook`. | ~$0.002 |
+| 4 | **Quick look**: Claude Haiku 4.5, first 3 pages at 1,100 px, 4 in parallel, 60 s timeout. (Haiku 5.5 is ready in the code - it is asked for low effort with room to think - but on 8 Oct 2026 Bedrock's Messages endpoint in us-east-1 did not serve it yet.) Answers `pod`, `bol`, `other_paperwork`, `photo` or `not_freight`, with a confidence. Stored in `quicklook`. | ~$0.002 |
 | 5 | **Skip the full read** only when the quick look says `photo` or `not_freight` at 80% or more, or when the page is already on the load (a texted picture), the truck isn't at the consignee, and the quick look called it `bol`, `other_paperwork`, `photo` or `not_freight`. A texted POD pulls the other pictures from its text batch into the full read. | – |
-| 6 | **Full read**: Claude Opus 5 on Bedrock, effort `low`, brief notes, 1,568 px pages sent as JPEG, 3 reads in parallel, 120 s timeout each. A file over 10 pages (`CHUNK_PAGES`) is read in pieces of up to 10 pages, one read per piece (`pieces_to_read`, `_read_input`). Each piece's reading is kept in `read_part` until every piece is in; then `merge_readings` ([`pod_intake/reader.py`](../pod_intake/reader.py)) combines them into one reading for the whole file. The file is a POD if any piece is, the receiver's name and delivery times come from the piece that has them, and pages are numbered as in the file. The result is the `Extraction` in [`pod_intake/schema.py`](../pod_intake/schema.py), stored in `attachment.extraction_json`. | ~$0.04 a read; a 27-page packet ~$0.40 |
+| 6 | **Full read**: Claude Opus 5.5 on Bedrock (since 8 Oct 2026; Opus 5 before), effort `low`, brief notes, 1,568 px pages sent as JPEG, 3 reads in parallel, 120 s timeout each. A file over 10 pages (`CHUNK_PAGES`) is read in pieces of up to 10 pages, one read per piece (`pieces_to_read`, `_read_input`). Each piece's reading is kept in `read_part` until every piece is in; then `merge_readings` ([`pod_intake/reader.py`](../pod_intake/reader.py)) combines them into one reading for the whole file. The file is a POD if any piece is, the receiver's name and delivery times come from the piece that has them, and pages are numbered as in the file. The result is the `Extraction` in [`pod_intake/schema.py`](../pod_intake/schema.py), stored in `attachment.extraction_json`. | ~$0.04 a read; a 27-page packet ~$0.40 |
 
 The full read returns:
 
@@ -625,7 +625,7 @@ flowchart TD
     SA -- yes --> AS["Set aside<br/>ledger only"]
     SA -- no --> CAP{"Within read caps<br/>and time?"}
     CAP -- no --> NX
-    CAP -- yes --> FR["Full read (Opus 5)"]
+    CAP -- yes --> FR["Full read (Opus 5.5)"]
     FR -- fails --> RT["Retry after 15m, 1h, 6h, 24h"] --> NX
     FR -- ok --> J
     J --> X1["Not a BOL/POD, personal ID<br/>ledger only"]
