@@ -480,6 +480,12 @@ def can_join(dec: Decision, refs: set[str], kind: str, s: Settings, docs: frozen
     if dec.kind is None:
         return (dec.outcome == NOT_PAPERWORK and bool(shipment_numbers(dec.ex) & numbers)
                 and (is_packing_list(dec.ex) or (kind == "POD" and is_dock_sheet(dec.ex))))
+    if (kind == "POD" and refs & set(dec.strong) and dec.outcome in ("ready", HELD, ON_FILE, NOT_NEEDED)
+            and len(dec.strong) >= 2 and (dec.conf or 0) >= s.pod_floor and dec.why <= {"pod_evidence", "confidence"}):
+        # Tied to the load by two reference numbers, one shared with the set: the Spindrift BOL beside
+        # load 2590009's Costco label (9 Oct 2026), read at 75% - its page of the POD whatever the
+        # reader made of its type.
+        return True
     if dec.kind != "BOL":
         # A page typed as a POD claim for its in/out times alone - load 2580410's Sojo BOL, whose
         # Opendocks block the reader put at the consignee - is a page of the POD it was sent with
@@ -580,7 +586,13 @@ def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[
     USPS 5398-A's Copy 2, with the Kansas City stamp, emailed a day after Copy 1 went up as the BOL,
     on a photo so faint the trip read 2A8E1 for 2AEE1 and the facility 6608P for 660RP - counts that
     document's facts whatever sending it came in, when the two share two identity numbers (same_form:
-    the seal and the barcode here) and the document matched the load on its own."""
+    the seal and the barcode here) and the document matched the load on its own.
+
+    A mate vouches for the lead with its facts, so it must be this load's page beyond doubt: read at
+    the confidence bar, or tied to the load by two reference numbers and read at the corroboration
+    floor. Load 2590009 (9 Oct 2026): the Spindrift BOL texted beside a Costco receiving label matched
+    the pickup number, the PO and the manifest number but read at 75% - 85% on Opus 5, 75-80% on
+    Opus 5.5, a borderline page either way - and the label stayed at one fact."""
     pool: list[Decision] | None = None
     for dec in decisions:
         if dec.outcome != HELD or dec.kind != "POD" or dec.why != {"facts"} or dec.ex is None:
@@ -591,8 +603,8 @@ def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[
             pool = decisions + (more() if more is not None else [])
         bare = not dec.ex.numbers and not dec.strong          # a signature page naming nothing (2604225)
         mates = [m for m in pool if m is not dec and m.ex is not None and m.kind is not None
-                 and (same_sending(m.doc, dec.doc) or same_form(m.ex, dec.ex)) and (m.conf or 0) >= s.min_confidence
-                 and m.why <= {"pod_evidence"} and m.outcome in ("ready", HELD, ON_FILE, NOT_NEEDED, UPLOADED)
+                 and (same_sending(m.doc, dec.doc) or same_form(m.ex, dec.ex)) and vouches(m, s)
+                 and m.outcome in ("ready", HELD, ON_FILE, NOT_NEEDED, UPLOADED)
                  and (set(m.strong) & set(dec.strong)
                       or ((bare or same_form(m.ex, dec.ex)) and m.strong and len(m.facts) >= s.min_facts))]
         if not mates:
@@ -615,6 +627,15 @@ def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[
             if due:
                 dec.allowed.append(due)
             dec.outcome, dec.final, dec.status = "ready", True, ""
+
+
+def vouches(m: Decision, s: Settings) -> bool:
+    """Whether a page is this load's beyond doubt, so its facts may count for a lead and it may ride
+    in the lead's upload: read at the confidence bar with nothing but the receiver's evidence missing,
+    or tied to the load by two reference numbers and read at the corroboration floor (2590009)."""
+    if (m.conf or 0) >= s.min_confidence and m.why <= {"pod_evidence"}:
+        return True
+    return len(m.strong) >= 2 and (m.conf or 0) >= s.pod_floor and m.why <= {"pod_evidence", "confidence"}
 
 
 def companions(conn, decisions: list[Decision], group: list[Decision], s: Settings) -> list[Decision]:

@@ -466,7 +466,11 @@ is the hand-off to a person.
   or a long unlabelled code such as a barcode (`same_form`, `identity_numbers`). Load 2607407 (7 Oct 2026):
   the USPS 5398-A's stamped Copy 2 came a day after Copy 1 went up as the BOL, on a faint photo that misread
   the trip and the facility code; its seal and barcode are the BOL's. `_sent_mates` now offers the load's
-  texted files the bot has read as mates too, not only emailed pages.
+  texted files the bot has read as mates too, not only emailed pages. A mate must be this load's page beyond
+  doubt (`vouches`, 9 Oct 2026): read at the 85% bar, or tied to the load by two reference numbers and read at
+  the 70% corroboration floor. Load 2590009: the Spindrift BOL beside a Costco label matched three references
+  but read at 75% (85% on Opus 5, 75-80% on Opus 5.5), and the label stayed at one fact; such a page now
+  vouches and rides in the upload (`can_join`).
 - **Other pages of the same document join it** even when they match nothing in TransportPro on their
   own: a page whose `doc_ref` carries a document number already in the set (load 2593890's signed
   page 3 of 3, whose only number was the BOL number).

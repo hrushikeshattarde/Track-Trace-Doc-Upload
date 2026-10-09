@@ -1077,12 +1077,13 @@ def test_a_checked_pod_goes_up_once_the_delivery_appointment_has_passed() -> Non
     check("dated the day after the appointment: still goes up", ups == ["Bill Of Lading"], str(got))
     ups, got, _ = world(2591188, pod(2591188, date="HW"))
     check("a date the parser cannot read does not block it", ups == ["Bill Of Lading"], str(got))
-    ups, got, _ = world(2577915, pod(2577915, date="10/9/26"), delivery="2026-10-09")
+    # A delivery still ahead has to stay ahead whenever the suite runs: 2099.
+    ups, got, _ = world(2577915, pod(2577915, date="1/9/99"), delivery="2099-01-09")
     check("the appointment still ahead: waits, and the status says what would release it",
-          not ups and got[0] == autofile.WAITING and got[2] == 0 and "or the delivery appointment (2026-10-09 08:00 ET) passes" in got[1], str(got))
-    ups, got, _ = world(2577911, pod(2577911, date="10-01-26"), delivery="2026-10-09")
-    check("2577911's shape - signed 1 Oct for a 9 Oct delivery: waits, and says the date will not release it either",
-          not ups and got[0] == autofile.WAITING and "the page's date 10-01-26 is before the delivery day (Oct 09)" in got[1], str(got))
+          not ups and got[0] == autofile.WAITING and got[2] == 0 and "or the delivery appointment (2099-01-09 07:00 ET) passes" in got[1], str(got))
+    ups, got, _ = world(2577911, pod(2577911, date="1/1/99"), delivery="2099-01-09")
+    check("2577911's shape - signed a week before the delivery: waits, and says the date will not release it either",
+          not ups and got[0] == autofile.WAITING and "the page's date 1/1/99 is before the delivery day (Jan 09)" in got[1], str(got))
     ups, got, _ = world(2577912, pod(2577912, date="9/25/26"))
     check("the appointment passed but the page is dated before the delivery day: waits for the stage, and says so",
           not ups and got[0] == autofile.WAITING and "is before the delivery day (Oct 03)" in got[1], str(got))
@@ -1261,6 +1262,80 @@ def test_a_leading_zero_does_not_hide_a_reference_number() -> None:
           [u["type"] for u in tpro.uploads] == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str((got, [u["type"] for u in tpro.uploads])))
     facts = next(iter(log.rows.values()))[8]
     check("and the sheet names the pickup number", "pickup # TD49406" in facts, facts)
+
+
+def test_a_page_tied_to_the_load_by_two_references_vouches_from_the_floor() -> None:
+    """Load 2590009 (9 Oct 2026, Spindrift to Costco Monroe Township): the driver texted the Costco
+    receiving label (POD 95%, stamped, the PO its only fact) and the Spindrift BOL beside it, which
+    matched the pickup number, the PO and the manifest number but read at 75%. The set rule asked the
+    BOL to be 85% sure of its type before its facts could count, so the label stayed at one fact and
+    both were held; a person filed the POD. Now a page tied to the load by two reference numbers vouches
+    for the lead from the 70% corroboration floor, and rides in the upload."""
+    print("a page tied to the load by two references vouches from the floor")
+    import time as _time
+    from intake import autofile
+
+    def num(label, value, kind):
+        return {"label": label, "kind": kind, "value": value, "handwritten": False, "confidence": 0.9}
+
+    def text(fid, when):
+        return {"id": fid, "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL", "uploadById": 1,
+                "comments": "Driver Supplied Image - load", "dateCreated": when}
+
+    def load_of(load_id):
+        return {"id": load_id, "status": {"documentStatus": "Waiting for Documents", "loadStatus": "Delivered"},
+                "billingInfo": {"customerId": 9701},
+                "reference": {"pickupNumber": "P3236C", "poNumber": "001750918659", "manifestNumber": "SO156405", "weight": 44032.8, "numberOfPieces": 1680},
+                "waypoints": [{"type": "SH", "location": {"companyName": "City Brewing Latrobe-Tarrs", "city": "Tarrs", "state": "PA", "timezone": -4},
+                               "appointmentTime": {"open": "2026-10-08T19:00:00Z"}, "reference": []},
+                              {"type": "CN", "location": {"companyName": "COSTCO MONROE TOWNSHIP DRY", "address": "10 COSTCO DR", "city": "Monroe Twp", "state": "NJ", "timezone": -4},
+                               "appointmentTime": {"open": "2026-10-09T12:00:00Z"}, "reference": []}]}
+
+    def label(load_id):
+        r = _reading(load_id, "proof_of_delivery", conf=0.95, numbers=[], city="Monroe Township")
+        r["numbers"] = [num("(unlabeled, below IN TIME)", "1750918659", "po"), num("(unlabeled, before COMMENTS)", "001750918659", "po"), num("DOOR", "448", "other")]
+        r["signatures"] = {"shipper_signed": False, "driver_signed": False, "receiver_signed": False, "receiver_name": "G QUI", "receiver_date": "10/09/26", "stamp_present": True}
+        r["times"] = {"check_in": "09:28", "check_out": "10:43", "source": "printed", "at_stop": "consignee"}
+        r["pages"] = [{"page": 1, "role": "pod", "legibility": 0.9}]
+        return r
+
+    def bol(load_id, conf=0.75, refs=3):
+        r = _reading(load_id, conf=conf, numbers=[], city="Monroe Township")
+        nums = [num("Order #", "P3236C", "order"), num("Customer PO #", "SO156405", "po"), num("Distribution #", "001750918659", "other")][:refs]
+        r["numbers"] = nums + [num("Trailer", "5317", "trailer"), num("Seal Numbers", "1388094", "seal")]
+        r["pieces"] = "1680"
+        r["signatures"].update({"shipper_signed": False, "driver_signed": True})
+        r["times"] = {"check_in": "7:43am", "check_out": "10:50am", "source": "handwritten", "at_stop": "unknown"}
+        r["pages"] = [{"page": 1, "role": "bol", "legibility": 0.8, "doc_ref": "P3236C 1/1"}]
+        return r
+
+    def world(load_id, bol_reading):
+        conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+        log = _AutoLog()
+        load_row(load_id, "pod_expected", "at consignee")
+        tpro.add(load_id, files=[(text(801, "2026-10-09T14:58:45Z"), _picture(51)), (text(802, "2026-10-09T14:59:29Z"), _picture(52))])
+        tpro.loads[load_id]["load"] = load_of(load_id)
+        on_load(_picture(51), label(load_id))
+        on_load(_picture(52), bol_reading)
+        s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+        autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+        outcome = {r[0]: r[1] for r in conn.execute("SELECT source, outcome FROM autofile WHERE load_id=?", (load_id,))}
+        return tpro.uploads, outcome, log
+
+    ups, outcome, log = world(2590009, bol(2590009))
+    check("the label leads on the BOL's facts and both go up as one two-page Bill Of Lading",
+          len(ups) == 1 and ups[0]["type"] == "Bill Of Lading" and autofile.page_count(ups[0]["data"]) == 2
+          and outcome.get("tpro:801") == autofile.UPLOADED and outcome.get("tpro:802") == autofile.UPLOADED,
+          str((outcome, [(u["type"], u["comment"]) for u in ups])))
+    check("one sheet row for the set", len(log.rows) == 1, str(list(log.rows)))
+    facts = next(iter(log.rows.values()))[8]
+    check("the sheet says what it was counted with", "counted with 802" in facts and "pickup # P3236C" in facts, facts)
+    ups, outcome, _ = world(2590010, bol(2590010, conf=0.65))
+    check("a mate under the corroboration floor still does not vouch: held",
+          not ups and outcome.get("tpro:801") == autofile.HELD, str((outcome, len(ups))))
+    ups, outcome, _ = world(2590011, bol(2590011, refs=1))
+    check("a mate matching one reference number at 75% does not vouch either: held",
+          not ups and outcome.get("tpro:801") == autofile.HELD, str((outcome, len(ups))))
 
 
 def test_comment_never_prints_a_non_name() -> None:
@@ -4482,6 +4557,7 @@ if __name__ == "__main__":
     test_a_checked_pod_goes_up_once_the_delivery_appointment_has_passed()
     test_a_stamped_copy_of_a_bol_already_on_the_load_counts_its_facts()
     test_a_leading_zero_does_not_hide_a_reference_number()
+    test_a_page_tied_to_the_load_by_two_references_vouches_from_the_floor()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()
