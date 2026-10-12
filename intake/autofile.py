@@ -579,8 +579,11 @@ def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[
     A3 straight BOL, signed by the receiver, texted 17 seconds after page 1, which carried the BOL and
     the PO - has no reference number to share with anything. It takes the facts of a page sent with it
     that matched the load on its own (min_facts facts, one a reference number): the burst and the
-    matching page are the tie, and the two go up as one POD. A page with numbers of its own that
-    match nothing is not bare - it may be another load's - and stays held.
+    matching page are the tie, and the two go up as one POD. A page with reference numbers of its
+    own that match nothing is not bare - it may be another load's - and stays held. A stray scribble
+    is not a reference: load 2593363 (12 Oct 2026), the stamped back of a BOL on which the reader
+    transcribed the door number "18B" showing through from the front, was held beside the front that
+    matched the load, for want of a bareness it plainly had.
 
     A stamped or signed copy of a document already read on the load - load 2607407 (7 Oct 2026): the
     USPS 5398-A's Copy 2, with the Kansas City stamp, emailed a day after Copy 1 went up as the BOL,
@@ -601,7 +604,7 @@ def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[
             continue
         if pool is None:
             pool = decisions + (more() if more is not None else [])
-        bare = not dec.ex.numbers and not dec.strong          # a signature page naming nothing (2604225)
+        bare = not shipment_numbers(dec.ex) and not dec.strong   # a signature page naming no shipment (2604225, 2593363)
         mates = [m for m in pool if m is not dec and m.ex is not None and m.kind is not None
                  and (same_sending(m.doc, dec.doc) or same_form(m.ex, dec.ex)) and vouches(m, s)
                  and m.outcome in ("ready", HELD, ON_FILE, NOT_NEEDED, UPLOADED)

@@ -460,7 +460,9 @@ is the hand-off to a person.
   earlier run still counts (`_sent_mates`). A signed page that names nothing at all - load 2604225 (5 Oct
   2026), the certification page of an A3 straight BOL texted 17 seconds after page 1 - has no reference
   number to share; it takes the facts of a page sent with it that matched the load on its own, and the two
-  go up as one POD. A page with numbers of its own that match nothing is not bare and stays held.
+  go up as one POD. A page with reference numbers of its own that match nothing is not bare and stays held;
+  a stray scribble such as a door number is not a reference (12 Oct 2026, load 2593363: the stamped back of
+  a BOL, with the front's "18B" showing through, was held beside the front that matched).
   A stamped or signed page that fails only on facts also counts the facts of a document already read on
   the load, whatever sending it came in, when the two share two identity numbers - seal, trailer, tractor,
   or a long unlabelled code such as a barcode (`same_form`, `identity_numbers`). Load 2607407 (7 Oct 2026):

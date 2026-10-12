@@ -962,9 +962,14 @@ def test_a_bare_signature_page_takes_the_facts_of_the_page_texted_with_it() -> N
           len(log.rows) == 1 and "counted with 701" in facts and "texted together" in facts and "BOL # AA260640454" in facts,
           f"{len(log.rows)} rows; {facts}")
 
-    ups, outcome, _ = world(2604226, page1(2604226), page2(2604226, numbers=[("PO", "PO7777777")]))
-    check("a signed page with a number of its own that matches nothing is not bare: held, nothing goes up",
+    stray = page2(2604226, numbers=[("PO", "PO7777777")])
+    stray["numbers"][0]["kind"] = "po"
+    ups, outcome, _ = world(2604226, page1(2604226), stray)
+    check("a signed page with a reference number of its own that matches nothing is not bare: held, nothing goes up",
           not ups and outcome.get("tpro:702") == autofile.HELD, str((outcome, len(ups))))
+    ups, outcome, _ = world(2604229, page1(2604229), page2(2604229, numbers=[("(unlabeled handwriting)", "18B")]))
+    check("a scribbled door number is not a reference: the page is still bare and goes up with its mate (2593363, 12 Oct 2026)",
+          len(ups) == 1 and outcome.get("tpro:702") == autofile.UPLOADED, str((outcome, len(ups))))
     ups, outcome, _ = world(2604227, page1(2604227, numbers=[("BOL#", "ZZ9999"), ("PO", "PO7777777")]), page2(2604227))
     check("a bare signed page whose mate does not match the load: held, nothing goes up",
           not ups and outcome.get("tpro:702") == autofile.HELD, str((outcome, len(ups))))
@@ -1336,6 +1341,62 @@ def test_a_page_tied_to_the_load_by_two_references_vouches_from_the_floor() -> N
     ups, outcome, _ = world(2590011, bol(2590011, refs=1))
     check("a mate matching one reference number at 75% does not vouch either: held",
           not ups and outcome.get("tpro:801") == autofile.HELD, str((outcome, len(ups))))
+
+
+def test_the_stamped_back_of_a_bol_goes_up_with_its_front() -> None:
+    """Load 2593363 (12 Oct 2026, Spindrift to City Brewing Latrobe-Tarrs): the driver texted the back
+    of the BOL - the brewery's "RECEIVED SUBJECT TO BREWERY COUNT AND INSPECTION" stamp, Lee C's
+    signature, in and out times - and page 3 of the BOL, signed at pickup, whose order number is the
+    load's pickup number. The back carries no reference number; the reader transcribed the faint door
+    number "18B" showing through from the front, and that one scribble made the page "not bare", so the
+    two sides were judged apart and the POD was held on zero facts. Now bareness means no reference-kind
+    number, and the back takes the front's facts; both go up as one POD."""
+    print("the stamped back of a BOL goes up with its front")
+    import time as _time
+    from intake import autofile
+
+    def num(label, value, kind):
+        return {"label": label, "kind": kind, "value": value, "handwritten": False, "confidence": 0.9}
+
+    def text(fid, when):
+        return {"id": fid, "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL", "uploadById": 1,
+                "comments": "Driver Supplied Image - load", "dateCreated": when}
+
+    load = {"id": 2593363, "status": {"documentStatus": "Waiting for Documents", "loadStatus": "Dispatched"},
+            "billingInfo": {"customerId": 9701},
+            "reference": {"pickupNumber": "TO326775/P117S", "poNumber": "TO326775/P117S", "manifestNumber": "TO326775/P117S", "weight": 42441, "numberOfPieces": 2100},
+            "waypoints": [{"type": "SH", "location": {"companyName": "Cold Spring Brewing Co - St. Cloud", "address": "6250 Ridgewood Rd.", "city": "St. Cloud", "state": "MN", "timezone": -5},
+                           "appointmentTime": {"open": "2026-10-10T19:00:00Z"}, "reference": []},
+                          {"type": "CN", "location": {"companyName": "City Brewing Latrobe-Tarrs", "address": "1001 Technology Drive West Gate", "city": "Tarrs", "state": "PA", "timezone": -4},
+                           "appointmentTime": {"open": "2026-10-12T10:00:00Z"}, "reference": []}]}
+    back = _reading(2593363, "proof_of_delivery", receiver=True, conf=0.9, numbers=[], city=None)
+    back["numbers"] = [num("(unlabeled handwriting)", "18B", "other")]
+    back["consignee"] = {"name": "City Brewery Latrobe", "city": "Latrobe", "state": "PA"}
+    back["signatures"] = {"shipper_signed": False, "driver_signed": False, "receiver_signed": True, "receiver_name": "Lee C", "receiver_date": "OCT 12 '26", "stamp_present": True}
+    back["times"] = {"check_in": "7:30 AM", "check_out": "8:38 AM", "source": "handwritten", "at_stop": "consignee"}
+    back["pages"] = [{"page": 1, "role": "pod", "legibility": 0.7}]
+    front = _reading(2593363, conf=0.92, numbers=[], city="Tarrs")
+    front["numbers"] = [num("Bill of Lading", "2296771", "bol"), num("Sales Order Number", "148683", "order"), num("ORDER NUMBER", "TO326775", "order"),
+                        num("Seal#", "1625355", "seal"), num("Unit#", "AARON116", "tractor"), num("(unlabeled handwriting)", "18B", "other")]
+    front["shipper"] = {"name": "Carolina Beverage Group", "city": "St Cloud", "state": "MN"}
+    front["pages"] = [{"page": 1, "role": "bol", "legibility": 0.8, "doc_ref": "2296771 3/3"}]
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    load_row(2593363, "pod_expected", "at consignee")
+    tpro.add(2593363, files=[(text(901, "2026-10-12T12:56:43Z"), _picture(61)), (text(902, "2026-10-12T12:56:45Z"), _picture(62))])
+    tpro.loads[2593363]["load"] = load
+    on_load(_picture(61), back)
+    on_load(_picture(62), front)
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    outcome = {r[0]: r[1] for r in conn.execute("SELECT source, outcome FROM autofile WHERE load_id=2593363")}
+    check("the back takes the front's facts and both go up as one two-page Bill Of Lading",
+          len(tpro.uploads) == 1 and tpro.uploads[0]["type"] == "Bill Of Lading" and autofile.page_count(tpro.uploads[0]["data"]) == 2
+          and outcome == {"tpro:901": autofile.UPLOADED, "tpro:902": autofile.UPLOADED}, str((outcome, [(u["type"], u["comment"]) for u in tpro.uploads])))
+    facts = next(iter(log.rows.values()))[8]
+    check("the sheet names the front's pickup number, counted with the front, texted together",
+          "(TO326775)" in facts and "counted with 902" in facts and "texted together" in facts, facts)
 
 
 def test_comment_never_prints_a_non_name() -> None:
@@ -4558,6 +4619,7 @@ if __name__ == "__main__":
     test_a_stamped_copy_of_a_bol_already_on_the_load_counts_its_facts()
     test_a_leading_zero_does_not_hide_a_reference_number()
     test_a_page_tied_to_the_load_by_two_references_vouches_from_the_floor()
+    test_the_stamped_back_of_a_bol_goes_up_with_its_front()
     test_comment_never_prints_a_non_name()
     test_provider_selection()
     test_notifications()
