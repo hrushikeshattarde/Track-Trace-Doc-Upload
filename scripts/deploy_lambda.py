@@ -75,16 +75,20 @@ BUILD = HERE / "build" / "lambda"
 # iPhone HEIC photos (pillow-heif). With it the unpacked package is ~200 MB of Lambda's 250.
 DEPS = ["boto3==1.43.98", "google-auth==2.58.0", "cryptography==50.0.1", "tzdata==2026.4",
         "anthropic==1.5.0", "pydantic==2.13.5", "pymupdf==1.28.2", "pillow==12.3.0", "pillow-heif==1.7.0"]
-# The auto-upload pilot's pods, by TransportPro terminal: Frankie Saiz (1160) from 24 Sep 2026, and
-# Jesse Klingler (1138) from 30 Sep 2026. Each pod has a sheet tab of its own, named here (30 Sep 2026:
-# the original "Upload log" tab became "Upload Log - Saiz"; the pod renamed its tab to "Upload Log - Klingler"
-# on 1 Oct 2026, so the name here must follow the sheet); a pod left out of UPLOAD_TABS would write
-# to the log's default tab, "Upload log".
+# The auto-upload pilot's pods, by TransportPro terminal: Frankie Saiz (1160) from 24 Sep 2026, Jesse
+# Klingler (1138) from 30 Sep 2026, and Julialynn Boyanowski (1101), Dalton Cunningham (1134) and the
+# Paper pod (1074) from 12 Oct 2026. "POD (Team Cunningham)" (1103) is an inactive terminal with no
+# loads, so it is left out. Each pod has a sheet tab of its own, named here (30 Sep 2026: the original
+# "Upload log" tab became "Upload Log - Saiz"; the pod renamed its tab to "Upload Log - Klingler" on
+# 1 Oct 2026, so the name here must follow the sheet); a pod left out of UPLOAD_TABS would write to
+# the log's default tab, "Upload log". A new tab is created with the header and the look of the first
+# pod tab on the first write, or ahead of the deploy with sheets.UploadLog.ensure(tab).
 # The morning report (intake/report.py): sent from a verified SES domain of Circle's. Recipients live in
 # .env as INTAKE_REPORT_TO and INTAKE_REPORT_CC, comma-separated, not in this public repository.
 REPORT_FROM = "DocIntake@circle-analytics.com"
-AUTO_TERMINALS = "1160,1138"
-UPLOAD_TABS = {1160: "Upload Log - Saiz", 1138: "Upload Log - Klingler"}
+AUTO_TERMINALS = "1160,1138,1101,1134,1074"
+UPLOAD_TABS = {1160: "Upload Log - Saiz", 1138: "Upload Log - Klingler", 1101: "Upload Log - Boyanowski",
+               1134: "Upload Log - Cunningham", 1074: "Upload Log - Paper"}
 
 
 def _collector_env(env: dict) -> dict:

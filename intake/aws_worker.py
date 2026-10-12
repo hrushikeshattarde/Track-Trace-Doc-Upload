@@ -11,8 +11,8 @@ One invocation:
                              check - somebody else filed something - are checked straight away
                    check     then the loads whose next check has come round, oldest first
                  changed + check together stay within INTAKE_LOAD_LIMIT loads a run
-                 auto_upload  for the pilot terminals only (INTAKE_AUTO_TERMINALS, the Frankie Saiz
-                             pod from 24 Sep 2026): read new BOLs and PODs with the AI, upload what
+                 auto_upload  for the pilot terminals only (INTAKE_AUTO_TERMINALS: the Frankie Saiz
+                             pod from 24 Sep 2026, five pods since 12 Oct): read new BOLs and PODs with the AI, upload what
                              passes every check, log every decision to the pod's Upload log sheet -
                              see autofile.py. INTAKE_AUTO_UPLOAD off / dry-run / on switches it
     4. hand the ledger back

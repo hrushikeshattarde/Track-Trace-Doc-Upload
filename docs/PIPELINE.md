@@ -18,7 +18,8 @@ Carriers and drivers email BOLs and PODs to the `ratecon@` Google Group. Every 1
 
 - records that mail in its **ledger**, a SQLite file kept in S3;
 - checks the Load Management loads against TransportPro;
-- for the pilot pod (Frankie Saiz, TransportPro terminal 1160), has Claude read the new paperwork
+- for the pilot pods (Frankie Saiz 1160, Jesse Klingler 1138, Julialynn Boyanowski 1101, Dalton
+  Cunningham 1134 and Paper 1074, by TransportPro terminal), has Claude read the new paperwork
   and uploads the BOLs and PODs that pass every check;
 - writes what it uploaded, or held back and why, to the pod's **Upload log** Google Sheet.
 
@@ -40,8 +41,8 @@ flowchart LR
 ```
 
 Only the worker's auto-upload step calls a model or writes to TransportPro. Collection, ledger
-bookkeeping and load checks run for all 16 pod terminals. Reading and uploading run for terminal
-1160 only.
+bookkeeping and load checks run for all 16 pod terminals. Reading and uploading run for the five
+pilot terminals only (`AUTO_TERMINALS` in `scripts/deploy_lambda.py`).
 
 ---
 
@@ -60,7 +61,7 @@ bookkeeping and load checks run for all 16 pod terminals. Reading and uploading 
 | IAM roles | `circle-doc-intake-collector`, `-worker`, `-scheduler` | least-privilege policies are in `scripts/deploy_lambda.py` |
 | Logs | `/aws/lambda/<function>` | 90-day retention; one JSON summary line per run |
 | S3 bucket | `INTAKE_S3_BUCKET` in `.env` | kept out of this public repository |
-| Upload log | `INTAKE_UPLOAD_SHEET_ID` in `.env`, one tab per pod from `INTAKE_UPLOAD_TABS`: `Upload Log - Saiz` (1160) and `Upload Log - Klingler` (1138) since 30 Sep 2026; a pod with no tab named falls back to `Upload log` | shared with the service account as an editor |
+| Upload log | `INTAKE_UPLOAD_SHEET_ID` in `.env`, one tab per pod from `INTAKE_UPLOAD_TABS`: `Upload Log - Saiz` (1160) and `Upload Log - Klingler` (1138) since 30 Sep 2026, `Upload Log - Boyanowski` (1101), `Upload Log - Cunningham` (1134) and `Upload Log - Paper` (1074) since 12 Oct 2026; a pod with no tab named falls back to `Upload log` | shared with the service account as an editor |
 | Region | us-east-1 | the AWS account behind `AWS_PROFILE` in `.env`, shared with other projects |
 
 Both functions run from the same zip (`deploy/collector.zip`). Each handler picks its entry point.

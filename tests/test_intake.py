@@ -494,6 +494,18 @@ def test_a_pod_with_a_tab_of_its_own() -> None:
                                    pods={1160: "Frankie Saiz", 1138: "Jesse Klingler", 1099: "Nobody"})
     check("the tab map comes from the environment",
           s.tabs == {1160: "Upload Log - Saiz", 1138: "Upload Log - Klinger"} and s.terminals == frozenset({1160, 1138, 1099}))
+    # 12 Oct 2026: three more pods. What the deploy script hands the worker must name a tab for every
+    # pilot terminal, and only for pilot terminals, so no pod's rows land on the fallback tab.
+    import importlib.util as _ilu
+    spec = _ilu.spec_from_file_location("deploy_lambda", Path(__file__).resolve().parent.parent / "scripts" / "deploy_lambda.py")
+    deploy = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(deploy)
+    live = autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_AUTO_TERMINALS": deploy.AUTO_TERMINALS,
+                                       "INTAKE_UPLOAD_TABS": json.dumps({str(k): v for k, v in deploy.UPLOAD_TABS.items()})})
+    check("the deployed pods are the five of 12 Oct 2026", live.terminals == frozenset({1160, 1138, 1101, 1134, 1074}), str(live.terminals))
+    check("every deployed pod has a tab of its own", set(live.tabs) == live.terminals, str(live.tabs))
+    check("and every tab is named like the log", all(v.startswith("Upload Log - ") for v in live.tabs.values())
+          and len(set(live.tabs.values())) == len(live.tabs), str(live.tabs))
     conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
     log = _AutoLog()
     load_row(2600130, "pod_expected", "at consignee", terminal=1138)
