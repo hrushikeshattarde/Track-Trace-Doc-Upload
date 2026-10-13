@@ -284,6 +284,7 @@ class Doc:
     # Every sending the file came in. A file can be sent again: load 2571670's 27-page BOL packet came on
     # 24 Sep 2026 and again on 25 Sep beside the Costco sticker it belongs with.
     batches: frozenset[str] = frozenset()
+    arrived_at: str | None = None   # when it arrived, ISO UTC: the email's date, or the file's dateCreated
 
 
 @dataclass
@@ -774,7 +775,7 @@ def _email_docs(conn, load_id: int) -> list[Doc]:
         out.append(Doc(r["sha256"], r["filename"] or r["sha256"][:12], f"email:{r['message_id']}",
                        f"Email {eastern(r['internal_date'])} from {r['from_domain'] or 'an unknown sender'}",
                        message_id=r["message_id"], order=i, batch=f"email:{r['message_id']}",
-                       batches=frozenset(sent_in[r["sha256"]])))
+                       batches=frozenset(sent_in[r["sha256"]]), arrived_at=r["internal_date"]))
     return out
 
 
@@ -840,7 +841,8 @@ def file_doc(of: OnFile, filed: list[OnFile]) -> Doc:
         sorted(filed, key=lambda x: (str(x.file.get("dateCreated") or ""), str(x.file.get("id")))))}
     fid = str(of.file.get("id"))
     return Doc(of.sha256, of.file.get("fileName") or fid, f"tpro:{fid}", _arrived_on_file(of.file), on_file=of,
-               order=10_000 + rank.get(fid, 0), data=of.data, batch=text_batches(filed).get(fid))
+               order=10_000 + rank.get(fid, 0), data=of.data, batch=text_batches(filed).get(fid),
+               arrived_at=of.file.get("dateCreated"))
 
 
 def _docs_received(load: dict) -> bool:
@@ -1242,8 +1244,13 @@ def stop_day(load: dict | None, kind: str) -> dt.date | None:
     w = stop_of(load, kind)
     if w is None:
         return None
-    when = (w.get("appointmentTime") or {}).get("open") or (w.get("appointmentTime") or {}).get("close")
-    if not when:
+    return stop_clock_day(load, kind, (w.get("appointmentTime") or {}).get("open") or (w.get("appointmentTime") or {}).get("close"))
+
+
+def stop_clock_day(load: dict | None, kind: str, when) -> dt.date | None:
+    """The date of a moment (ISO, UTC) on a stop's own clock (its UTC offset)."""
+    w = stop_of(load, kind)
+    if w is None or not when:
         return None
     try:
         t = dt.datetime.fromisoformat(str(when).replace("Z", "+00:00"))
@@ -1258,7 +1265,8 @@ def stop_day(load: dict | None, kind: str) -> dt.date | None:
     return (t.astimezone(dt.timezone.utc) + dt.timedelta(hours=hours)).date()
 
 
-def corroborated_pod(ex, facts: list[str], strong: list[str], load: dict | None, s: Settings) -> str | None:
+def corroborated_pod(ex, facts: list[str], strong: list[str], load: dict | None, s: Settings, *,
+                     arrived: str | None = None, stage: str | None = None) -> str | None:
     """Why a POD the AI is less than min_confidence sure of may still go up - or None.
 
     Loads 2568382, 2565691, 2572625 and 2587025 (25-28 Sep 2026): signed or stamped PODs read at 78-83%
@@ -1271,7 +1279,17 @@ def corroborated_pod(ex, facts: list[str], strong: list[str], load: dict | None,
     corroborates the reading three ways: the receiver's signature or stamp is on it, the receiver's
     date is the delivery appointment day (or the day after - trucks run late), and at least min_facts
     facts match, one a reference number. A shipper's form dated at loading fails on the date; a page
-    for another load fails on the facts; a page nobody signed fails on the evidence."""
+    for another load fails on the facts; a page nobody signed fails on the evidence.
+
+    Load 2612789 (13 Oct 2026): Mann+Hummel's BOL came back with the receiver's signature on the
+    consignee line and nothing else - no date, no stamp, no times - read as a POD at 75% with five
+    facts matching, the load number among them, and was held because the signature has no date to
+    check. It had arrived at 09:19 ET on the delivery day, inside the appointment window, with the
+    truck at the consignee. When the receiver's signature or stamp carries no date, the day the
+    document arrived (`arrived`, on the consignee's clock) stands in for it, provided TransportPro has
+    the truck at the consignee or delivered (`stage`): a page that comes in on the delivery day from
+    a truck that is there was signed there. A page arriving earlier, or from a truck still loaded,
+    is held as before."""
     conf = ex.document_type_confidence
     if conf < s.pod_floor or conf >= s.min_confidence:
         return None
@@ -1281,10 +1299,16 @@ def corroborated_pod(ex, facts: list[str], strong: list[str], load: dict | None,
         return None
     day = delivery_day(load)
     when = page_date(ex.signatures.receiver_date, year=day.year if day else None)
+    came = None
+    if when is None and arrived and (stage or "").lower() in AT_CONSIGNEE:
+        when = came = stop_clock_day(load, "CN", arrived)
     if when is None or day is None or not (0 <= (when - day).days <= DELIVERY_DAY_SLACK):
         return None
     evidence = "receiver signature" if ex.signatures.receiver_signed else "receiving stamp"
     on = "the delivery day" if when == day else "the day after the appointment"
+    if came is not None:
+        return (f"AI {conf:.0%} sure, under {s.min_confidence:.0%} but accepted: {evidence}, undated, arrived "
+                f"{eastern(arrived)} on {on} with the truck {stage}, {len(facts)} facts incl. a reference number")
     return (f"AI {conf:.0%} sure, under {s.min_confidence:.0%} but accepted: {evidence}, dated "
             f"{ex.signatures.receiver_date} on {on}, {len(facts)} facts incl. a reference number")
 
@@ -1559,7 +1583,7 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
 
     # The checks.
     if ex.document_type_confidence < s.min_confidence:
-        allowed = (corroborated_pod(ex, dec.facts, dec.strong, load, s) if kind == "POD"
+        allowed = (corroborated_pod(ex, dec.facts, dec.strong, load, s, arrived=d.arrived_at, stage=stage) if kind == "POD"
                    else corroborated_bol(ex, dec.facts, dec.strong, s))
         if allowed:
             dec.allowed.append(allowed)

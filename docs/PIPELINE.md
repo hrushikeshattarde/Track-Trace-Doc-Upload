@@ -382,7 +382,12 @@ The floor was 75% until 1 Oct 2026: load 2587817, a Kraft Heinz BOL the receiver
 block (the form has no receiver line), read as a POD at 72% with two references matching and the date on the
 delivery day, and a person filed it two minutes after the hold; 2579182 and 2562048, 72% each, were filed by
 hand the same way, and no reading between 65% and 75% with that evidence was ever a wrong page. The reader
-is also told that on such forms a signature dated after the ship date is the receiver's.
+is also told that on such forms a signature dated after the ship date is the receiver's. When the
+receiver's signature or stamp carries no date (13 Oct 2026, load 2612789: Riley Ralston's signature on the
+consignee line of Mann+Hummel's BOL, nothing else, 75% with five facts matching), the day the document
+arrived stands in for it, on the consignee's clock, provided TransportPro has the truck at the consignee or
+delivered; the Checks column then says `undated, arrived <time> ET on the delivery day with the truck at
+consignee`. A page arriving before the delivery day, or from a truck still loaded, is held as before.
 `INTAKE_AUTO_POD_FLOOR` moves the floor. A BOL between the floor and the bar is accepted when at least two
 reference numbers on it match the load (`corroborated_bol`, 30 Sep 2026: USPS's Contract Route Vehicle Record
 reads as a BOL at 78% however it is described, and its route and trip are the pick number).

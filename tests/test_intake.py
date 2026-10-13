@@ -398,11 +398,60 @@ def test_a_pod_short_of_the_confidence_bar_goes_up_when_the_page_corroborates_it
     check("the reader knows a BOL with no receiver line is signed wherever there is room",
           "no printed line for the receiver" in reader.READER_SYSTEM and "2587817" in reader.READER_SYSTEM)
     ups, got, _ = world(2600105, pod(2600105, date=None))
-    check("no receiver date on the page: held", not ups and got[0] == autofile.HELD, str(got))
+    check("no receiver date on the page, and it arrived four days before the delivery day: held", not ups and got[0] == autofile.HELD, str(got))
     ups, got, _ = world(2600106, pod(2600106), delivery=None)
     check("a load with no delivery appointment gives nothing to corroborate: held", not ups and got[0] == autofile.HELD, str(got))
     ups, got, _ = world(2600107, pod(2600107, conf=0.9))
     check("at 90% the ordinary route still applies", ups == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str(got))
+
+
+def test_an_undated_receiver_signature_counts_the_day_it_arrived() -> None:
+    """Load 2612789 (13 Oct 2026, Boyanowski pod): Mann+Hummel's BOL came back from URI Conyers with
+    Riley Ralston's signature on the consignee line and nothing else - no date, no stamp, no times -
+    and read as a POD at 75% with five facts matching, the load number among them. Held on confidence
+    alone: the corroboration needs the receiver's date on the delivery day, and the signature has none.
+    The page had arrived at 09:19 ET on the delivery day, inside the appointment window, with the truck
+    at the consignee. Now, when the receiver's signature carries no date, the day the document arrived
+    stands in for it, provided TransportPro has the truck at the consignee or delivered. A page arriving
+    before the delivery day, or while the truck is still loaded, is held as before."""
+    print("an undated receiver signature counts the day it arrived")
+    import time as _time
+    from intake import autofile
+    s = autofile.Settings(terminals=frozenset({1101}), mode="on", pods={1101: "Julialynn Boyanowski"})
+
+    def pod(load_id, conf=0.75):
+        r = _reading(load_id, "proof_of_delivery", receiver=True, conf=conf)
+        r["signatures"].update({"receiver_date": None, "receiver_name": "Riley Ralston"})
+        r["pages"] = [{"page": 1, "role": "pod", "legibility": 0.92}]
+        return r
+
+    def world(load_id, stage="at consignee", arrived="2026-10-13T13:19:44+00:00", delivery="2026-10-13", conf=0.75):
+        conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+        log = _AutoLog()
+        load_row(load_id, "pod_expected", stage, terminal=1101)
+        tpro.add(load_id, delivery=delivery)
+        (sha,) = mail(load_id, f"m{load_id}", [(_picture(load_id % 1000), pod(load_id, conf))], when=arrived)
+        autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+        got = conn.execute("SELECT outcome, status FROM autofile WHERE load_id=? AND sha256=?", (load_id, sha)).fetchone()
+        return [u["type"] for u in tpro.uploads], tuple(got) if got else None, log
+
+    check("the arrival day is read on the consignee's clock",
+          autofile.stop_clock_day(_tp_auto(2612789, delivery="2026-10-13"), "CN", "2026-10-14T02:30:00Z") == autofile.dt.date(2026, 10, 13))
+    ups, got, log = world(2612789)
+    check("undated receiver signature, arrived on the delivery day with the truck at the consignee, 75%: uploaded as Bill Of Lading",
+          ups == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str((got, ups)))
+    row = next(iter(log.rows.values()))
+    check("the sheet says the arrival day stood in for the date",
+          "receiver signature, undated, arrived 2026-10-13 09:19 ET on the delivery day with the truck at consignee" in row[9], row[9])
+    ups, got, _ = world(2612790, arrived="2026-10-14T13:19:44+00:00")
+    check("arrived the day after the appointment: still counts", ups == ["Bill Of Lading"], str(got))
+    ups, got, _ = world(2612791, arrived="2026-10-11T13:19:44+00:00")
+    check("arrived two days before the delivery day: held on confidence, as before",
+          not ups and got[0] == autofile.HELD and "AI only 75% sure" in got[1], str(got))
+    ups, got, _ = world(2612792, stage="loaded")
+    check("with the truck still loaded the arrival day proves nothing: held", not ups and got[0] == autofile.HELD, str(got))
+    ups, got, _ = world(2612793, conf=0.69)
+    check("69% is under the floor: held", not ups and got[0] == autofile.HELD, str(got))
 
 
 def test_a_dock_check_in_sheet_rides_with_the_pod() -> None:
@@ -3661,10 +3710,10 @@ def _auto_world():
                      "next_check_at, source) VALUES (?,?,?,?,?,1,?,?,'dashboard')",
                      (load_id, state_, stage, terminal, "Spindrift Beverage Co Inc.", db.now_iso(), db.now_iso()))
 
-    def mail(load_id, mid, pages: list[tuple[bytes, dict]]):
+    def mail(load_id, mid, pages: list[tuple[bytes, dict]], when="2026-09-24T12:00:00+00:00"):
         conn.execute("INSERT INTO message (message_id, thread_id, internal_date, from_domain, load_id, "
                      "routing_tier, part_count) VALUES (?,?,?,?,?,?,?)",
-                     (mid, "t" + mid, "2026-09-24T12:00:00+00:00", "shipwell.com", load_id, "subject", len(pages)))
+                     (mid, "t" + mid, when, "shipwell.com", load_id, "subject", len(pages)))
         shas = []
         for i, (data, reading) in enumerate(pages):
             sha = _h.sha256(data).hexdigest()
@@ -4657,6 +4706,7 @@ if __name__ == "__main__":
     test_a_facility_inspection_form_is_not_a_pod()
     test_a_receiving_label_counts_the_facts_of_the_bol_sent_with_it()
     test_a_pod_short_of_the_confidence_bar_goes_up_when_the_page_corroborates_it()
+    test_an_undated_receiver_signature_counts_the_day_it_arrived()
     test_a_dock_check_in_sheet_rides_with_the_pod()
     test_a_pod_with_a_tab_of_its_own()
     test_a_new_pod_tab_is_styled_like_the_first()
