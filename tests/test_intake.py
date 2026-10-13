@@ -804,6 +804,46 @@ def test_two_usps_forms_for_one_trip_are_two_pages() -> None:
     check("and distinct doc_refs never collide", autofile.same_page_by_numbers(record.ex, extra.ex, "5398A-002D7-2A8BB 1/1") is False)
 
 
+def test_the_clearer_copy_of_a_page_goes_up() -> None:
+    """Load 2615137 (12 Oct 2026, Boyanowski pod): the carrier emailed the Irby BOL twice - first half
+    under a yellow "Packing List Enclosed" pouch (legibility 0.6), then clear (0.88) - and a photo of the
+    crates. Both copies read as the same signed page, so the repeat rule kept the first picture in the
+    email, the pouch, and dropped the clear one. Of two copies of one page the signed one still wins;
+    among copies alike in that, the more legible goes up, then the one the reader is surer of; equal
+    copies keep the earlier, as before."""
+    print("the clearer copy of a page goes up")
+    from intake import autofile
+    from pod_intake.schema import Extraction, PageInfo
+
+    def member(order, legibility, conf=0.9, signed=True):
+        r = _reading(2615137, numbers=[("BOL NO:", "54566017LN"), ("ShipmentID", "6000960127SN"), ("PO Number", "s014461272")],
+                     city="Dwight", conf=conf)
+        r["pages"] = [{"page": 1, "role": "bol", "legibility": legibility, "doc_ref": "54566017LN 1/1", "signed": signed}]
+        d = autofile.Doc(f"sha{order}", "image.png", "email:m", "Email", message_id="m", order=order, batch="email:m")
+        dec = autofile.Decision(d, "ready", kind="BOL", ex=Extraction.model_validate(r))
+        dec.pages, dec.left_out = [1], []
+        return dec
+
+    pouch, clear = member(1, 0.6, conf=0.90), member(2, 0.88, conf=0.93)
+    autofile.without_repeats_across([pouch, clear])
+    check("the clearer picture goes up, the pouch is the repeat",
+          clear.pages == [1] and pouch.pages == [] and pouch.left_out == [(1, "repeat")], str((pouch.pages, clear.pages, pouch.left_out)))
+    first, second = member(1, 0.8), member(2, 0.8)
+    autofile.without_repeats_across([first, second])
+    check("copies alike keep the first, as before", first.pages == [1] and second.pages == [], str((first.pages, second.pages)))
+    unsigned_clear, signed_blur = member(1, 0.95, signed=False), member(2, 0.5, signed=True)
+    autofile.without_repeats_across([unsigned_clear, signed_blur])
+    check("a signed copy still beats a clearer unsigned one", signed_blur.pages == [1] and unsigned_clear.pages == [], str((unsigned_clear.pages, signed_blur.pages)))
+    surer, less = member(1, 0.8, conf=0.85), member(2, 0.8, conf=0.95)
+    autofile.without_repeats_across([surer, less])
+    check("alike in signature and legibility, the reading the reader is surer of wins", less.pages == [1] and surer.pages == [], str((surer.pages, less.pages)))
+    info = {1: PageInfo(page=1, role="bol", legibility=0.6, doc_ref="54566017LN 1/1", signed=True),
+            2: PageInfo(page=2, role="bol", legibility=0.88, doc_ref="54566017LN 1/1", signed=True),
+            3: PageInfo(page=3, role="bol", legibility=0.88, doc_ref="54566017LN 1/1", signed=True)}
+    check("inside one file too: the most legible copy, the first of equals",
+          autofile.without_repeats([1, 2, 3], info) == ([2], [1, 3]), str(autofile.without_repeats([1, 2, 3], info)))
+
+
 def test_a_page_with_none_of_the_loads_numbers_goes_up_on_the_lane_and_the_date() -> None:
     """Loads 2598125 and 2599137 (1-2 Oct 2026): a TireHub BOL for a Mavis store names only TireHub's
     LD numbers, a Baker Hughes delivery note only the shipper's invoice; TransportPro held Penske's
@@ -4624,6 +4664,7 @@ if __name__ == "__main__":
     test_usps_paperwork_matches_on_route_trip_and_facility()
     test_the_morning_report()
     test_two_usps_forms_for_one_trip_are_two_pages()
+    test_the_clearer_copy_of_a_page_goes_up()
     test_a_page_with_none_of_the_loads_numbers_goes_up_on_the_lane_and_the_date()
     test_a_bare_signature_page_takes_the_facts_of_the_page_texted_with_it()
     test_a_number_in_a_stops_notes_is_a_reference_number()

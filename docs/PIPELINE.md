@@ -485,7 +485,9 @@ is the hand-off to a person.
   with it (page role `packing_list`). It never goes up on its own. Certificates of analysis,
   inspection forms and lumper receipts stay out.
 - **Repeats across files go up once** (`without_repeats_across`): the same `doc_ref` and role in two
-  photos is one page, the signed copy kept - provided their other numbers agree (`same_page_by_numbers`,
+  photos is one page, the signed copy kept, then the more legible, then the reading the reader is surer
+  of, else the first (12 Oct 2026, load 2615137: the BOL was emailed half under a packing-list pouch and
+  then clear, and the pouch went up) - provided their other numbers agree (`same_page_by_numbers`,
   30 Sep 2026: two USPS forms for one trip shared a doc_ref and one was dropped as a repeat).
 - Texted pages decided in an earlier run are judged again (`_batch_mates`), so page 1 can still go
   up with a page 2 that arrived later.
@@ -504,7 +506,7 @@ is the hand-off to a person.
    2590747 the consignee's stamp was on a packing list, not the BOL. **Repeated pages go up once**
    (`without_repeats`): the reading gives every page a `doc_ref` (its own document and page number,
    e.g. `P2700C 1/3`), and copies with the same `doc_ref` and role are one page. The signed copy is
-   kept, else the first. Load 2571670's 27 pages were three BOLs scanned nine times; 3 went up. The
+   kept, then the most legible, else the first. Load 2571670's 27 pages were three BOLs scanned nine times; 3 went up. The
    pictures are not compared: different orders on the same form look as alike as re-scans. A PDF
    that keeps every page goes up as it arrived.
    Photos, HEIC files and multi-page sets are combined with PyMuPDF. This rule has applied since

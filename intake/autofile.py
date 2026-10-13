@@ -2019,8 +2019,10 @@ def without_repeats(pages: list[int], info: dict) -> tuple[list[int], list[int]]
     A page is a repeat of another when the reading gives both the same doc_ref - the page's own document
     number and page number - and the same role. Pictures are not compared: on that packet three
     different orders printed on the same Spindrift form were as alike as two scans of one page. Of the
-    copies the one the reading calls signed is kept, else the first; a page with no doc_ref is always
-    kept, and a signed POD page never gives way to an unsigned one, because their roles differ."""
+    copies the one the reading calls signed is kept, then the most legible (load 2615137, 12 Oct 2026:
+    the BOL was photographed once under a packing-list pouch and once clear, and the pouch went up),
+    else the first; a page with no doc_ref is always kept, and a signed POD page never gives way to an
+    unsigned one, because their roles differ."""
     groups: dict[tuple[str, str], list[int]] = {}
     for n in pages:
         p = info.get(n)
@@ -2030,16 +2032,25 @@ def without_repeats(pages: list[int], info: dict) -> tuple[list[int], list[int]]
     drop: set[int] = set()
     for copies in groups.values():
         if len(copies) > 1:
-            best = next((n for n in copies if info[n].signed), copies[0])
+            best = max(copies, key=lambda n: _copy_rank(info[n]))     # max keeps the first of equals
             drop.update(n for n in copies if n != best)
     return [n for n in pages if n not in drop], sorted(drop)
+
+
+def _copy_rank(p, ex=None) -> tuple[bool, float, float]:
+    """How good a copy of a page this picture is, when two pictures show the same page: a signed copy
+    first, then the reader's legibility, then its confidence in the document (across files). Equal
+    copies keep the earlier one, as before."""
+    conf = float(getattr(ex, "document_type_confidence", 0.0) or 0.0) if ex is not None else 0.0
+    return (bool(getattr(p, "signed", False)), float(getattr(p, "legibility", 0.0) or 0.0), conf)
 
 
 def without_repeats_across(members: list[Decision]) -> None:
     """The same, across the files of one upload: one copy of each document page. Load 2593890
     (27 Sep 2026): pages 2 and 3 of the BOL were each photographed twice, as separate files, and page 2
     went up twice. Changes members' pages and left_out in place; a copy the reading calls signed is
-    kept over one it does not, else the first."""
+    kept over one it does not, then the more legible (load 2615137, 12 Oct 2026: the carrier emailed
+    the BOL half under a packing-list pouch and then clear, and the first picture went up), else the first."""
     seen: dict[tuple[str, str], tuple[Decision, int]] = {}
     for m in sorted(members, key=lambda x: x.doc.order):
         info = {p.page: p for p in (m.ex.pages if m.ex is not None else [])}
@@ -2057,8 +2068,8 @@ def without_repeats_across(members: list[Decision]) -> None:
                 # Extra Trip Authorization for the same route and trip. Their other numbers disagree, so
                 # they are not two copies of one page and both go up.
                 continue
-            first_signed = bool(next((q.signed for q in first.ex.pages if q.page == fn), False))
-            loser, ln = (first, fn) if p.signed and not first_signed else (m, n)
+            fp = next((q for q in first.ex.pages if q.page == fn), None)
+            loser, ln = (first, fn) if _copy_rank(p, m.ex) > _copy_rank(fp, first.ex) else (m, n)
             loser.pages.remove(ln)
             loser.left_out = sorted(loser.left_out + [(ln, "repeat")])
             if loser is first:
