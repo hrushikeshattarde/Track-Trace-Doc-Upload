@@ -1177,6 +1177,55 @@ def test_one_row_per_load_once_it_has_its_pod() -> None:
           and autofile.ref(2600261, b_sha) in log.removed, str(dict(r)))
 
 
+def test_reads_the_bot_no_longer_pays_for() -> None:
+    """14 Oct 2026: of a day's 498 full reads, 274 found the page already on the load picture for picture,
+    and 164 were on finished loads where the quick look had already said BOL or POD. Neither needs the
+    read: a picture match is free, and a load that shows Documents Received needs no BOL or POD."""
+    print("auto-upload: reads the bot no longer pays for")
+    import time as _time
+    from intake import autofile
+
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    now = db.now_iso()
+    quicks: dict[str, tuple[str, float]] = {}
+
+    def quick(data, filename):
+        return (*quicks.get(hashlib.sha256(data).hexdigest(), ("other_paperwork", 0.9)), "claude-haiku-4-5", 0.002)
+
+    rep_bol = {"id": 901, "fileTypeId": 12, "fileTypeName": "Bill Of Lading", "uploadById": 4352, "comments": "POD", "dateCreated": now}
+    texted = {"id": 902, "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL", "uploadById": 1,
+              "comments": "Driver Supplied Image - 2600270", "dateCreated": now}
+    # A: the pod filed the POD as Bill Of Lading; the carrier then emails the same page (as a JPEG).
+    load_row(2600270, "filed_status_pending", "delivered")
+    tpro.add(2600270, files=[(rep_bol, _picture(270)), (texted, _picture(271))])
+    on_load(_picture(271), _reading(2600270, "proof_of_delivery", receiver=True))
+    a_same, a_text, a_new = mail(2600270, "m270", [(_picture(270, "JPEG"), _reading(2600270, "proof_of_delivery", receiver=True)),
+                                                    (_picture(271, "JPEG"), _reading(2600270, "proof_of_delivery", receiver=True)),
+                                                    (_picture(272), _reading(2600270, "proof_of_delivery", receiver=True))], when=now)
+    quicks[a_same] = ("pod", 0.95)        # same picture as the rep's Bill Of Lading: on file, unread
+    quicks[a_text] = ("pod", 0.95)        # same picture as the driver's text, called a POD: read (it may need re-filing)
+    quicks[a_new] = ("pod", 0.95)         # a new picture: read
+    # B: a finished load with a BOL copy and a receipt-like page in the mail.
+    load_row(2600273, "complete", "delivered")
+    tpro.add(2600273, doc="Documents Received")
+    b_bol, b_other = mail(2600273, "m273", [(_picture(273), _reading(2600273)), (_picture(274), _reading(2600273, "shipping_document"))], when=now)
+    quicks[b_bol] = ("bol", 0.95)
+    quicks[b_other] = ("other_paperwork", 0.9)
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600, quick=quick)
+    rows = {(r["load_id"], r["sha256"]): r for r in conn.execute("SELECT * FROM autofile")}
+    check("a page that is the pod's own upload, picture for picture, is on file without a read",
+          a_same not in reads and rows[(2600270, a_same)]["outcome"] == "on_file" and "checked by picture" in rows[(2600270, a_same)]["status"]
+          and rows[(2600270, a_same)]["kind"] == "POD", str(rows.get((2600270, a_same))))
+    check("a page under Driver Supplied BOL the quick look calls a POD is still read", a_text in reads, str(a_text in reads))
+    check("and a new picture is read as before", a_new in reads)
+    check("on a finished load a page the quick look is sure is a BOL is not read, and is not needed",
+          b_bol not in reads and rows[(2600273, b_bol)]["outcome"] == "not_needed" and "not read in full" in rows[(2600273, b_bol)]["status"]
+          and autofile.ref(2600273, b_bol) not in log.rows, str(rows.get((2600273, b_bol))))
+    check("while other paperwork there is still read, for a lumper receipt", b_other in reads)
+
+
 def test_a_pod_with_a_tab_of_its_own() -> None:
     """30 Sep 2026: Jesse Klingler's pod (terminal 1138) joins the pilot with its own sheet tab,
     "Upload Log - Klinger". Rows are routed by the load's terminal; every other pod keeps the
@@ -5376,6 +5425,7 @@ if __name__ == "__main__":
     test_lumper_receipts()
     test_lumper_receipts_company_wide()
     test_one_row_per_load_once_it_has_its_pod()
+    test_reads_the_bot_no_longer_pays_for()
     test_a_signature_added_after_pickup_is_the_receivers()
     test_efs_requests_vouch_for_a_lumper_receipt()
     test_a_pod_with_a_tab_of_its_own()

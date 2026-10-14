@@ -344,6 +344,7 @@ class Doc:
     arrived_at: str | None = None   # when it arrived, ISO UTC: the email's date, or the file's dateCreated
     to_group: str | None = None     # the Google Group an email came to: ratecon@..., fwefs@... (14 Oct 2026)
     pilot: bool | None = True       # on a load of a pilot pod (BOLs and PODs go up); False: lumper receipts only; None: not known yet
+    done: bool = False              # the load shows Documents Received: no BOL or POD is work on it
 
 
 @dataclass
@@ -973,6 +974,7 @@ def _look(conn, tpro, row, lumper: bool = True, fetched: tuple | None = None,
     emailed = _email_docs(conn, load_id)
     for d in emailed:
         d.pilot = pilot
+        d.done = done
     # A load TransportPro is satisfied with needs no BOL or POD; the load check will mark it complete.
     # It can still be short a lumper receipt (14 Oct 2026), which comes as often after the POD as with
     # it, so its mail of the last LUMPER_DAYS is read for one. Older mail, and the pictures texted onto
@@ -1166,7 +1168,7 @@ def _read(conn, store, tpro, read, quick, s: Settings, stats: Stats, plans, dead
     full, shas = [], set()
     for row, filed, d in left:
         q = quick_of(conn, d.sha256) if quick is not None else None
-        if needs_full_read(d, q, (row["stage"] or "").lower()):
+        if needs_full_read(d, q, (row["stage"] or "").lower()) and on_file_by_picture(conn, store, tpro, filed, d, q) is None:
             full.append((row, filed, d))
             shas.add(d.sha256)
     # A texted POD takes its other pages into the full read, even ones only looked at before - page 1
@@ -1323,9 +1325,10 @@ def needs_full_read(d: Doc, q: tuple[str, float] | None, stage: str) -> bool:
     kind, confidence = q
     if kind in ("photo", "not_freight") and confidence >= QUICK_TRUST:
         return False
-    if d.pilot is False and kind in ("bol", "pod") and confidence >= QUICK_TRUST:
-        # Outside the BOL/POD pilot the full read serves lumper receipts only (14 Oct 2026): a page the
-        # quick look is sure is a BOL or a POD is not one, and is set aside unread.
+    if (d.pilot is False or d.done) and kind in ("bol", "pod") and confidence >= QUICK_TRUST:
+        # Outside the BOL/POD pilot, and on a load that already shows Documents Received, the full read
+        # serves lumper receipts only (14 Oct 2026): a page the quick look is sure is a BOL or a POD is
+        # not one, and is set aside unread. 164 of the day's 498 reads, $7.15, had been exactly that.
         return False
     if d.on_file is not None and stage not in AT_CONSIGNEE and kind in ("bol", "other_paperwork", "photo", "not_freight"):
         return False
@@ -1406,15 +1409,57 @@ def _decide(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnFile]
         q = quick_of(conn, d.sha256)
         if q is not None and not needs_full_read(d, q, (row["stage"] or "").lower()):
             return quick_decision(d, q)
+        hit = on_file_by_picture(conn, store, tpro, filed, d, q)
+        if hit is not None:
+            kind = q[0].upper() if q and q[0] in ("bol", "pod") else "BOL/POD?"
+            quick = f"{q[0].upper()} (quick look, {q[1]:.0%} sure)" if q else "not read"
+            ours = hit.by_bot and (hit.sha256 == d.sha256 or conn.execute(
+                "SELECT 1 FROM filing WHERE load_id=? AND sha256=?", (int(row["load_id"]), d.sha256)).fetchone())
+            if ours:                                  # the bot's own upload, its ledger row lost
+                dec = Decision(d, UPLOADED, f"UPLOADED - on file as {hit.named()}, by the bot (checked by picture)",
+                               kind=kind, quick=quick)
+                dec.tpro_file_id = str(hit.file.get("id"))
+                return dec
+            how = "same file" if hit.sha256 == d.sha256 else "same picture"
+            dec = Decision(d, ON_FILE, f"ALREADY ON FILE - {hit.named()}, {how}"
+                                       + (", uploaded by the bot for another copy" if hit.by_bot else "")
+                                       + "; nothing uploaded (checked by picture, not read in full)",
+                           kind=kind, quick=quick)
+            dec.on_clearing = hit.type_id in st.CLEARING_TYPES
+            return dec
         return None                                   # not read yet: next run
     return judge(conn, s, row, load, filed, d, json.loads(att["extraction_json"]),
                  sig=lambda: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load))
 
 
+def on_file_by_picture(conn, store, tpro, filed: list[OnFile], d: Doc, q: tuple[str, float] | None) -> OnFile | None:
+    """A file already on the load that is this emailed page, picture for picture, under a type that
+    settles the page without the full read - or None. For a page the quick look calls a BOL or a POD a
+    clearing type counts; Driver Supplied BOL or Other counts when it is sure the page is a BOL. A page
+    under Driver Supplied BOL the quick look calls a POD is still read: the bot re-files such a POD under
+    a type that clears. Other paperwork is still read too, for a lumper receipt a rep may have filed under
+    Bill Of Lading. 14 Oct 2026: 274 of the day's 498 full reads, $11.75, found the page already on the
+    load - the pod's own upload, or the driver's text - and the picture check costs nothing."""
+    if d.on_file is not None or not filed or q is None:
+        return None
+    kind, confidence = q
+    counts = [of for of in filed if (kind in ("bol", "pod") and of.type_id in st.CLEARING_TYPES)
+              or (kind == "bol" and confidence >= QUICK_TRUST and of.type_id in (DRIVER_SUPPLIED, 123))]
+    if not counts:
+        return None
+    mine = doc_sig(conn, store, tpro, d)
+    return _covering(d.sha256, mine, counts) if mine else None
+
+
 def quick_decision(d: Doc, q: tuple[str, float]) -> Decision:
     """The decision for a page the quick look settled. A photo is never logged; a BOL the driver
-    texted is on the load already, as Driver Supplied BOL, and is logged as that."""
+    texted is on the load already, as Driver Supplied BOL, and is logged as that; a BOL or POD on a
+    load that shows Documents Received is not needed (14 Oct 2026)."""
     kind, confidence = q
+    if d.done and kind in ("bol", "pod"):
+        return Decision(d, NOT_NEEDED, f"NOT NEEDED - the load shows Documents Received; the quick look read it as a "
+                                       f"{kind.upper()} ({confidence:.0%} sure), not read in full",
+                        kind=kind.upper(), quick=f"{kind.upper()} (quick look, {confidence:.0%} sure)")
     if kind == "bol" and d.on_file is not None:
         return Decision(d, ON_FILE, f"ALREADY ON FILE - {d.on_file.named()}, same file; nothing uploaded "
                                     f"(checked by quick look)", kind="BOL",
