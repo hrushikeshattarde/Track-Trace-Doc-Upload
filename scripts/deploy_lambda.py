@@ -136,6 +136,11 @@ def _worker_env(env: dict) -> dict:
             # When it is served, change INTAKE_QUICK_MODEL - the quick look already asks it for low effort.
             "INTAKE_MODEL_PROVIDER": "bedrock", "INTAKE_READ_MODEL": "claude-opus-5-5", "INTAKE_READ_EFFORT": "low",
             "INTAKE_QUICK_LOOK": "on", "INTAKE_QUICK_MODEL": "claude-haiku-4-5",
+            # The prompt cache (14 Oct 2026): the reads' 10,125-token instruction sheet lives an hour
+            # ("5m" for the old five-minute cache, which was cold at every run), and a run warms it
+            # once before its parallel reads start. A sure rate confirmation is set aside by the quick
+            # look, unread ("off" sends them to the full read again).
+            "INTAKE_CACHE_TTL": "1h", "INTAKE_QUICK_RATECON": "on",
             "INTAKE_GMAIL_SECRET": GMAIL_SECRET, "INTAKE_UPLOAD_SHEET_ID": env["INTAKE_UPLOAD_SHEET_ID"],
             # The bot's own TransportPro login, once an admin has made one and somebody has put it in
             # Secrets Manager as JSON {username, password}. Until then uploads go in as the reading login.
@@ -149,7 +154,9 @@ def _report_env(env: dict) -> dict:
             "INTAKE_REPORT_FROM": REPORT_FROM, "INTAKE_REPORT_TO": env.get("INTAKE_REPORT_TO", ""),
             "INTAKE_REPORT_CC": env.get("INTAKE_REPORT_CC", ""),
             "INTAKE_REPORT_HOURS": "24", "INTAKE_UPLOAD_SHEET_ID": env["INTAKE_UPLOAD_SHEET_ID"],
-            "INTAKE_GMAIL_SECRET": GMAIL_SECRET}
+            "INTAKE_GMAIL_SECRET": GMAIL_SECRET,
+            # The day's AI spend goes on the report (14 Oct 2026); past this many dollars it is a warning.
+            "INTAKE_SPEND_WARN_USD": "30"}
 
 
 def _report_policy(b: str, secret_arns: list[str], region: str, account: str) -> dict:

@@ -661,14 +661,24 @@ def make_reader(model: str, timeout: float | None = None, effort: str | None = N
             except OSError:
                 pass
 
+    def warm() -> float:
+        """Put the instruction sheet into the prompt cache before a burst of reads (reader.warm_cache,
+        autofile._warm); returns what it cost. A short timeout of its own: a slow warm-up must not
+        eat the reads' window, and the reads write the cache themselves if it never came."""
+        usage = claude_reader.warm_cache(client.with_options(timeout=20), model, effort=effort, brief=brief)
+        return round(usage.cost_usd, 5)
+
+    read.warm = warm
     return read
 
 
-def make_quick_reader(model: str, timeout: float | None = None, max_edge: int = 1100, max_pages: int = 3):
+def make_quick_reader(model: str, timeout: float | None = None, max_edge: int = 1100, max_pages: int = 4):
     """The cheap first look (pod_intake.reader.quick_look): read(data, filename) -> (kind, confidence,
     model, cost). Pages go at 1,100 px - enough to tell a freight photo from paperwork, and about 40%
-    fewer image tokens than the full read's 1,568 - and only the first `max_pages`: which of five things a
-    file is shows on its first pages, and all 27 pages of one scan were too large a request (HTTP 413)."""
+    fewer image tokens than the full read's 1,568 - and only the first `max_pages`: which of six things a
+    file is shows on its first pages, and all 27 pages of one scan were too large a request (HTTP 413).
+    Four pages since 14 Oct 2026 (three before): the brokerage's own rate confirmation is a four-page
+    form, and the quick look sets one aside only when it has seen every page of the file."""
     from pod_intake import provider, reader as claude_reader
     from pod_intake.localenv import load_local_env
     from pod_intake.normalize import load_document

@@ -119,6 +119,11 @@ EST_READ_USD = 0.04          # a brief full read, for the safety limit; the reco
 # How sure the quick look must be that a page is a photo before the full read is skipped. On the 24 Sep
 # 2026 pages it never called a BOL or POD a photo at any confidence; 0.8 keeps a margin.
 QUICK_TRUST = 0.8
+# What the quick look may set aside unread at that confidence. A photo and a non-freight image since
+# 24 Sep 2026; a rate confirmation since 14 Oct 2026 (the brokerage's own contract, sent back signed:
+# never a BOL, a POD or a lumper receipt, and until then paid for a full read as a "bol" - 22 reads,
+# $1.89, on 14 Oct). INTAKE_QUICK_RATECON=off takes the rate confirmation out again.
+SET_ASIDE = frozenset({"photo", "not_freight", "rate_confirmation"})
 LOOK_UNTIL_S = 240           # stop looking at more loads this long before the deadline (300 until the evening of 14 Oct 2026:
                              # with six readers the reads no longer need the time, and the look phase was ending early)
 READ_UNTIL_S = 90            # ...stop waiting for reads
@@ -250,6 +255,7 @@ class Settings:
     lumper_tab: str = LUMPER_TAB  # the one tab every pod's lumper rows go to
     lumper_loads: int = LUMPER_LOADS_PER_RUN   # loads looked at for a receipt per run beyond the pilot's working loads
     lumper_terminals: frozenset[int] | None = None   # where lumper receipts are handled: None is every terminal
+    set_aside: frozenset[str] = SET_ASIDE  # the quick-look answers that spare a page the full read (needs_full_read)
 
     @classmethod
     def from_env(cls, env, pods: dict[int, str] | None = None) -> "Settings":
@@ -268,7 +274,9 @@ class Settings:
                    lumper=(env.get("INTAKE_LUMPER") or "on").strip().lower() != "off",
                    lumper_tab=(env.get("INTAKE_LUMPER_TAB") or "").strip() or LUMPER_TAB,
                    lumper_loads=int(env.get("INTAKE_LUMPER_LOADS") or LUMPER_LOADS_PER_RUN),
-                   lumper_terminals=_terminals_setting(env.get("INTAKE_LUMPER_TERMINALS")))
+                   lumper_terminals=_terminals_setting(env.get("INTAKE_LUMPER_TERMINALS")),
+                   set_aside=(SET_ASIDE - {"rate_confirmation"}
+                              if (env.get("INTAKE_QUICK_RATECON") or "on").strip().lower() == "off" else SET_ASIDE))
 
 
 @dataclass
@@ -283,6 +291,7 @@ class Stats:
     uploaded: int = 0
     quick: int = 0
     reused: int = 0
+    warmed: int = 0              # prompt-cache warm-ups made before a burst of reads (_warm)
     outcomes: dict[str, int] = field(default_factory=dict)
     logged: int = 0
     errors: int = 0
@@ -1168,7 +1177,7 @@ def _read(conn, store, tpro, read, quick, s: Settings, stats: Stats, plans, dead
     full, shas = [], set()
     for row, filed, d in left:
         q = quick_of(conn, d.sha256) if quick is not None else None
-        if needs_full_read(d, q, (row["stage"] or "").lower()) and on_file_by_picture(conn, store, tpro, filed, d, q) is None:
+        if needs_full_read(d, q, (row["stage"] or "").lower(), s.set_aside) and on_file_by_picture(conn, store, tpro, filed, d, q) is None:
             full.append((row, filed, d))
             shas.add(d.sha256)
     # A texted POD takes its other pages into the full read, even ones only looked at before - page 1
@@ -1215,6 +1224,8 @@ def _read(conn, store, tpro, read, quick, s: Settings, stats: Stats, plans, dead
         _merge_pieces(conn, full, unread)
         _save_spend(conn, stats, day)
         return unread
+    if len(jobs) >= 2:
+        _warm(read, stats)
     pool = ThreadPoolExecutor(max_workers=READERS)
     futures = {pool.submit(read, *_read_input(d, first, last)): (load_id, d, first, last)
                for load_id, d, first, last in jobs}
@@ -1252,6 +1263,23 @@ def _read(conn, store, tpro, read, quick, s: Settings, stats: Stats, plans, dead
     _merge_pieces(conn, full, unread)
     _save_spend(conn, stats, day)
     return unread
+
+
+def _warm(read, stats: Stats) -> None:
+    """Put the full read's instruction sheet into the prompt cache before the readers start, so that
+    the reads that begin together find it there instead of each writing it (14 Oct 2026: the six
+    parallel readers of a run all paid the 5-cent write, 114 of the day's 509 single-page reads cost
+    7-9 cents against 2-4 cents for the rest). One tiny call, through the reader's own `warm` when it
+    has one (ingest.make_reader); a reader without one, such as the tests', is not warmed. A warm-up
+    that fails is only a warning: the reads then write the cache themselves, as before."""
+    warm = getattr(read, "warm", None)
+    if warm is None:
+        return
+    try:
+        stats.spent += float(warm() or 0)
+        stats.warmed += 1
+    except Exception as e:                                       # noqa: BLE001 - the reads go on without it
+        print(f"  ! auto-upload: prompt-cache warm-up: {type(e).__name__}: {str(e)[:120]}")
 
 
 def _merge_pieces(conn, full: list, unread: set[int]) -> None:
@@ -1317,20 +1345,20 @@ def page_count(data: bytes) -> int:
         return 1
 
 
-def needs_full_read(d: Doc, q: tuple[str, float] | None, stage: str) -> bool:
+def needs_full_read(d: Doc, q: tuple[str, float] | None, stage: str, set_aside: frozenset[str] = SET_ASIDE) -> bool:
     """Whether a page needs the full read, given its quick look. No quick look, or one that is
-    unsure: always."""
+    unsure: always. `set_aside` is what the quick look may settle at QUICK_TRUST (Settings.set_aside)."""
     if q is None:
         return True
     kind, confidence = q
-    if kind in ("photo", "not_freight") and confidence >= QUICK_TRUST:
+    if kind in set_aside and confidence >= QUICK_TRUST:
         return False
     if (d.pilot is False or d.done) and kind in ("bol", "pod") and confidence >= QUICK_TRUST:
         # Outside the BOL/POD pilot, and on a load that already shows Documents Received, the full read
         # serves lumper receipts only (14 Oct 2026): a page the quick look is sure is a BOL or a POD is
         # not one, and is set aside unread. 164 of the day's 498 reads, $7.15, had been exactly that.
         return False
-    if d.on_file is not None and stage not in AT_CONSIGNEE and kind in ("bol", "other_paperwork", "photo", "not_freight"):
+    if d.on_file is not None and stage not in AT_CONSIGNEE and kind not in ("pod", "unknown"):
         return False
     return True
 
@@ -1407,7 +1435,7 @@ def _decide(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnFile]
         if db.read_blocked(att):
             return Decision(d, UNREADABLE, "the file cannot be read")
         q = quick_of(conn, d.sha256)
-        if q is not None and not needs_full_read(d, q, (row["stage"] or "").lower()):
+        if q is not None and not needs_full_read(d, q, (row["stage"] or "").lower(), s.set_aside):
             return quick_decision(d, q)
         hit = on_file_by_picture(conn, store, tpro, filed, d, q)
         if hit is not None:
@@ -1464,7 +1492,7 @@ def quick_decision(d: Doc, q: tuple[str, float]) -> Decision:
         return Decision(d, ON_FILE, f"ALREADY ON FILE - {d.on_file.named()}, same file; nothing uploaded "
                                     f"(checked by quick look)", kind="BOL",
                         quick=f"BOL (quick look, {confidence:.0%} sure)")
-    return Decision(d, NOT_PAPERWORK, f"quick look: {kind}")
+    return Decision(d, NOT_PAPERWORK, f"quick look: {kind.replace('_', ' ')}")
 
 
 DELIVERY_DAY_SLACK = 1        # a receiver may date the copy the day after the appointment

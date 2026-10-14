@@ -56,7 +56,7 @@ pilot terminals only (`AUTO_TERMINALS` in `scripts/deploy_lambda.py`).
 |---|---|---|
 | Collector Lambda | `circle-doc-intake-collector` | python3.12, 512 MB, 10 min timeout, handler `intake.aws_lambda.handler` |
 | Worker Lambda | `circle-doc-intake-worker` | python3.12, 3 GB (1.5 GB until 14 Oct 2026), 10 min timeout, handler `intake.aws_worker.handler` |
-| Report Lambda | `circle-doc-intake-report` | python3.12, 512 MB, handler `intake.aws_report.handler`; 07:00 America/New_York daily; mails the loads the bot did not file from `DocIntake@circle-analytics.com` (SES) to `INTAKE_REPORT_TO` in `.env` |
+| Report Lambda | `circle-doc-intake-report` | python3.12, 512 MB, handler `intake.aws_report.handler`; 07:00 America/New_York daily; mails the loads the bot did not file, and the day's AI spend (a warning past `INTAKE_SPEND_WARN_USD`, $30), from `DocIntake@circle-analytics.com` (SES) to `INTAKE_REPORT_TO` in `.env` |
 | Schedules (EventBridge Scheduler) | `circle-doc-intake-every-15-min`, `circle-doc-intake-worker-every-15-min` | `rate(15 minutes)`, no retries |
 | Concurrency | both functions | Reserved concurrency 1. A trigger older than 60 s is dropped, so a run that fires while another is going is skipped. The next quarter-hour is the retry. |
 | Secrets | `circle-doc-intake/gmail-service-account` | Google service-account key: Gmail (delegated, read-only) and the Upload log sheet |
@@ -318,8 +318,9 @@ Each document without a reading goes down this ladder:
 | 2 | **Too long?** Over 40 pages (`MAX_READ_PAGES`) or 25 MB (`MAX_READ_MB`): recorded as a permanent failure, "too long for the bot", and **held for a person**. It is never sent to the AI. Up to 25 Sep 2026 the limit was 10 pages. | free |
 | 3 | **Same picture already read on this load?** (every page within a mean difference of 3.0 of a read document's pages) Copy that reading. | $0 |
 | 3b | **Same picture already on the load?** (14 Oct 2026) An emailed page the quick look calls a BOL or a POD that is, picture for picture, a file on the load under a clearing type - or under Driver Supplied BOL or Other when the quick look is sure it is a BOL - is on file, unread. Other paperwork is still read, for a lumper receipt a rep may have filed under Bill Of Lading. 274 of a day's 498 reads had found exactly that. A page under Driver Supplied BOL the quick look calls a POD is still read, since such a POD is re-filed under a type that clears. | $0 |
-| 4 | **Quick look**: Claude Haiku 4.5, first 3 pages at 1,100 px, 4 in parallel, 60 s timeout. (Haiku 5.5 is ready in the code - it is asked for low effort with room to think - but on 8 Oct 2026 Bedrock's Messages endpoint in us-east-1 did not serve it yet.) Answers `pod`, `bol`, `other_paperwork`, `photo` or `not_freight`, with a confidence. Stored in `quicklook`. | ~$0.002 |
-| 5 | **Skip the full read** only when the quick look says `photo` or `not_freight` at 80% or more, or when the page is already on the load (a texted picture), the truck isn't at the consignee, and the quick look called it `bol`, `other_paperwork`, `photo` or `not_freight`. A texted POD pulls the other pictures from its text batch into the full read. Since 14 Oct 2026 also when the load already shows Documents Received, or the page is on a load outside the pilot, and the quick look is sure it is a `bol` or a `pod`: no full read could change what happens to it. | – |
+| 4 | **Quick look**: Claude Haiku 4.5, first 4 pages at 1,100 px (3 until 14 Oct 2026: the brokerage's rate confirmation is a four-page form), 8 in parallel, 60 s timeout. (Haiku 5.5 is ready in the code - it is asked for low effort with room to think - but on 8 Oct 2026 Bedrock's Messages endpoint in us-east-1 did not serve it yet.) Answers `pod`, `bol`, `other_paperwork`, `rate_confirmation` (since 14 Oct 2026: the brokerage's own contract, sent back signed), `photo` or `not_freight`, with a confidence. Stored in `quicklook`. | ~$0.002 |
+| 5 | **Skip the full read** only when the quick look says `photo`, `not_freight` or `rate_confirmation` at 80% or more (`SET_ASIDE`; `INTAKE_QUICK_RATECON=off` sends rate confirmations to the full read again - they cost 22 reads, $1.89, on 14 Oct 2026 as "bol"; a rate confirmation counts only when the quick look saw every page of the file, because a carrier's invoice packet opens with the contract and carries the signed POD behind it - 5 of 150 stored PODs, 6 to 12 pages each, were called a sure rate confirmation by a three-page look), or when the page is already on the load (a texted picture), the truck isn't at the consignee, and the quick look called it anything but `pod`. A texted POD pulls the other pictures from its text batch into the full read. Since 14 Oct 2026 also when the load already shows Documents Received, or the page is on a load outside the pilot, and the quick look is sure it is a `bol` or a `pod`: no full read could change what happens to it. | – |
+| 5b | **Warm the prompt cache** (14 Oct 2026). Every read sends the same 10,125-token instruction sheet (the reader's rules and, on Bedrock, the JSON schema). A read that finds it in the prompt cache pays 0.2 cents for it; one that has to write it pays 5 cents, more than the rest of the read - and a run's six parallel readers all started cold and all wrote it (114 of the day's 509 single-page reads cost 7-9 cents against 2-4 cents). Now, before two or more reads start, one one-token call with the reads' own system block warms the cache (`reader.warm_cache`, `autofile._warm`), and the cache is asked to live an hour instead of five minutes (`INTAKE_CACHE_TTL`: `1h`, or `5m`), so it also outlives the 15 minutes between runs. A warm-up that fails is a warning; the reads then write the cache themselves. | 8 cents when cold, under a cent when warm |
 | 6 | **Full read**: Claude Opus 5.5 on Bedrock (since 8 Oct 2026; Opus 5 before), effort `low`, brief notes, 1,568 px pages sent as JPEG, 6 reads in parallel (3 until 14 Oct 2026), 120 s timeout each. A file over 10 pages (`CHUNK_PAGES`) is read in pieces of up to 10 pages, one read per piece (`pieces_to_read`, `_read_input`). Each piece's reading is kept in `read_part` until every piece is in; then `merge_readings` ([`pod_intake/reader.py`](../pod_intake/reader.py)) combines them into one reading for the whole file. The file is a POD if any piece is, the receiver's name and delivery times come from the piece that has them, and pages are numbered as in the file. The result is the `Extraction` in [`pod_intake/schema.py`](../pod_intake/schema.py), stored in `attachment.extraction_json`. | ~$0.04 a read; a 27-page packet ~$0.40 |
 
 The full read returns:
@@ -333,8 +334,10 @@ The full read returns:
 - each page's role;
 - short notes.
 
-The quick look is trusted only to set aside photos, never to decide a page isn't a POD. It once
-called a signed POD page an unsigned BOL.
+The quick look is trusted only to set aside photos, images that are not freight and rate
+confirmations, never to decide a page isn't a POD. It once called a signed POD page an unsigned BOL,
+and by 14 Oct 2026, 248 of the 1,523 pages it had called a sure BOL were signed PODs by the full
+read: one in six.
 
 A facility's trailer inspection form or receiving checklist reads as shipping paperwork, never as a
 POD, whichever facility signed it (28 Sep 2026: Carolina Beverage Group fills its form at loading, and
@@ -865,7 +868,13 @@ against the memory size, and `Status: error` with `Error Type` on a crash.
 With the quick look and the brief read, the pilot pod should run about $15–25 a month. The AWS
 account is shared with other projects, and the `project=circle-doc-intake` tag isn't a
 cost-allocation tag. To measure spend, use Cost Explorer's resource-level view for the Lambdas,
-bucket and secrets, plus the "Claude Opus 5 (Amazon Bedrock Edition)" service line.
+bucket and secrets, plus the "Claude Opus 5.5 (Amazon Bedrock Edition)" service line (Opus 5 before
+8 Oct 2026). Bedrock's figure runs about 4% above the bot's own tally (failed and retried reads).
+With nine pods and the company-wide lumper search (14 Oct 2026) a day came to $33 before the picture
+check, the cache warm-up and the rate-confirmation rule; the morning report now carries the day's
+spend, and a day past `INTAKE_SPEND_WARN_USD` ($30) is flagged in its subject. The measured
+breakdown and the remaining proposals are in the 14 Oct 2026 write-up "Cutting the auto-upload
+bot's AI spend".
 
 **Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 750 offline checks: no network, no
 model, no credentials. Run it before every deploy.

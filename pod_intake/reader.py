@@ -6,6 +6,7 @@ The system prompt is cached; only the document content changes per call.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 
@@ -15,7 +16,8 @@ from .normalize import Document
 from .schema import Adjudication, Extraction, reader_json_schema
 
 # Anthropic list prices per million tokens (input, output). Cache reads are billed at ~0.1x input,
-# cache writes at ~1.25x input. Source: claude-api skill reference, 24 Jun 2026. Verify before budgeting.
+# cache writes at 1.25x input for the five-minute cache and 2x for the one-hour cache. Source:
+# claude-api skill reference, 24 Jun 2026. Verify before budgeting.
 #
 # These are the FIRST-PARTY rates. Amazon Bedrock is partner-operated and priced separately, so on
 # Bedrock every cost this module reports is an estimate carried over from here - close enough for
@@ -87,6 +89,7 @@ class Usage:
     output_tokens: int
     cache_read: int
     cache_write: int
+    cache_write_1h: int = 0      # the part of cache_write that went into the one-hour cache: 2x input, not 1.25x
 
     @property
     def cost_usd(self) -> float:
@@ -95,17 +98,29 @@ class Usage:
         key = base_model(self.model.split("/")[-1])          # tolerate openrouter's anthropic/... and bedrock's anthropic....
         inp, out = PRICES.get(key, PRICES.get(key.replace(".", "-"), (5.00, 25.00)))
         cache_read = CACHE_READ_RATE.get(key, 0.10)
-        return (self.input_tokens * inp + self.cache_read * inp * cache_read + self.cache_write * inp * 1.25 + self.output_tokens * out) / 1_000_000
+        one_hour = min(self.cache_write_1h, self.cache_write)
+        five_min = self.cache_write - one_hour
+        return (self.input_tokens * inp + self.cache_read * inp * cache_read + five_min * inp * 1.25
+                + one_hour * inp * 2.0 + self.output_tokens * out) / 1_000_000
 
     def as_dict(self) -> dict:
         return {"model": self.model, "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
-                "cache_read_tokens": self.cache_read, "cache_write_tokens": self.cache_write, "estimated_cost_usd": round(self.cost_usd, 5)}
+                "cache_read_tokens": self.cache_read, "cache_write_tokens": self.cache_write,
+                "cache_write_1h_tokens": self.cache_write_1h, "estimated_cost_usd": round(self.cost_usd, 5)}
 
 
 def _usage(model: str, response) -> Usage:
     u = response.usage
+    # The SDK splits a cache write by its lifetime (usage.cache_creation.ephemeral_1h_input_tokens /
+    # ephemeral_5m_input_tokens); older responses and the test fakes carry only the total.
+    detail = getattr(u, "cache_creation", None)
+    if isinstance(detail, dict):
+        one_hour = int(detail.get("ephemeral_1h_input_tokens") or 0)
+    else:
+        one_hour = int(getattr(detail, "ephemeral_1h_input_tokens", 0) or 0)
     return Usage(model=model, input_tokens=u.input_tokens, output_tokens=u.output_tokens,
-                 cache_read=getattr(u, "cache_read_input_tokens", 0) or 0, cache_write=getattr(u, "cache_creation_input_tokens", 0) or 0)
+                 cache_read=getattr(u, "cache_read_input_tokens", 0) or 0,
+                 cache_write=getattr(u, "cache_creation_input_tokens", 0) or 0, cache_write_1h=one_hour)
 
 
 def _check_stop(response) -> None:
@@ -155,6 +170,82 @@ _NO_EFFORT: dict[str, bool] = {}
 BRIEF_NOTES = ("\n\nKeep notes to two short sentences at most: what the page is, and anything a reviewer "
                "must know (a personal ID on the page, a page that is cut off or unreadable).")
 
+# How long the cached system block lives: "1h" (the default) or "5m". Measured 14 Oct 2026 on one
+# archived page: a read that finds the 10,125-token instruction sheet in the cache costs $0.049, one
+# that has to write it $0.096. The worker runs every 15 minutes, so a five-minute cache is cold at
+# every run, and its six parallel readers all start at once and all write it: 114 of the day's 509
+# single-page reads cost 7-9 cents against 2-4 cents for the rest, roughly $6 of a $30 day. A
+# one-hour write costs 2x input instead of 1.25x (8 cents against 5), but then serves every run of
+# the hour, and each read extends it. Bedrock accepted the one-hour cache on 14 Oct 2026.
+CACHE_TTL_SETTING = "INTAKE_CACHE_TTL"
+
+
+def cache_control() -> dict:
+    """The cache_control block for the system prompt, by INTAKE_CACHE_TTL: "1h" unless it says "5m"."""
+    ttl = (os.environ.get(CACHE_TTL_SETTING) or "1h").strip().lower()
+    return {"type": "ephemeral", "ttl": "1h"} if ttl == "1h" else {"type": "ephemeral"}
+
+
+def _system_variants(system: str, schema_model, brief: bool) -> tuple[list[dict], list[dict]]:
+    """The two forms of the cached system block a read may send: the plain one, for an endpoint that
+    enforces the schema itself, and the one with the schema pasted at its end, for one that does not
+    (Bedrock). Built in one place so that the warm-up (warm_cache) sends the very same bytes as the
+    reads - the cache is keyed on them."""
+    system = system + (BRIEF_NOTES if brief else "")
+    schema_text = ("Respond with ONLY a JSON object that validates against this JSON schema. No prose, no code fences.\n"
+                   + json.dumps(reader_json_schema(schema_model)))
+    system_blocks = [{"type": "text", "text": system, "cache_control": cache_control()}]
+    schema_system = [{"type": "text", "text": system + "\n\n" + schema_text, "cache_control": cache_control()}]
+    return system_blocks, schema_system
+
+
+def warm_cache(client, model: str, system: str = READER_SYSTEM, schema_model=Extraction, effort: str | None = None,
+               brief: bool = True) -> Usage:
+    """Put the full read's instruction sheet into the prompt cache with a one-token request, so the
+    reads that start together afterwards all find it there instead of each writing it (14 Oct 2026:
+    two reads started at the same moment both paid the 10,125-token write). Same system bytes and the
+    same endpoint lessons as a read: the structured form is tried first and the schema-in-prompt form
+    on refusal, so a warm-up on Bedrock warms the form the reads will use. Returns the usage; the
+    caller counts its cost (under a cent when the cache is warm, the write when it is cold).
+
+    `model` is the bare name; `effort` and `brief` must be what the reads send. Nothing is parsed:
+    one token of answer is all that is asked for."""
+    from .provider import model_id
+
+    model = model_id(model)
+    system_blocks, schema_system = _system_variants(system, schema_model, brief)
+    messages = [{"role": "user", "content": [{"type": "text", "text": "Warm-up only. Answer with the single word OK."}]}]
+    use_effort = bool(effort) and not _no_effort_model(model)
+
+    def send(system_block, with_format: bool):
+        output_config: dict = {}
+        if with_format:
+            output_config["format"] = _output_format(schema_model)
+        if use_effort and not _NO_EFFORT.get(model):
+            output_config["effort"] = effort
+        kw = dict(model=model, max_tokens=1, system=system_block, messages=messages)
+        if output_config:
+            kw["output_config"] = output_config
+        return client.messages.create(**kw)
+
+    response = None
+    if not _NO_STRUCTURED_OUTPUT.get(model):
+        try:
+            response = send(system_blocks, True)
+        except anthropic.BadRequestError as e:
+            if not any(k in str(e).lower() for k in ("output_config", "output_format", "format", "schema")):
+                raise
+            _NO_STRUCTURED_OUTPUT[model] = True
+    if response is None:
+        try:
+            response = send(schema_system, False)
+        except anthropic.BadRequestError as e:
+            if "effort" not in str(e).lower() or not use_effort or _NO_EFFORT.get(model):
+                raise
+            _NO_EFFORT[model] = True
+            response = send(schema_system, False)
+    return _usage(model, response)
+
 
 def _structured_call(client, model: str, system: str, content: list[dict], schema_model, effort: str | None = None,
                      brief: bool = False):
@@ -173,11 +264,8 @@ def _structured_call(client, model: str, system: str, content: list[dict], schem
     which is cached, not after the page images, which are not. It is ~2,000 tokens, and until
     24 Sep 2026 every read on Bedrock paid for it in full.
     """
-    system = system + (BRIEF_NOTES if brief else "")
-    system_blocks = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+    system_blocks, schema_system = _system_variants(system, schema_model, brief)
     messages = [{"role": "user", "content": content}]
-    schema_text = "Respond with ONLY a JSON object that validates against this JSON schema. No prose, no code fences.\n" + json.dumps(reader_json_schema(schema_model))
-    schema_system = [{"type": "text", "text": system + "\n\n" + schema_text, "cache_control": {"type": "ephemeral"}}]
     output_config: dict = {"format": _output_format(schema_model)}
     use_effort = bool(effort) and not _no_effort_model(model)
     if use_effort:
@@ -325,20 +413,25 @@ def merge_readings(parts: list[tuple[int, dict]]) -> dict:
     return merged
 
 
-# The cheap first look: which of five things a page is, for about $0.002 on Claude Haiku 4.5.
+# The cheap first look: which of six things a page is, for about $0.002 on Claude Haiku 4.5.
 # Measured 24 Sep 2026 against the full reading of the 162 pages the auto-upload read that day: it
 # never called a BOL or a POD a photo, but it did call one signed POD (2577917's texted page 2) an
-# unsigned BOL - so it is trusted to set aside photos, never to decide a page is not a POD.
+# unsigned BOL - so it is trusted to set aside photos, never to decide a page is not a POD. Across
+# every page it had looked at by 14 Oct 2026, 248 of its 1,523 sure BOLs were signed PODs by the full
+# read: one in six. Rate confirmations joined the list on 14 Oct 2026: the brokerage's own rate
+# confirmation, sent back signed by the carrier, was called a BOL and paid for a full read 22 times
+# that day (57 times since the quick look began), and it is never a BOL, a POD or a lumper receipt.
 QUICK_SYSTEM = """You sort pictures and scans that truck drivers send a freight brokerage. Look at the page(s) and answer with ONLY a JSON object, no prose:
-{"kind": "pod" | "bol" | "other_paperwork" | "photo" | "not_freight", "confidence": 0.0-1.0}
+{"kind": "pod" | "bol" | "other_paperwork" | "rate_confirmation" | "photo" | "not_freight", "confidence": 0.0-1.0}
 
 - pod: a bill of lading, delivery receipt, packing list or any other shipment page that the RECEIVER (consignee) has signed, stamped, or written received / in / out times on at the delivery. Receivers often stamp a receiving block sideways across a packing list ("Distributors Receiving", "Pallets Off Loaded", "Signature"). A Costco receiving sticker or thermal receipt (DOOR, APP / ARR / IN / OUT TIME, RECVR, "TRAILER LEAVING EMPTY") is a pod, even laid over an unsigned BOL. If ANY page of the file is like this, answer pod.
 - bol: a bill of lading (straight, short form, pickup copy, continuation or detail page) with nothing from the receiver on it. A USPS "Contract Route Vehicle Record" (PS Form 5398-A) with no receiving stamp is a bol; the same form carrying the receiving facility's red date stamp is a pod. A shipper or driver signature alone is still bol. A shipper's warehouse pick slip or loading sheet handed to the driver, and its sign-out side (driver signature, seal, trailer, times), count as bol.
-- other_paperwork: lumper receipt, scale ticket, packing list, invoice, rate confirmation, a facility's trailer inspection form or receiving checklist (even one signed or filled in with check-in / check-out times), reefer log, any other freight paperwork that is not a BOL.
+- other_paperwork: lumper receipt, scale ticket, packing list, invoice, a facility's trailer inspection form or receiving checklist (even one signed or filled in with check-in / check-out times), reefer log, any other freight paperwork that is not a BOL and not a rate confirmation.
+- rate_confirmation: the brokerage's own rate confirmation or carrier rate agreement, which carriers send back signed: a typed contract page headed "Rate Confirmation", "Load Confirmation", "Carrier Rate Agreement", "Carrier Confirmation" or the like, with the load number, the rate or total carrier pay, the pickup and delivery stops with dates, terms, and a carrier signature line. It is never a BOL or a POD, even when a driver or dispatcher signed it. Answer rate_confirmation only when EVERY page you see is that contract; a file that also carries an invoice, a BOL or a receiver-signed page is pod or other_paperwork, and a page you cannot place is other_paperwork.
 - photo: a picture of freight, pallets, a trailer, a seal, a truck, a dock, a dock pager or a check-in screen.
 - not_freight: a logo, an email signature, a screenshot of something else, an ID card, a selfie.
 If you are unsure whether the receiver signed, answer pod. confidence is how sure you are of kind."""
-QUICK_KINDS = ("pod", "bol", "other_paperwork", "photo", "not_freight")
+QUICK_KINDS = ("pod", "bol", "other_paperwork", "rate_confirmation", "photo", "not_freight")
 
 
 def _no_effort_model(model: str) -> bool:
@@ -377,6 +470,13 @@ def quick_look(client, doc: Document, model: str) -> tuple[str, float, Usage]:
         confidence = float(answer.get("confidence") or 0)
     except (TypeError, ValueError):
         confidence = 0.0
+    if kind == "rate_confirmation" and (getattr(doc, "total_pages", 0) or 0) > len(doc.pages):
+        # The look sees the first pages only (three, from intake.ingest.make_quick_reader). A carrier's
+        # invoice packet opens with the invoice and the rate confirmation and carries the signed POD
+        # behind them: on 14 Oct 2026, 5 of 150 stored PODs were called a sure rate confirmation that
+        # way, every one a packet longer than the look. A rate confirmation is only set aside when the
+        # whole file was looked at; a longer file is other paperwork, which gets the full read.
+        kind = "other_paperwork"
     return kind, confidence, _usage(model, response)
 
 

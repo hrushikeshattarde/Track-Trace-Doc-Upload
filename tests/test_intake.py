@@ -5372,6 +5372,229 @@ def test_every_load_state_is_classified() -> None:
           state.shortfall("complete") == (None, state.NOTHING))
 
 
+def test_the_reader_warms_its_cache() -> None:
+    """14 Oct 2026: a read that finds the instruction sheet in the prompt cache costs $0.049, one that
+    writes it $0.096, and a run's six parallel readers all wrote it. The warm-up sends the same bytes
+    as a read, once, for one token; the cache lives an hour; a one-hour write is priced at 2x."""
+    print("reader: the prompt cache is warmed once, for an hour")
+    import os as _os
+    import time as _time
+    import anthropic
+    import httpx2 as httpx
+    from intake import autofile
+    from pod_intake import reader as rd
+    from pod_intake.reader import Usage
+    from pod_intake.schema import Extraction
+
+    calls: list[dict] = []
+
+    class _Msg:
+        def __init__(self, text):
+            self.content = [type("B", (), {"type": "text", "text": text})()]
+            self.stop_reason = "end_turn"
+            self.usage = type("U", (), {"input_tokens": 10, "output_tokens": 1, "cache_read_input_tokens": 0,
+                                        "cache_creation_input_tokens": 10125,
+                                        "cache_creation": type("C", (), {"ephemeral_1h_input_tokens": 10125,
+                                                                        "ephemeral_5m_input_tokens": 0})()})()
+
+    def refuse(what):
+        req = httpx.Request("POST", "https://example")
+        return anthropic.BadRequestError(what, response=httpx.Response(400, request=req), body=None)
+
+    class _Client:
+        def __init__(self):
+            self.messages = self
+
+        def create(self, **kw):
+            calls.append(kw)
+            if "format" in (kw.get("output_config") or {}):
+                raise refuse("output_config.format is not supported")
+            return _Msg("OK" if kw.get("max_tokens") == 1 else json.dumps(_extraction("bill_of_lading")))
+
+    rd._NO_STRUCTURED_OUTPUT.clear()
+    rd._NO_EFFORT.clear()
+    _os.environ.pop("INTAKE_CACHE_TTL", None)
+    u = rd.warm_cache(_Client(), "claude-opus-5-5", effort="low", brief=True)
+    warm = calls[-1]
+    check("the warm-up asks for one token, learning the endpoint's answer on the way like a read",
+          warm["max_tokens"] == 1 and len(calls) == 2, str(len(calls)))
+    rd._structured_call(_Client(), "anthropic.claude-opus-5-5", rd.READER_SYSTEM, [{"type": "text", "text": "page"}],
+                        Extraction, effort="low", brief=True)
+    read = calls[-1]
+    check("and sends the very bytes a read sends: the same system block, schema included, low effort",
+          warm["system"] == read["system"] and "JSON schema" in warm["system"][0]["text"]
+          and warm.get("output_config") == {"effort": "low"} and read.get("output_config") == {"effort": "low"})
+    check("the cache lives an hour by default", warm["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"},
+          str(warm["system"][0]["cache_control"]))
+    check("a one-hour write is priced at twice the input rate, and the warm-up reports its cost",
+          abs(u.cost_usd - (10 * 4 + 10125 * 8 + 1 * 20) / 1e6) < 1e-9 and u.cache_write_1h == 10125, str(u.as_dict()))
+    _os.environ["INTAKE_CACHE_TTL"] = "5m"
+    try:
+        calls.clear()
+        rd.warm_cache(_Client(), "claude-opus-5-5", effort="low", brief=True)
+        check("INTAKE_CACHE_TTL=5m goes back to the five-minute cache",
+              calls[-1]["system"][0]["cache_control"] == {"type": "ephemeral"})
+    finally:
+        _os.environ.pop("INTAKE_CACHE_TTL", None)
+    rd._NO_STRUCTURED_OUTPUT.clear()
+    rd._NO_EFFORT.clear()
+    check("a five-minute write is still 1.25x, a one-hour write 2x",
+          abs(Usage("claude-opus-5-5", 0, 0, 0, 1_000_000).cost_usd - 5.0) < 1e-9
+          and abs(Usage("claude-opus-5-5", 0, 0, 0, 1_000_000, 1_000_000).cost_usd - 8.0) < 1e-9)
+
+    # The auto-upload warms once before a burst of reads, never for a single read, and goes on when
+    # the warm-up fails.
+    conn, store, tpro, read_doc, reads, load_row, mail, on_load = _auto_world()
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    order: list[str] = []
+
+    def read2(data, filename):
+        order.append("read")
+        return read_doc(data, filename)
+
+    def warm():
+        order.append("warm")
+        return 0.08
+
+    read2.warm = warm
+    load_row(2600040, "bol_expected", "loaded")
+    tpro.add(2600040)
+    mail(2600040, "mw", [(_picture(40), _reading(2600040)), (_picture(41), _reading(2600040))])
+    st = autofile.run(conn, tpro, store, read2, _AutoLog(), s, deadline=_time.monotonic() + 600)
+    check("two reads: warmed once, before the first read, its cost in the run's spend",
+          order[:1] == ["warm"] and order.count("warm") == 1 and order.count("read") == 2 and st.warmed == 1
+          and abs(st.spent - (0.08 + 0.05 * 2)) < 1e-9, str((order, st.warmed, st.spent)))
+    order.clear()
+    load_row(2600041, "bol_expected", "loaded")
+    tpro.add(2600041)
+    mail(2600041, "mx", [(_picture(42), _reading(2600041))])
+    autofile.run(conn, tpro, store, read2, _AutoLog(), s, deadline=_time.monotonic() + 600)
+    check("one read: no warm-up", order == ["read"], str(order))
+
+    def bad():
+        raise RuntimeError("no cache for you")
+
+    read2.warm = bad
+    order.clear()
+    load_row(2600042, "bol_expected", "loaded")
+    tpro.add(2600042)
+    mail(2600042, "my", [(_picture(43), _reading(2600042)), (_picture(44), _reading(2600042))])
+    autofile.run(conn, tpro, store, read2, _AutoLog(), s, deadline=_time.monotonic() + 600)
+    check("a failed warm-up is a warning; the reads go on", order.count("read") == 2, str(order))
+    check("a reader without a warm-up, such as this suite's, is simply not warmed", not hasattr(read_doc, "warm"))
+
+
+def test_the_quick_look_sets_aside_rate_confirmations() -> None:
+    """14 Oct 2026: 22 of the day's reads, $1.89, were the brokerage's own rate confirmation sent back
+    signed, which the quick look had called a BOL. It is never a BOL, a POD or a lumper receipt, so a
+    sure rate confirmation is set aside unread, an unsure one is read, and INTAKE_QUICK_RATECON=off
+    reads them all again."""
+    print("auto-upload: rate confirmations are set aside by the quick look")
+    import hashlib as _h
+    import time as _time
+    from intake import autofile
+    from pod_intake import reader as rd
+
+    check("the quick look knows the kind", "rate_confirmation" in rd.QUICK_KINDS and "rate_confirmation" in rd.QUICK_SYSTEM
+          and "Rate Confirmation" in rd.QUICK_SYSTEM)
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    said: dict[str, tuple[str, float]] = {}
+
+    def quick(data, filename):
+        return (*said[_h.sha256(data).hexdigest()], "claude-haiku-4-5", 0.002)
+
+    def sha(data):
+        return _h.sha256(data).hexdigest()
+
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    load_row(2600050, "bol_expected", "loaded")
+    tpro.add(2600050)
+    mail(2600050, "mr", [(_picture(50), _reading(2600050, "rate_confirmation")),
+                         (_picture(51), _reading(2600050, "rate_confirmation")),
+                         (_picture(52), _reading(2600050))])
+    said[sha(_picture(50))] = ("rate_confirmation", 0.95)
+    said[sha(_picture(51))] = ("rate_confirmation", 0.6)
+    said[sha(_picture(52))] = ("bol", 0.95)
+    autofile.run(conn, tpro, store, read, _AutoLog(), s, deadline=_time.monotonic() + 600, quick=quick)
+    row = conn.execute("SELECT outcome, status FROM autofile WHERE sha256=?", (sha(_picture(50)),)).fetchone()
+    check("a sure rate confirmation gets no full read and is recorded as not paperwork",
+          sha(_picture(50)) not in reads and row is not None and row[0] == "not_bol_pod" and "rate confirmation" in (row[1] or ""),
+          str(tuple(row) if row else None))
+    check("an unsure one is read", sha(_picture(51)) in reads)
+    check("the BOL beside them is read and goes up", sha(_picture(52)) in reads and any(u["load"] == 2600050 for u in tpro.uploads))
+    off = autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_AUTO_TERMINALS": "1160", "INTAKE_QUICK_RATECON": "off"})
+    on = autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_AUTO_TERMINALS": "1160"})
+    check("INTAKE_QUICK_RATECON=off keeps the full read for them; the default sets them aside",
+          "rate_confirmation" not in off.set_aside and "rate_confirmation" in on.set_aside and "photo" in off.set_aside)
+    d = type("D", (), {"pilot": True, "done": False, "on_file": None})()
+    check("the rule itself: a sure rate confirmation needs no read, an unsure one does, and off reads it",
+          not autofile.needs_full_read(d, ("rate_confirmation", 0.95), "loaded")
+          and autofile.needs_full_read(d, ("rate_confirmation", 0.7), "loaded")
+          and autofile.needs_full_read(d, ("rate_confirmation", 0.95), "loaded", off.set_aside))
+
+    # The look sees the first three pages of a file. A carrier's invoice packet opens with the invoice
+    # and the rate confirmation and carries the signed POD behind them: 5 of 150 stored PODs were
+    # called a sure rate confirmation that way on 14 Oct 2026, every one longer than the look.
+    class _Says:
+        def __init__(self, kind):
+            self.messages = self
+            self.kind = kind
+
+        def create(self, **kw):
+            return type("M", (), {"content": [type("B", (), {"type": "text", "text": json.dumps({"kind": self.kind, "confidence": 0.95})})()],
+                                  "usage": type("U", (), {"input_tokens": 1, "output_tokens": 1})()})()
+
+    page = type("P", (), {"media_type": "image/jpeg", "b64": "AA=="})()
+    whole = type("D", (), {"pages": [page, page], "total_pages": 2})()
+    packet = type("D", (), {"pages": [page, page, page, page], "total_pages": 7})()
+    check("a rate confirmation is set aside only when the whole file was looked at; a longer packet is other paperwork, and read",
+          rd.quick_look(_Says("rate_confirmation"), whole, "claude-haiku-4-5")[0] == "rate_confirmation"
+          and rd.quick_look(_Says("rate_confirmation"), packet, "claude-haiku-4-5")[0] == "other_paperwork"
+          and rd.quick_look(_Says("pod"), packet, "claude-haiku-4-5")[0] == "pod")
+
+
+def test_the_morning_report_shows_the_spend() -> None:
+    """14 Oct 2026: the day's AI bill tripled when four pods joined, and nobody saw it until the evening.
+    The morning report now carries the window's reads, quick looks, uploads, holds and dollars, the
+    week's daily average, and a warning when a day passes the line (INTAKE_SPEND_WARN_USD, $30)."""
+    print("the morning report: the spend line")
+    import datetime as _dt
+    from intake import report
+
+    conn = fresh_db()
+    now = _dt.datetime(2026, 10, 15, 11, 0, tzinfo=_dt.timezone.utc)
+
+    def read_row(sha, when, cost):
+        conn.execute("INSERT INTO attachment (sha256, filename, bytes, extraction_json, document_type, model, cost_usd, read_at) "
+                     "VALUES (?,?,?,?,?,?,?,?)", (sha, f"{sha}.jpg", 100, "{}", "bill_of_lading", "claude-opus-5-5", cost, when))
+
+    for i in range(4):
+        read_row(f"r{i}", "2026-10-14T18:00:00+00:00", 0.05)        # the window: 4 paid reads, $0.20
+    read_row("old", "2026-10-10T18:00:00+00:00", 1.00)                 # earlier in the week
+    read_row("free", "2026-10-14T18:00:00+00:00", 0.0)                 # a reused reading: not paid for
+    for q in ("q1", "q2"):
+        conn.execute("INSERT INTO quicklook (sha256, kind, confidence, model, cost_usd, looked_at) VALUES (?,?,?,?,?,?)",
+                     (q, "bol", 0.9, "claude-haiku-4-5", 0.002, "2026-10-14T18:00:00+00:00"))
+    for i, outcome in enumerate(("uploaded", "uploaded", "held")):
+        conn.execute("INSERT INTO autofile (load_id, sha256, source, outcome, final, status, logged, attempts, decided_at) "
+                     "VALUES (?,?,?,?,1,?,1,0,?)", (2600060 + i, f"r{i}", f"email:{i}", outcome, outcome.upper(), "2026-10-14T18:05:00+00:00"))
+    conn.commit()
+    rep = report.build(conn, now=now, terminals={1160}, pods={})
+    check("the spend line: reads, quick looks, uploads, holds, dollars and dollars per upload",
+          "AI SPEND, LAST 24 HOURS - $0.20: 4 full read(s) ($0.20), 2 quick look(s) ($0.00); 2 upload(s), 1 held; "
+          "$0.10 per upload." in rep.text, rep.text)
+    check("and the week's daily average", "7-day average $0.17 a day" in rep.text, rep.text)
+    check("under the line, no warning", "warning line" not in rep.text and "over $" not in rep.subject, rep.subject)
+    for i in range(10):
+        read_row(f"big{i}", "2026-10-14T19:00:00+00:00", 3.5)
+    conn.commit()
+    loud = report.build(conn, now=now, terminals={1160}, pods={})
+    check("a day over $30 gets a warning in the text and in the subject",
+          "! over the $30 warning line" in loud.text and loud.subject.endswith("AI spend $35, over $30"), loud.subject)
+    quiet = report.build(conn, now=now, terminals={1160}, pods={}, warn_usd=0)
+    check("warn_usd 0 switches the warning off", "warning line" not in quiet.text and "over $" not in quiet.subject)
+
+
 if __name__ == "__main__":
     test_routing()
     test_no_group_is_a_configuration_not_a_crash()
@@ -5409,6 +5632,9 @@ if __name__ == "__main__":
     test_auto_upload_reads_a_long_file_in_pieces()
     test_auto_upload_quick_look()
     test_reader_is_brief_and_caches_the_schema()
+    test_the_reader_warms_its_cache()
+    test_the_quick_look_sets_aside_rate_confirmations()
+    test_the_morning_report_shows_the_spend()
     test_auto_upload_dry_run_and_off()
     test_upload_log_sheet()
     test_every_load_state_is_classified()

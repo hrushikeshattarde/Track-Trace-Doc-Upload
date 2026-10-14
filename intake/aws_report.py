@@ -61,6 +61,7 @@ def handler(event: dict | None, context: Any) -> dict:
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         rep = report.build(conn, hours=int(env.get("INTAKE_REPORT_HOURS") or 24), terminals=terminals,
+                           warn_usd=float(env.get("INTAKE_SPEND_WARN_USD") or report.WARN_USD),
                            pods=pods, sheet_id=env.get("INTAKE_UPLOAD_SHEET_ID", ""), sheet_status=sheet_status)
     finally:
         conn.close()

@@ -23,6 +23,10 @@ from dataclasses import dataclass, field
 from . import autofile
 
 SHEET_URL = "https://docs.google.com/spreadsheets/d/{id}"
+# A day whose AI spend passes this gets a warning line and a word in the subject (INTAKE_SPEND_WARN_USD).
+# 14 Oct 2026: the bill tripled to $33 the day four pods and the company-wide lumper search joined, and
+# nobody saw it until the evening. The $50 cap in the worker only stops a runaway.
+WARN_USD = 30.0
 
 
 @dataclass
@@ -51,12 +55,49 @@ def reason(status: str) -> str:
     return s.strip()
 
 
+def spend(conn: sqlite3.Connection, since: str, now: dt.datetime | None = None, days: int = 7) -> dict:
+    """What the AI cost since `since` (an ISO UTC instant), from the ledger alone: paid full reads
+    (`attachment`), quick looks (`quicklook`), uploads and holds (`autofile`), and the daily average
+    over the `days` before `now`. The bot's own tally at list prices; Bedrock's bill ran about 4%
+    above it on 12 and 13 Oct 2026 (failed and retried reads)."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    reads, read_usd = conn.execute("SELECT COUNT(*), COALESCE(SUM(cost_usd), 0) FROM attachment "
+                                   "WHERE read_at >= ? AND cost_usd > 0", (since,)).fetchone()
+    quicks, quick_usd = conn.execute("SELECT COUNT(*), COALESCE(SUM(cost_usd), 0) FROM quicklook WHERE looked_at >= ?",
+                                     (since,)).fetchone()
+    uploads = conn.execute("SELECT COUNT(*) FROM autofile WHERE outcome = ? AND decided_at >= ?",
+                           (autofile.UPLOADED, since)).fetchone()[0]
+    held = conn.execute("SELECT COUNT(*) FROM autofile WHERE outcome = ? AND decided_at >= ?",
+                        (autofile.HELD, since)).fetchone()[0]
+    week_since = (now - dt.timedelta(days=days)).isoformat(timespec="seconds")
+    week = (conn.execute("SELECT COALESCE(SUM(cost_usd), 0) FROM attachment WHERE read_at >= ? AND cost_usd > 0",
+                         (week_since,)).fetchone()[0]
+            + conn.execute("SELECT COALESCE(SUM(cost_usd), 0) FROM quicklook WHERE looked_at >= ?", (week_since,)).fetchone()[0])
+    total = float(read_usd or 0) + float(quick_usd or 0)
+    return {"reads": int(reads or 0), "read_usd": float(read_usd or 0), "quick": int(quicks or 0),
+            "quick_usd": float(quick_usd or 0), "uploads": int(uploads or 0), "held": int(held or 0), "usd": total,
+            "per_upload": (total / uploads) if uploads else None, "day_average": float(week or 0) / days, "days": days}
+
+
+def spend_lines(sp: dict, hours: int, warn_usd: float) -> list[str]:
+    """The report's spend section: one line of numbers, and a warning when the window passed `warn_usd`."""
+    per = f"${sp['per_upload']:.2f} per upload" if sp["per_upload"] is not None else "no uploads"
+    out = [f"AI SPEND, LAST {hours} HOURS - ${sp['usd']:.2f}: {sp['reads']} full read(s) (${sp['read_usd']:.2f}), "
+           f"{sp['quick']} quick look(s) (${sp['quick_usd']:.2f}); {sp['uploads']} upload(s), {sp['held']} held; {per}. "
+           f"{sp['days']}-day average ${sp['day_average']:.2f} a day."]
+    if warn_usd and sp["usd"] > warn_usd:
+        out.append(f"  ! over the ${warn_usd:.0f} warning line: look at reads per upload, and at any pod that joined")
+    return out
+
+
 def build(conn: sqlite3.Connection, *, now: dt.datetime | None = None, hours: int = 24,
           terminals: frozenset[int] | set[int] = frozenset(), pods: dict[int, str] | None = None,
-          sheet_id: str = "", sheet_status: dict[str, tuple[str, str]] | None = None) -> Report:
+          sheet_id: str = "", sheet_status: dict[str, tuple[str, str]] | None = None,
+          warn_usd: float = WARN_USD) -> Report:
     """The report as of `now` (UTC), covering the last `hours` for the pilot `terminals`. With
     `sheet_status` (Ref -> (Status, Correct?), sheets.UploadLog.statuses) the held section follows
-    the sheet: rows a person removed or rewrote are left out."""
+    the sheet: rows a person removed or rewrote are left out. The window's AI spend follows the held
+    loads (14 Oct 2026), with a warning past `warn_usd`."""
     pods = pods or {}
     now = now or dt.datetime.now(dt.timezone.utc)
     since = (now - dt.timedelta(hours=hours)).isoformat(timespec="seconds")
@@ -102,11 +143,15 @@ def build(conn: sqlite3.Connection, *, now: dt.datetime | None = None, hours: in
     docs = sum(h["docs"] for h in held.values())
     subject = (f"Doc Intake: {len(held)} load(s) the bot did not upload - {day}" if held
                else f"Doc Intake: nothing held - {day}")
+    sp = spend(conn, since, now)
+    if warn_usd and sp["usd"] > warn_usd:
+        subject += f" - AI spend ${sp['usd']:.0f}, over ${warn_usd:.0f}"
     out = [f"Doc Intake Bot - loads the bot did not upload, {autofile.eastern(now)} (last {hours} hours)", ""]
     out.append(f"HELD IN THE LAST {hours} HOURS - {len(held)} load(s), {docs} document(s)")
     out += held_lines or ["  none"]
     if resolved:
         out.append(f"  ({resolved} held document(s) since filed or cleared by a person are not listed)")
+    out += ["", *spend_lines(sp, hours, warn_usd)]
     out += ["", "Every held document is on the Upload Log sheet with the page it read, what matched and why it was held."]
     if sheet_id:
         out.append(SHEET_URL.format(id=sheet_id))
