@@ -1110,6 +1110,65 @@ def test_lumper_receipts_company_wide() -> None:
           and conn.execute("SELECT COUNT(*) FROM autofile").fetchone()[0] == 0)
 
 
+def test_one_row_per_load_once_it_has_its_pod() -> None:
+    """Load 2602683 (14 Oct 2026): a Walmart receiving report photographed page by page came in one email.
+    The stamped receipt and one page went up as the POD; three pages at 80% and one at 85% with a single
+    matching PO were held one by one, five rows for a load that had its POD. Now holds the load has
+    outgrown - the POD went up, by the bot or by hand - are withdrawn and leave the sheet: one row per load.
+    (Pooling the facts of a page with a matching PO of its own was tried and dropped: a label and a BOL in
+    one email naming different POs are deliberately not pooled.)"""
+    print("auto-upload: one row per load once it has its POD")
+    import time as _time
+    from intake import autofile
+
+    def page(load_id, conf, numbers, city="Atlanta"):
+        r = _reading(load_id, "proof_of_delivery", conf=conf, numbers=numbers, city=city)
+        r["signatures"] = {**r["signatures"], "receiver_signed": False, "receiver_name": None, "receiver_date": None, "stamp_present": True}
+        for n in r["numbers"]:
+            n["kind"] = "po" if n["label"].startswith("PO") else "delivery"
+        return r
+
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    now = db.now_iso()
+    # A: one email, four photos: the receipt (matches the pickup and the PO), a report page with one of the
+    # load's POs, and two report pages at 80% naming other POs.
+    load_row(2600260, "wrong_doc_type", "delivered")
+    tpro.add(2600260)
+    tpro.loads[2600260]["load"]["waypoints"][1]["reference"] = [{"type": "PO", "value": "6635290243"}]
+    lead, tied, weak1, weak2 = mail(2600260, "m260", [
+        (_picture(260), page(2600260, 0.88, [("Delivery #", "P2600260"), ("PO #", "PO2600260")])),
+        (_picture(261), page(2600260, 0.85, [("PO #", "6635290243")], city=None)),
+        (_picture(262), page(2600260, 0.80, [("PO #", "9740120245")], city=None)),
+        (_picture(263), page(2600260, 0.80, [("PO #", "1585550013")], city=None))], when=now)
+    # B: a hold from an earlier run, on a load whose POD a person then filed by hand.
+    load_row(2600261, "pod_expected", "delivered")
+    tpro.add(2600261)
+    (b_sha,) = mail(2600261, "m261", [(_picture(264), page(2600261, 0.80, [("PO #", "1111111111")], city=None))], when=now)
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    ups = [u for u in tpro.uploads if u["load"] == 2600260]
+    rows = {(r["load_id"], r["sha256"]): r for r in conn.execute("SELECT * FROM autofile")}
+    check("the receipt goes up as the POD, on its own facts", len(ups) == 1 and ups[0]["type"] == "Bill Of Lading"
+          and len(autofile.picture_sig(ups[0]["data"])) == 1, str([(u["type"], u["comment"]) for u in ups]))
+    check("the pages that failed on their own are not needed once the POD is up, not held",
+          all(rows[(2600260, x)]["outcome"] == "not_needed" for x in (tied, weak1, weak2))
+          and "the hold is withdrawn" in rows[(2600260, weak1)]["status"], str([rows[(2600260, x)]["outcome"] for x in (tied, weak1, weak2)]))
+    a_rows = [r for r in log.rows.values() if r[1] == 2600260]
+    check("so the load has one row on the sheet", len(a_rows) == 1 and a_rows[0][13].startswith("UPLOADED"), str([r[13][:40] for r in a_rows]))
+    check("the earlier-run case starts as a hold on the sheet", rows[(2600261, b_sha)]["outcome"] == "held" and autofile.ref(2600261, b_sha) in log.rows)
+    # A person files the POD; the load check sees it; the hold is withdrawn and its row removed.
+    by_hand = {"id": 801, "fileTypeId": 360, "fileTypeName": "Proof of Delivery", "uploadById": 4985, "comments": "", "dateCreated": now}
+    tpro.loads[2600261]["files"].append(by_hand)
+    tpro.loads[2600261]["bytes"][801] = _picture(265)
+    conn.execute("UPDATE load SET last_checked_at='9999-01-01T00:00:00+00:00' WHERE load_id=2600261")
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    r = conn.execute("SELECT outcome, status FROM autofile WHERE load_id=2600261").fetchone()
+    check("a hold the load has outgrown is withdrawn, and its row leaves the sheet",
+          r["outcome"] == "not_needed" and "Proof of Delivery 801" in r["status"] and autofile.ref(2600261, b_sha) not in log.rows
+          and autofile.ref(2600261, b_sha) in log.removed, str(dict(r)))
+
+
 def test_a_pod_with_a_tab_of_its_own() -> None:
     """30 Sep 2026: Jesse Klingler's pod (terminal 1138) joins the pilot with its own sheet tab,
     "Upload Log - Klinger". Rows are routed by the load's terminal; every other pod keeps the
@@ -4665,11 +4724,15 @@ def test_auto_upload_bol_sets() -> None:
     check("the set is one row, on the front, naming the sign-out side too",
           autofile.ref(2600040, b40) not in log.rows and log.rows[autofile.ref(2600040, f40)][4]
           == "m40_0.png + m40_1.png - one 2-page PDF")
+    # Since 14 Oct 2026 the hold on that page is withdrawn once the front has gone up: the load has its
+    # BOL, so the page is not needed (withdraw_superseded_holds) - and it still did not join.
     check("a back page that names a different shipment does not join",
-          len(autofile.picture_sig(up[2600041]["data"])) == 1 and conn.execute(
-              "SELECT outcome FROM autofile WHERE load_id=2600041 AND source='email:m41' ORDER BY outcome").fetchall()[0][0] == "held")
+          len(autofile.picture_sig(up[2600041]["data"])) == 1 and sorted(r[0] for r in conn.execute(
+              "SELECT outcome FROM autofile WHERE load_id=2600041 AND source='email:m41'")) == ["not_needed", "uploaded"]
+          and "the hold is withdrawn" in conn.execute(
+              "SELECT status FROM autofile WHERE load_id=2600041 AND outcome='not_needed'").fetchone()[0])
     check("nor does one that came in another email", len(autofile.picture_sig(up[2600042]["data"])) == 1
-          and conn.execute("SELECT outcome FROM autofile WHERE sha256=?", (b42,)).fetchone()[0] == "held")
+          and conn.execute("SELECT outcome FROM autofile WHERE sha256=?", (b42,)).fetchone()[0] == "not_needed")   # withdrawn: the load has its BOL
 
 
 def test_auto_upload_leaves_out_pages_that_are_not_paperwork() -> None:
@@ -5304,6 +5367,7 @@ if __name__ == "__main__":
     test_a_dock_check_in_sheet_rides_with_the_pod()
     test_lumper_receipts()
     test_lumper_receipts_company_wide()
+    test_one_row_per_load_once_it_has_its_pod()
     test_a_signature_added_after_pickup_is_the_receivers()
     test_efs_requests_vouch_for_a_lumper_receipt()
     test_a_pod_with_a_tab_of_its_own()

@@ -465,7 +465,11 @@ Waiting decisions stay in the ledger only, as the pod asked on 24 Sep.
 
 **Final decisions are never re-decided.** Held, on_file, not_needed and uploaded are final
 (`autofile.final = 1`). Only waiting, and dry-run rows, are looked at again. A held row on the sheet
-is the hand-off to a person.
+is the hand-off to a person - until the load has what it was short of: a BOL or POD page held on a
+load that then gets a BOL or POD on file, from the bot later in the same run or from anyone by hand,
+is rewritten as not needed and its row leaves the sheet (`withdraw_superseded_holds`, 14 Oct 2026,
+load 2602683: a Walmart receiving report photographed page by page, the receipt and one page up as the
+POD and four more pages held under a load that had its POD). One row per load, as the pods read it.
 
 ### 6.5 Grouping pages into one upload
 
@@ -862,7 +866,7 @@ account is shared with other projects, and the `project=circle-doc-intake` tag i
 cost-allocation tag. To measure spend, use Cost Explorer's resource-level view for the Lambdas,
 bucket and secrets, plus the "Claude Opus 5 (Amazon Bedrock Edition)" service line.
 
-**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 739 offline checks: no network, no
+**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 744 offline checks: no network, no
 model, no credentials. Run it before every deploy.
 
 **Changing the pilot's pods.** Change `AUTO_TERMINALS` in `scripts/deploy_lambda.py` and deploy. A pod that

@@ -470,6 +470,7 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
                     unread.add(load_id)
                     continue
                 _upload(conn, tpro, uploader, store, s, row, filed, group, stats)
+            withdraw_superseded_holds(conn, load_id, filed)
         except Exception as e:                                   # noqa: BLE001 - one load never stops the rest
             stats.errors += 1
             unread.add(load_id)
@@ -973,6 +974,7 @@ def _look(conn, tpro, row, lumper: bool = True, fetched: tuple | None = None,
         _mark_looked(conn, load_id)
         return None
     filed = on_file(conn, tpro, load_id, files if files is not None else tpro.files(load_id), fetched=data)
+    withdraw_superseded_holds(conn, load_id, filed)
     shas = {d.sha256 for d in emailed}
     for of in filed:
         # Driver Supplied BOLs somebody else filed: a driver's text, a rep. Their bytes are on the
@@ -985,6 +987,26 @@ def _look(conn, tpro, row, lumper: bool = True, fetched: tuple | None = None,
         _mark_looked(conn, load_id)
         return None
     return row, load, filed, docs
+
+
+def withdraw_superseded_holds(conn, load_id: int, filed: list[OnFile]) -> int:
+    """A BOL or POD page held for a person on a load that has since got the document it was short of -
+    the bot's upload later in the same run, or anyone's by hand - is not a hold any more: the load has
+    its document, and the page was not needed. The row is rewritten as not needed and leaves the sheet
+    (flush_log; a row the pod wrote in stays). Load 2602683 (14 Oct 2026): a Walmart receiving report
+    photographed page by page came in one email; the stamped receipt and one page went up as the POD,
+    and four more pages sat on the sheet as holds under a load that had its POD. Returns how many."""
+    n = 0
+    for r in conn.execute("SELECT sha256, kind FROM autofile WHERE load_id=? AND outcome=? AND kind IN ('BOL', 'POD')",
+                          (load_id, HELD)).fetchall():
+        has = (_has_bol(conn, filed) if r["kind"] == "BOL" else _has_pod(conn, filed))[0]
+        if has is None:
+            continue
+        conn.execute("UPDATE autofile SET outcome=?, final=1, status=?, decided_at=? WHERE load_id=? AND sha256=?",
+                     (NOT_NEEDED, f"NOT NEEDED - the load has since got a {r['kind']} on file: {has.named()}; "
+                                  f"the hold is withdrawn", db.now_iso(), load_id, r["sha256"]))
+        n += 1
+    return n
 
 
 def _recent(d: Doc, days: int = LUMPER_DAYS) -> bool:
