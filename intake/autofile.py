@@ -1,4 +1,4 @@
-"""Step 4 for the pilot pods: read the new paperwork, upload what passes, log every BOL and POD.
+"""Step 4 for the pilot pods: read the new paperwork, upload what passes, log every BOL, POD and lumper receipt.
 
 Runs inside the worker, after the load checks, for the terminals in INTAKE_AUTO_TERMINALS - the
 Frankie Saiz pod (1160) from 24 Sep 2026, Jesse Klingler's (1138) from 30 Sep, and Julialynn
@@ -19,10 +19,23 @@ of their loads that is not yet complete:
              sheet - one row per document, updated in place when its status changes. Every other
              decision (already on file, not needed, waiting) is kept in the ledger only
 
+Lumper receipts (14 Oct 2026). A file the AI reads as the printed lumper receipt goes up as well, under
+TransportPro's own Lumper type - one file, one upload, never inside a BOL or POD and never with one
+inside it (judge_lumper). Its checks are the pod's rule for filing one by hand: the AI is at least 85%
+sure of it; it reached the load on the load's own email chain - the thread bound to this load, no reply
+naming another - or was texted onto the load; and one thing on it ties it to the load: the destination
+(the receipt's facility in the delivery stop's city, by street or by name), the PO number, the BOL
+number or another reference number TransportPro holds. Nothing waits for the truck's stage. Every
+lumper row, uploaded or held, goes to one tab of the sheet for every pod (Settings.lumper_tab,
+"Upload Log - Lumper"). A receipt comes as often after the POD as with it, so a load already showing
+Documents Received, or gone from the view, is still looked at for one for LUMPER_DAYS after its mail
+arrived; the BOLs and PODs in that mail are read and recorded as not needed, in the ledger only.
+INTAKE_LUMPER=off switches all of this off, and a lumper receipt is then set aside as before.
+
 A document is uploaded only when all of these hold:
 
-    - it is a BOL or a POD. Anything else - freight and seal photos included - is never uploaded
-      and never logged (house rule: only BOLs and PODs go into File History)
+    - it is a BOL, a POD or a lumper receipt. Anything else - freight and seal photos included - is
+      never uploaded and never logged (house rule: only those go into File History)
     - there is no personal ID on it. Never uploaded, never logged
     - the AI is at least 85% sure what it is
     - at least two facts on the page match the load in TransportPro, one of them a reference number
@@ -67,8 +80,12 @@ OFF, DRY_RUN, ON = "off", "dry-run", "on"
 
 PAPERWORK_TYPES = (12, 363, 360, 53, 123)     # what a driver's paperwork can be filed under
 DRIVER_SUPPLIED = 363
-TYPE_IDS = {"Bill Of Lading": 12, "Driver Supplied BOL": 363}
-REAL_TYPE = {"POD": "Proof of Delivery", "BOL": "Bill Of Lading"}
+LUMPER_TYPE = 113                             # TransportPro's Lumper type, where the pod files lumper receipts
+HASHED_TYPES = PAPERWORK_TYPES + (LUMPER_TYPE,)   # the files on a load whose bytes and pictures are compared
+TYPE_IDS = {"Bill Of Lading": 12, "Driver Supplied BOL": 363, "Lumper": LUMPER_TYPE}
+LUMPER = "LUMPER"                             # the third kind of document, beside "BOL" and "POD"
+REAL_TYPE = {"POD": "Proof of Delivery", "BOL": "Bill Of Lading", LUMPER: "Lumper"}
+KIND_NAME = {"BOL": "BOL", "POD": "POD", LUMPER: "Lumper receipt"}
 AT_CONSIGNEE = ("at consignee", "delivered")
 # The states worth the bot's time, most urgent first. complete / out of scope need nothing, and a
 # load not checked yet ('new', 'error') has no stage to judge a POD's timing by.
@@ -125,6 +142,13 @@ UPLOAD_ROLES = PAPER_ROLES | {"packing_list"}
 # load 2580064: the manager wants the Capstone check-in sheet filed with the POD; the printed lumper
 # receipt still stays out, the pod files those under Lumper). Never with a BOL, never on its own.
 POD_RIDERS = frozenset({"dock_sheet"})
+# A lumper receipt's own upload (14 Oct 2026): its receipt pages, and the lumper company's check-in sheet
+# when the same file carries it. A BOL or POD page in a lumper file stays out, as a receipt stays out of theirs.
+LUMPER_ROLES = frozenset({"lumper"})
+LUMPER_RIDERS = frozenset({"dock_sheet"})
+LUMPER_TAB = "Upload Log - Lumper"            # every pod's lumper rows, on one tab of the sheet
+LUMPER_DAYS = 7                               # how long after its mail arrived a finished load is still looked at for a receipt
+LUMPER_STATES = ("complete", "not_in_view")   # a finished load: no BOL or POD is work on it, a lumper receipt still is
 ROLE_WORDS = {"photo": "photo", "lumper": "lumper receipt", "dock_sheet": "dock check-in sheet",
               "weight_ticket": "scale ticket", "reefer_log": "reefer log",
               "invoice": "invoice", "rate_confirmation": "rate confirmation", "other": "other paperwork"}
@@ -197,6 +221,8 @@ class Settings:
     pods: dict[int, str] = field(default_factory=dict)
     tabs: dict[int, str] = field(default_factory=dict)   # terminal -> its own sheet tab; the rest use the log's
     lane_rule: bool = True        # lane_match: a page with none of the load's numbers may go up on the lane and the date
+    lumper: bool = True           # lumper receipts go up under Lumper (judge_lumper) and finished loads are looked at for them
+    lumper_tab: str = LUMPER_TAB  # the one tab every pod's lumper rows go to
 
     @classmethod
     def from_env(cls, env, pods: dict[int, str] | None = None) -> "Settings":
@@ -211,7 +237,9 @@ class Settings:
                    daily_usd=float(env.get("INTAKE_AUTO_DAILY_USD") or 50),
                    max_reads=int(env.get("INTAKE_AUTO_MAX_READS") or 60), pods=pods or {},
                    tabs={int(k): str(v) for k, v in json.loads(env.get("INTAKE_UPLOAD_TABS") or "{}").items()},
-                   lane_rule=(env.get("INTAKE_AUTO_LANE_RULE") or "on").strip().lower() != "off")
+                   lane_rule=(env.get("INTAKE_AUTO_LANE_RULE") or "on").strip().lower() != "off",
+                   lumper=(env.get("INTAKE_LUMPER") or "on").strip().lower() != "off",
+                   lumper_tab=(env.get("INTAKE_LUMPER_TAB") or "").strip() or LUMPER_TAB)
 
 
 @dataclass
@@ -292,7 +320,7 @@ class Decision:
     doc: Doc
     outcome: str
     status: str = ""
-    kind: str | None = None       # BOL | POD
+    kind: str | None = None       # BOL | POD | LUMPER
     ex: Any = None
     conf: float | None = None
     facts: list[str] = field(default_factory=list)
@@ -337,14 +365,14 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
 
     # 1. look
     plans: list[tuple[sqlite3.Row, dict, list[OnFile], list[Doc]]] = []
-    for row in _loads(conn, s.terminals):
+    for row in _loads(conn, s.terminals, lumper=s.lumper):
         if time.monotonic() > deadline - LOOK_UNTIL_S:
             stats.stopped = "out of time while looking at loads"
             break
         if not _worth_a_look(conn, row, s):
             continue
         try:
-            plan = _look(conn, tpro, row)
+            plan = _look(conn, tpro, row, lumper=s.lumper)
         except TProError as e:
             stats.errors += 1
             print(f"  ! auto-upload: load {row['load_id']}: {e}")
@@ -373,13 +401,15 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
             groups: dict[tuple, list[Decision]] = {}
             for dec in decisions:
                 if dec.ready:
-                    groups.setdefault((dec.doc.batch or dec.doc.source, dec.kind), []).append(dec)
+                    # A BOL or POD takes the pages sent with it; a lumper receipt is one file, one upload.
+                    sending = dec.doc.source if dec.kind == LUMPER else (dec.doc.batch or dec.doc.source)
+                    groups.setdefault((sending, dec.kind), []).append(dec)
             # The other pages sent with each document join it - a POD's first, then a BOL's - and a
             # page one set claims leaves every other, so nothing goes up twice.
             claimed: dict[int, tuple] = {}
             for key in sorted(groups, key=lambda k: 0 if k[1] == "POD" else 1):
                 group = groups[key]
-                if not group[0].doc.batch:
+                if not group[0].doc.batch or key[1] == LUMPER:
                     continue
                 pool = [d for d in decisions + _batch_mates(conn, store, tpro, s, row, load, filed, docs, group[0].doc.batch)
                         if id(d) not in claimed and not any(d is g for g in group)]
@@ -417,7 +447,7 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
     # 4. log
     if log is not None and s.mode == ON:
         try:
-            stats.logged = flush_log(conn, log, s.tabs)
+            stats.logged = flush_log(conn, log, s.tabs, lumper_tab=s.lumper_tab)
         except Exception as e:                                   # noqa: BLE001 - reported; rows stay pending
             stats.sheet_error = f"{type(e).__name__}: {str(e)[:200]}"
     return stats
@@ -478,8 +508,8 @@ def can_join(dec: Decision, refs: set[str], kind: str, s: Settings, docs: frozen
     its only failed checks may be the facts it cannot have and a confidence the set's lead makes up for.
     A packing list joins when it names the same shipment as the set: a number of a reference kind
     printed on both."""
-    if dec.on_clearing or dec.ex is None:
-        return False
+    if dec.on_clearing or dec.ex is None or dec.kind == LUMPER:
+        return False                          # a lumper receipt goes up on its own, under Lumper, never inside a BOL or POD
     if dec.kind is None:
         return (dec.outcome == NOT_PAPERWORK and bool(shipment_numbers(dec.ex) & numbers)
                 and (is_packing_list(dec.ex) or (kind == "POD" and is_dock_sheet(dec.ex))))
@@ -555,6 +585,17 @@ def is_dock_sheet(ex) -> bool:
     return ex is not None and bool(ex.pages) and all(p.role == "dock_sheet" for p in ex.pages)
 
 
+def is_lumper_receipt(ex) -> bool:
+    """A file that is the printed lumper receipt (14 Oct 2026): read as lumper, with a receipt page - role
+    "lumper" - or with no page labelled at all. The reader gives document_type "lumper" to a file that is
+    only the driver's dock check-in sheet as well; that one is not a receipt and rides with the POD
+    (is_dock_sheet, POD_RIDERS)."""
+    if ex is None or ex.document_type != "lumper":
+        return False
+    roles = [p.role for p in ex.pages]
+    return not roles or "lumper" in roles
+
+
 def set_marks(group: list[Decision]) -> tuple[frozenset[str], frozenset[str]]:
     """(document numbers, shipment numbers) of the pages leading a set - what a page must share to join it."""
     lead = [g for g in group if not g.companion and g.ex is not None]
@@ -608,7 +649,7 @@ def pool_set_facts(decisions: list[Decision], row, s: Settings, more: Callable[[
         if pool is None:
             pool = decisions + (more() if more is not None else [])
         bare = not shipment_numbers(dec.ex) and not dec.strong   # a signature page naming no shipment (2604225, 2593363)
-        mates = [m for m in pool if m is not dec and m.ex is not None and m.kind is not None
+        mates = [m for m in pool if m is not dec and m.ex is not None and m.kind in ("BOL", "POD")
                  and (same_sending(m.doc, dec.doc) or same_form(m.ex, dec.ex)) and vouches(m, s)
                  and m.outcome in ("ready", HELD, ON_FILE, NOT_NEEDED, UPLOADED)
                  and (set(m.strong) & set(dec.strong)
@@ -719,13 +760,33 @@ def _sent_mates(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnF
     return out
 
 
-def _loads(conn, terminals: frozenset[int]) -> list[sqlite3.Row]:
+def _loads(conn, terminals: frozenset[int], lumper: bool = False) -> list[sqlite3.Row]:
+    """The pilot pods' loads worth the bot's time, most urgent first - and, with `lumper`, their
+    finished loads that recent mail may have brought a lumper receipt for, last."""
     cases = " ".join(f"WHEN '{x}' THEN {i}" for i, x in enumerate(LOAD_ORDER))
     marks = ",".join("?" * len(terminals))
-    return conn.execute(
+    rows = conn.execute(
         f"SELECT * FROM load WHERE in_view=1 AND terminal IN ({marks}) AND state IN "
         f"({','.join('?' * len(LOAD_ORDER))}) ORDER BY CASE state {cases} ELSE 99 END, next_check_at",
         (*sorted(terminals), *LOAD_ORDER)).fetchall()
+    return rows + (lumper_loads(conn, terminals) if lumper else [])
+
+
+def lumper_loads(conn, terminals: frozenset[int]) -> list[sqlite3.Row]:
+    """The pilot pods' finished loads - Documents Received, or gone from the Load Management view - with
+    mail of the last LUMPER_DAYS that has no final decision. A lumper receipt comes when the carrier
+    sends it, as often after the POD as with it, and a finished load was never looked at again. Its
+    older mail is left alone, so the first run under this rule does not read three weeks of paperwork
+    on loads nobody is waiting on."""
+    marks = ",".join("?" * len(terminals))
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=LUMPER_DAYS)).isoformat(timespec="seconds")
+    return conn.execute(
+        f"SELECT l.* FROM load l WHERE l.terminal IN ({marks}) AND l.state IN ({','.join('?' * len(LUMPER_STATES))}) "
+        "AND EXISTS (SELECT 1 FROM part p JOIN message m ON m.message_id = p.message_id "
+        "            LEFT JOIN autofile a ON a.load_id = m.load_id AND a.sha256 = p.sha256 "
+        "            WHERE m.load_id = l.load_id AND p.decision = 'keep' AND p.sha256 IS NOT NULL "
+        "              AND m.internal_date >= ? AND (a.sha256 IS NULL OR a.final = 0)) "
+        "ORDER BY l.load_id", (*sorted(terminals), *LUMPER_STATES, since)).fetchall()
 
 
 def _worth_a_look(conn, row, s: Settings) -> bool:
@@ -784,22 +845,26 @@ def same_sending(a: Doc, b: Doc) -> bool:
     return bool((a.batches or {a.batch}) & (b.batches or {b.batch}) - {None})
 
 
-def _look(conn, tpro, row) -> tuple | None:
+def _look(conn, tpro, row, lumper: bool = True) -> tuple | None:
     load_id = int(row["load_id"])
     load = tpro.load(load_id)
-    if _docs_received(load):
-        # TransportPro is satisfied; the load check will mark it complete. Nothing to read or upload.
+    done = _docs_received(load)
+    decided = _decided(conn, load_id)
+    emailed = _email_docs(conn, load_id)
+    # A load TransportPro is satisfied with needs no BOL or POD; the load check will mark it complete.
+    # It can still be short a lumper receipt (14 Oct 2026), which comes as often after the POD as with
+    # it, so its mail of the last LUMPER_DAYS is read for one. Older mail, and the pictures texted onto
+    # the load, are left alone: reading them could only find paperwork the load already has.
+    docs = [d for d in emailed if _open(decided, d.sha256) and (not done or (lumper and _recent(d)))]
+    if done and not docs:
         _mark_looked(conn, load_id)
         return None
     filed = on_file(conn, tpro, load_id, tpro.files(load_id))
-    decided = _decided(conn, load_id)
-    emailed = _email_docs(conn, load_id)
     shas = {d.sha256 for d in emailed}
-    docs = [d for d in emailed if _open(decided, d.sha256)]
     for of in filed:
         # Driver Supplied BOLs somebody else filed: a driver's text, a rep. Their bytes are on the
         # load, not in the mail, and one of them may be the POD this load is waiting for.
-        if (of.type_id == DRIVER_SUPPLIED and not of.by_bot and of.sha256 not in shas
+        if (not done and of.type_id == DRIVER_SUPPLIED and not of.by_bot and of.sha256 not in shas
                 and _open(decided, of.sha256)):
             shas.add(of.sha256)
             docs.append(file_doc(of, filed))
@@ -807,6 +872,16 @@ def _look(conn, tpro, row) -> tuple | None:
         _mark_looked(conn, load_id)
         return None
     return row, load, filed, docs
+
+
+def _recent(d: Doc, days: int = LUMPER_DAYS) -> bool:
+    """Whether the document arrived within the last `days`."""
+    when = _utc(d.arrived_at)
+    if when is None:
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return when >= dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
 
 
 def texted(f: dict) -> bool:
@@ -866,7 +941,7 @@ def on_file(conn, tpro, load_id: int, files: list[dict]) -> list[OnFile]:
         if not f.get("id"):
             continue
         db.record_tpro_file(conn, load_id, f)
-        if int(f.get("fileTypeId") or 0) not in PAPERWORK_TYPES:
+        if int(f.get("fileTypeId") or 0) not in HASHED_TYPES:
             continue
         got = conn.execute("SELECT sha256 FROM tpro_file WHERE tpro_file_id=?", (int(f["id"]),)).fetchone()
         sha = got["sha256"] if got else None
@@ -1538,6 +1613,8 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
         kind = "POD"
     elif type_name == "Bill Of Lading":
         kind = "POD" if receiver and stage not in AT_CONSIGNEE else "BOL"
+    elif s.lumper and is_lumper_receipt(ex):
+        kind = LUMPER
     else:
         return Decision(d, NOT_PAPERWORK, f"read as {type_name}", ex=ex)
     dec = Decision(d, "ready", kind=kind, ex=ex, conf=ex.document_type_confidence)
@@ -1548,10 +1625,10 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
     # that would go up are compared: an upload leaves a file's photos out, so they are never on the load
     # to be found, and a second copy of the same PDF would otherwise read as new and go up again.
     mine = sig()
-    keep, _ = paper_pages(ex, len(mine), kind, roles_up=PAPER_ROLES)
+    keep, _ = paper_pages(ex, len(mine), kind, roles_up=LUMPER_ROLES if kind == LUMPER else PAPER_ROLES)
     if mine and len(keep) < len(mine):
         mine = [mine[n - 1] for n in keep]
-    counts =[of for of in filed if kind == "BOL" or of.type_id in st.CLEARING_TYPES]
+    counts = [of for of in filed if counts_as(of, kind)]
     hit = _covering(d.sha256, mine, counts)
     if hit is not None:
         ours = hit.by_bot and (hit.sha256 == d.sha256 or conn.execute(
@@ -1568,9 +1645,19 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
             dec.status = (f"ALREADY ON FILE - {hit.named()}, {how}"
                           + (", uploaded by the bot for another copy" if hit.by_bot else "") + "; nothing uploaded")
         return dec
-    if kind == "POD":
-        copy = _covering(d.sha256, mine, [of for of in filed if of.type_id not in st.CLEARING_TYPES])
+    if kind in ("POD", LUMPER):
+        # On the load under a type that does not count - a POD the driver texted, which TransportPro files
+        # as Driver Supplied BOL, or a lumper receipt likewise - it goes up again under the right type, and
+        # the comment names the copy.
+        copy = _covering(d.sha256, mine, [of for of in filed if not counts_as(of, kind)])
         dec.refiles = f"{copy.file.get('fileTypeName')} {copy.file.get('id')}" if copy is not None else ""
+    if kind == LUMPER:
+        return judge_lumper(conn, s, row, load, d, dec)
+    if _docs_received(load):
+        # Looked at for a lumper receipt (lumper_loads): its BOLs and PODs are nothing the load needs.
+        dec.outcome = NOT_NEEDED
+        dec.status = "NOT NEEDED - the load shows Documents Received; nothing uploaded"
+        return dec
 
     # Does the load need it?
     has, unknown = (_has_bol if kind == "BOL" else _has_pod)(conn, filed)
@@ -1626,6 +1713,98 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
                           f"{stage or 'at an unknown stage'}; uploads once it reaches the consignee" + waiting_note(ex, load))
             return dec
     return dec
+
+
+def counts_as(of: OnFile, kind: str) -> bool:
+    """Whether a file on the load, under its type, is where a document of `kind` belongs: a BOL under
+    any paperwork type; a POD only under a type that clears; a lumper receipt only under Lumper."""
+    if kind == "BOL":
+        return of.type_id in PAPERWORK_TYPES
+    if kind == "POD":
+        return of.type_id in st.CLEARING_TYPES
+    return of.type_id == LUMPER_TYPE
+
+
+def judge_lumper(conn, s: Settings, row, load: dict, d: Doc, dec: Decision) -> Decision:
+    """The checks for a lumper receipt (14 Oct 2026) - the pod's rule for filing one by hand: the receipt
+    must have come on the load's own chain, and the destination, the PO number or the BOL number on it
+    must be the load's.
+
+        confidence  the AI is at least min_confidence sure the page is a lumper receipt
+        chain       an emailed receipt reached the load by its email thread - the load number in the
+                    subject, or the thread bound to this load - and no reply in the thread named a
+                    different load (lumper_chain); a texted receipt is on the load in TransportPro already
+        tie         a reference number TransportPro holds for the load is printed on the receipt - the
+                    PO, the BOL number, the pickup or load number, a number from a stop's notes
+                    (match_facts_detail) - or the receipt names the destination: its facility in the
+                    delivery stop's city, sharing its street or its name (destination_match). A city
+                    alone is every load on the lane, and is not enough
+
+    Nothing waits for the truck's stage: the receipt is paid at the dock and comes when it comes. The
+    outcome is ready, or held with the check that failed; `allowed` carries the evidence for the sheet."""
+    ex = dec.ex
+    if ex.document_type_confidence < s.min_confidence:
+        dec.failed.append(f"AI only {ex.document_type_confidence:.0%} sure it is a lumper receipt (needs {s.min_confidence:.0%})")
+        dec.why.add("confidence")
+    chain, conflicted = lumper_chain(conn, int(row["load_id"]), d)
+    if conflicted:
+        dec.failed.append("a reply in the email thread named a different load")
+        dec.why.add("conflict")
+    tie = f"{dec.strong[0]} is on the receipt" if dec.strong else destination_match(ex, load)
+    if tie is None:
+        stop = (stop_of(load, "CN") or {}).get("location") or {}
+        where = ", ".join(str(x) for x in (stop.get("companyName"), stop.get("city")) if x) or "unknown"
+        dec.failed.append("nothing on the receipt ties it to the load: none of the load's numbers (PO, BOL, pickup, "
+                          f"load) is on it and its facility is not the delivery stop ({where})")
+        dec.why.add("facts")
+    if dec.failed:
+        dec.outcome = HELD
+        dec.status = f"HELD - lumper receipt: {'; '.join(dec.failed)}; not uploaded, a person should look"
+        return dec
+    dec.allowed += [f"lumper receipt: {chain}", tie]
+    return dec
+
+
+def lumper_chain(conn, load_id: int, d: Doc) -> tuple[str, bool]:
+    """(how the receipt reached the load, whether that is contested): an emailed receipt by the tier its
+    message was routed on, and whether a reply in the thread named another load; a file on the load by
+    being there."""
+    if d.message_id:
+        routing, conflicted = filing._routing_of(conn, load_id, d.sha256)
+        how = {"subject": "the load number in its subject", "thread": "the thread bound to the load",
+               "paper": "the numbers on the paper"}.get(routing or "", "the thread bound to the load")
+        return f"sent on load {load_id}'s email chain ({how})", bool(conflicted)
+    return f"on load {load_id} in TransportPro ({d.arrived})", False
+
+
+def destination_match(ex, load: dict) -> str | None:
+    """How the receipt names the load's destination, or None: its facility - the consignee as the reader
+    read it, else the shipper, for a slip that says the work was loading - is in the delivery stop's city
+    and shares its street (same_street) or its name (same_name). A city alone is every load on the lane."""
+    loc = (stop_of(load, "CN") or {}).get("location") or {}
+    if not loc.get("city"):
+        return None
+    for party in (ex.consignee, ex.shipper):
+        if party is None or not party.city or _norm(party.city) != _norm(loc["city"]):
+            continue
+        if same_street(getattr(party, "address", None), loc.get("address")):
+            return f"destination {loc.get('address')}, {loc['city']} is on the receipt"
+        if same_name(party.name, loc.get("companyName")):
+            return f"destination {loc.get('companyName')}, {loc['city']} is on the receipt"
+    return None
+
+
+def lumper_detail(ex) -> list[str]:
+    """What a lumper receipt shows beyond its kind, for the comment and the sheet: the facility it was
+    paid at - the consignee as the reader read it, else the shipper - and its date."""
+    out: list[str] = []
+    who = next((p.name for p in (ex.consignee, ex.shipper) if p is not None and p.name), None)
+    if who:
+        out.append(" ".join(str(who).split()))
+    when = ex.delivery_date or ex.ship_date or ex.signatures.receiver_date
+    if when:
+        out.append(str(when).strip())
+    return out
 
 
 def _covering(sha: str, mine: list, files: list[OnFile]) -> OnFile | None:
@@ -1895,7 +2074,7 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
     set_docs, set_numbers = set_marks(group)
     rejudged: list[tuple[Decision, Decision | None]] = []
     for dec in sorted(group, key=lambda x: x.doc.order):
-        if _docs_received(load):
+        if kind != LUMPER and _docs_received(load):
             dec.outcome, dec.status = NOT_NEEDED, "NOT NEEDED - the load now shows Documents Received; nothing uploaded"
             dec.final, dec.companion = True, False
             _record(conn, s, row, dec)
@@ -1929,7 +2108,8 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
     for m in members:
         m.doc.data = m.doc.data or doc_bytes(store, tpro, m.doc)
         m.pages, m.left_out = paper_pages(m.ex, page_count(m.doc.data), m.kind,
-                                          riders=POD_RIDERS if kind == "POD" else frozenset())
+                                          roles_up=LUMPER_ROLES if kind == LUMPER else UPLOAD_ROLES,
+                                          riders={"POD": POD_RIDERS, LUMPER: LUMPER_RIDERS}.get(kind, frozenset()))
     without_repeats_across(members)
     data, filename, content_type = upload_payload([only_pages(m.doc.data, m.pages) for m in members if m.pages],
                                                   kind, load_id)
@@ -1983,7 +2163,7 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
         conn.execute("INSERT OR IGNORE INTO filing (load_id, sha256, tpro_file_id, document_type, comment, filed_at) "
                      "VALUES (?,?,?,?,?,?)", (load_id, m.doc.sha256, file_id, upload_as, comment, now))
         notify.record(conn, load_id=load_id, event=notify.FILED, sha256=m.doc.sha256, document_type=upload_as,
-                      filename=m.doc.filename, reason=f"uploaded by the bot as {upload_as}; the page is a {kind}")
+                      filename=m.doc.filename, reason=f"uploaded by the bot as {upload_as}; the page is a {KIND_NAME.get(kind, kind)}")
     conn.execute("UPDATE load SET next_check_at=? WHERE load_id=?", (now, load_id))
     stats.uploads += 1
     stats.uploaded += len(members)
@@ -2150,9 +2330,10 @@ def upload_payload(parts: list[bytes], kind: str, load_id: int) -> tuple[bytes, 
     is; a photo, several pages, or an iPhone HEIC are made into one PDF first. File History is PDFs -
     TransportPro turns even a driver's texted picture into one - and the pod asked for the bot's
     uploads to match (2535235's emailed photo went up as a JPEG, 24 Sep 2026)."""
+    name = "Lumper" if kind == LUMPER else kind
     if len(parts) == 1 and _kind_of(parts[0]) == "pdf":
-        return parts[0], f"{kind}_{load_id}.pdf", "application/pdf"
-    return combine_pdf(parts, f"{kind} - load {load_id}"), f"{kind}_{load_id}.pdf", "application/pdf"
+        return parts[0], f"{name}_{load_id}.pdf", "application/pdf"
+    return combine_pdf(parts, f"{name} - load {load_id}"), f"{name}_{load_id}.pdf", "application/pdf"
 
 
 def combine_pdf(parts: list[bytes], title: str) -> bytes:
@@ -2196,6 +2377,18 @@ def upload_comment(members: list[Decision], kind: str, load_id: int) -> str:
     """"Doc Intake Bot: POD, signed by Kendyl 9/24/26, 2 pages - load 2562005": what the page is,
     whatever type it went in under."""
     lead = next((m for m in members if m.kind == kind and not m.companion), members[0])
+    if kind == LUMPER:
+        # "Doc Intake Bot: Lumper receipt, Capstone at Walmart DC 6012, 10/13/26 - load 2612789"
+        bits = ["Lumper receipt"] + lumper_detail(lead.ex)
+        pages = sum(_pages_up(m) for m in members)
+        if pages > 1:
+            bits.append(f"{pages} pages")
+        if any(m.ex is not None and m.pages and any(p.role == "dock_sheet" and p.page in m.pages for p in m.ex.pages)
+               for m in members):
+            bits.append("with dock check-in sheet")
+        if lead.refiles:
+            bits.append(f"copy of {lead.refiles}")
+        return f"{BOT}: {', '.join(bits)} - load {load_id}"
     detail = page_detail(lead.ex)
     if kind == "BOL" and not any("signed" in d and "unsigned" not in d for d in detail):
         # The sign-out side carries the signatures on a pick slip; say so rather than "unsigned".
@@ -2232,14 +2425,14 @@ def _record(conn, s: Settings, row, dec: Decision, *, upload_as: str = "", comme
     values = sheet_row(s, row, dec, upload_as=upload_as, comment=comment, group=group) if logged else None
     conn.execute(
         "INSERT INTO autofile (load_id, sha256, source, outcome, final, status, row_json, logged, tpro_file_id, "
-        "attempts, decided_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+        "attempts, decided_at, kind) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(load_id, sha256) DO UPDATE SET source=excluded.source, outcome=excluded.outcome, "
         "final=excluded.final, status=excluded.status, row_json=excluded.row_json, logged=excluded.logged, "
         "tpro_file_id=COALESCE(excluded.tpro_file_id, autofile.tpro_file_id), attempts=excluded.attempts, "
-        "decided_at=excluded.decided_at WHERE autofile.final = 0 OR excluded.outcome = 'uploaded'",
+        "decided_at=excluded.decided_at, kind=excluded.kind WHERE autofile.final = 0 OR excluded.outcome = 'uploaded'",
         (int(row["load_id"]), d.sha256, d.source, dec.outcome, 1 if dec.final else 0, dec.status or dec.outcome,
          json.dumps(values) if values is not None else None, logged, dec.tpro_file_id,
-         attempts if attempts is not None else _attempts(conn, int(row["load_id"]), d.sha256), db.now_iso()))
+         attempts if attempts is not None else _attempts(conn, int(row["load_id"]), d.sha256), db.now_iso(), dec.kind))
 
 
 def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: str = "",
@@ -2254,8 +2447,9 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
     read_as = dec.quick
     if ex is not None and dec.kind:
         pages = len(dec.pages) if dec.pages is not None else len(ex.pages)
-        detail = ", ".join(page_detail(ex) + ([f"{pages} pages"] if pages > 1 else []))
-        read_as = dec.kind + (f" - {detail}" if detail else "")
+        shown = lumper_detail(ex) if dec.kind == LUMPER else page_detail(ex)
+        detail = ", ".join(shown + ([f"{pages} pages"] if pages > 1 else []))
+        read_as = KIND_NAME.get(dec.kind, dec.kind) + (f" - {detail}" if detail else "")
     facts = ((f"{len(dec.facts)} fact(s): " + "; ".join(dec.facts)) if dec.facts
              else "not checked - not read in full" if ex is None else "nothing on the page matches")
     if dec.pooled:
@@ -2271,7 +2465,7 @@ def sheet_row(s: Settings, row, dec: Decision, *, upload_as: str = "", comment: 
             dec.tpro_file_id or "", dec.status]
 
 
-def flush_log(conn, log, tabs: dict[int, str] | None = None) -> int:
+def flush_log(conn, log, tabs: dict[int, str] | None = None, lumper_tab: str | None = None) -> int:
     """Send every row whose status the sheet does not show yet. A failure leaves them pending.
 
     Only SHEET_OUTCOMES reach the sheet. Every decision is still recorded in the ledger - the audit
@@ -2281,29 +2475,32 @@ def flush_log(conn, log, tabs: dict[int, str] | None = None) -> int:
     `tabs` maps a terminal to a tab of its own (Settings.tabs, from INTAKE_UPLOAD_TABS): Jesse
     Klingler's pod writes to "Upload Log - Klinger" (30 Sep 2026). Every other pod's rows go to the
     log's own tab. Rows are routed by the load's terminal, and a tab is created with its header the
-    first time it is written."""
+    first time it is written. `lumper_tab` takes every lumper receipt's row (kind LUMPER), whichever
+    pod's load it is on (14 Oct 2026)."""
     tabs = tabs or {}
     marks = ",".join("?" * len(SHEET_OUTCOMES))
 
-    def tab_of(terminal) -> str | None:
+    def tab_of(terminal, kind) -> str | None:
+        if kind == LUMPER and lumper_tab:
+            return lumper_tab
         return tabs.get(int(terminal)) if terminal is not None else None
 
     # Rows the sheet showed that it should not any more: a page that went up inside another page's
     # row. Removed by Ref; a row the pod has marked (Correct? / Pod note) is never removed.
     gone = conn.execute(
-        "SELECT a.load_id, a.sha256, l.terminal FROM autofile a LEFT JOIN load l ON l.load_id = a.load_id "
+        "SELECT a.load_id, a.sha256, a.kind, l.terminal FROM autofile a LEFT JOIN load l ON l.load_id = a.load_id "
         f"WHERE a.logged_status IS NOT NULL AND (a.logged = 0 OR a.outcome NOT IN ({marks}))", SHEET_OUTCOMES).fetchall()
     if gone and hasattr(log, "remove"):
         by_tab: dict[str | None, set[str]] = {}
         for r in gone:
-            by_tab.setdefault(tab_of(r["terminal"]), set()).add(ref(r["load_id"], r["sha256"]))
+            by_tab.setdefault(tab_of(r["terminal"], r["kind"]), set()).add(ref(r["load_id"], r["sha256"]))
         for tab, refs in by_tab.items():
             log.remove(refs, tab=tab)
         for r in gone:
             conn.execute("UPDATE autofile SET logged_status=NULL WHERE load_id=? AND sha256=?",
                          (r["load_id"], r["sha256"]))
     rows = conn.execute(
-        "SELECT a.load_id, a.sha256, a.status, a.row_json, l.terminal FROM autofile a "
+        "SELECT a.load_id, a.sha256, a.status, a.row_json, a.kind, l.terminal FROM autofile a "
         "LEFT JOIN load l ON l.load_id = a.load_id WHERE a.logged=1 AND a.row_json IS NOT NULL "
         f"AND a.outcome IN ({marks}) AND (a.logged_status IS NULL OR a.logged_status != a.status) "
         "ORDER BY a.decided_at, a.load_id", SHEET_OUTCOMES).fetchall()
@@ -2311,7 +2508,7 @@ def flush_log(conn, log, tabs: dict[int, str] | None = None) -> int:
         return 0
     entries: dict[str | None, list] = {}
     for r in rows:
-        entries.setdefault(tab_of(r["terminal"]), []).append((ref(r["load_id"], r["sha256"]), json.loads(r["row_json"])))
+        entries.setdefault(tab_of(r["terminal"], r["kind"]), []).append((ref(r["load_id"], r["sha256"]), json.loads(r["row_json"])))
     n = 0
     for tab, batch in entries.items():
         n += log.write(batch, tab=tab)

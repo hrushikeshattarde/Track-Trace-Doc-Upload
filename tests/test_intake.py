@@ -530,6 +530,167 @@ def test_a_dock_check_in_sheet_rides_with_the_pod() -> None:
           str((outcome, [(u["type"], u["comment"]) for u in tpro.uploads])))
 
 
+def test_lumper_receipts() -> None:
+    """14 Oct 2026: a lumper receipt goes up under TransportPro's Lumper type, one file one upload, on the
+    pod's rule for filing one by hand - the receipt came on the load's own email chain (or was texted
+    onto the load), and the destination, the PO number or the BOL number on it is the load's. Every
+    lumper row, uploaded or held, goes to one tab for every pod, "Upload Log - Lumper". A receipt comes
+    as often after the POD as with it, so a load already showing Documents Received is still looked at
+    for one in its mail of the last week."""
+    print("auto-upload: lumper receipts")
+    import time as _time
+    from intake import autofile
+    from pod_intake.schema import Extraction
+
+    def receipt(load_id, numbers=None, *, facility=None, address=None, city="Atlanta", conf=0.95,
+                roles=("lumper",), date="10/13/26"):
+        r = _reading(load_id, "lumper", numbers=[("PO", f"PO{load_id}")] if numbers is None else numbers, conf=conf, city=city)
+        r["consignee"] = {"name": facility, "city": city, "address": address}
+        r["delivery_date"] = date
+        r["pages"] = [{"page": i, "role": role, "legibility": 0.9} for i, role in enumerate(roles, 1)]
+        return r
+
+    ex = Extraction.model_validate(receipt(1))
+    check("a file read as lumper with a receipt page is a lumper receipt", autofile.is_lumper_receipt(ex))
+    check("one that is only the dock check-in sheet is not",
+          not autofile.is_lumper_receipt(Extraction.model_validate(receipt(1, roles=("dock_sheet",)))))
+    check("nor is a BOL", not autofile.is_lumper_receipt(Extraction.model_validate(_reading(1))))
+    load = _tp_auto(1)
+    load["waypoints"][1]["location"].update({"companyName": "WALMART DC 6012", "address": "1234 Distribution Pkwy"})
+    check("the destination is the facility's name in the delivery city",
+          autofile.destination_match(Extraction.model_validate(receipt(1, facility="Walmart 6012")), load)
+          == "destination WALMART DC 6012, Atlanta is on the receipt")
+    check("or its street", autofile.destination_match(Extraction.model_validate(
+        receipt(1, facility="Capstone Logistics", address="1234 DISTRIBUTION PKWY")), load)
+        == "destination 1234 Distribution Pkwy, Atlanta is on the receipt")
+    check("never the city alone",
+          autofile.destination_match(Extraction.model_validate(receipt(1, facility="Capstone Logistics")), load) is None)
+    check("and not another city's store", autofile.destination_match(Extraction.model_validate(
+        receipt(1, facility="Walmart 6012", city="Macon")), load) is None)
+
+    s = autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_AUTO_TERMINALS": "1160, 1138",
+                                    "INTAKE_UPLOAD_TABS": '{"1160": "Upload Log - Saiz", "1138": "Upload Log - Klingler"}'},
+                                   pods={1160: "Frankie Saiz", 1138: "Jesse Klingler"})
+    check("lumper receipts are on unless switched off, with a tab of their own",
+          s.lumper and s.lumper_tab == "Upload Log - Lumper"
+          and not autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_LUMPER": "off"}).lumper
+          and autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_LUMPER_TAB": "Lumpers"}).lumper_tab == "Lumpers")
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    now = db.now_iso()
+    # A: the receipt, emailed on the load's thread, with the PO.
+    load_row(2600201, "pod_expected", "at consignee")
+    tpro.add(2600201)
+    (a_sha,) = mail(2600201, "m201", [(_picture(201), receipt(2600201, facility="Capstone at Walmart 6012"))], when=now)
+    # B: none of the load's numbers on it, but the facility is the delivery stop - on another pod's load.
+    load_row(2600202, "pod_expected", "delivered", terminal=1138)
+    tpro.add(2600202)
+    tpro.loads[2600202]["load"]["waypoints"][1]["location"].update({"companyName": "WALMART DC 6012", "address": "1234 Distribution Pkwy"})
+    (b_sha,) = mail(2600202, "m202", [(_picture(202), receipt(2600202, numbers=[("Receipt #", "778812")], facility="Walmart 6012"))], when=now)
+    # C: nothing ties it to the load.
+    load_row(2600203, "pod_expected", "delivered")
+    tpro.add(2600203)
+    (c_sha,) = mail(2600203, "m203", [(_picture(203), receipt(2600203, numbers=[("Receipt #", "778813")], facility="Capstone Logistics"))], when=now)
+    # D: the load already shows Documents Received - the receipt came after the POD - with a BOL copy beside it.
+    load_row(2600204, "complete", "delivered")
+    tpro.add(2600204, doc="Documents Received")
+    d_sha, d_bol = mail(2600204, "m204", [(_picture(204), receipt(2600204, facility="Costco 1150")), (_picture(205), _reading(2600204))], when=now)
+    # E: the same receipt is on the load under Lumper already.
+    load_row(2600205, "pod_expected", "delivered")
+    on_lumper = {"id": 601, "fileTypeId": 113, "fileTypeName": "Lumper", "uploadById": 2756, "comments": "lumper",
+                 "dateCreated": "2026-10-13T14:00:00Z"}
+    tpro.add(2600205, files=[(on_lumper, _picture(206))])
+    (e_sha,) = mail(2600205, "m205", [(_picture(206, "JPEG"), receipt(2600205))], when=now)
+    # F: the driver texted the receipt, and TransportPro filed it as Driver Supplied BOL.
+    load_row(2600206, "pod_expected", "at consignee")
+    texted = {"id": 602, "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL", "uploadById": 1,
+              "comments": "Driver Supplied Image - 2600206", "dateCreated": "2026-10-13T15:00:00Z"}
+    tpro.add(2600206, files=[(texted, _picture(207))])
+    on_load(_picture(207), receipt(2600206))
+    # G: a reply in the thread named a different load.
+    load_row(2600207, "pod_expected", "delivered")
+    tpro.add(2600207)
+    (g_sha,) = mail(2600207, "m207", [(_picture(208), receipt(2600207))], when=now)
+    conn.execute("INSERT INTO thread (thread_id, load_id, conflict_flag) VALUES ('tm207', 2600207, 1)")
+    # H: the receipt in the same email as the signed POD.
+    load_row(2600208, "pod_expected", "at consignee")
+    tpro.add(2600208)
+    h_pod, h_rec = mail(2600208, "m208", [(_picture(209), _reading(2600208, "proof_of_delivery", receiver=True)),
+                                          (_picture(210), receipt(2600208))], when=now)
+    # I: three-week-old mail on a finished load is left alone.
+    load_row(2600209, "complete", "delivered")
+    tpro.add(2600209, doc="Documents Received")
+    mail(2600209, "m209", [(_picture(211), receipt(2600209))], when="2026-09-24T12:00:00+00:00")
+
+    st1 = autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    ups: dict[int, list] = {}
+    for u in tpro.uploads:
+        ups.setdefault(u["load"], []).append(u)
+    rows = {(r["load_id"], r["sha256"]): r for r in conn.execute("SELECT * FROM autofile")}
+    a = ups.get(2600201, [{}])[0]
+    check("the receipt goes up under Lumper, as a one-page PDF", a.get("type") == "Lumper" and a.get("filename") == "Lumper_2600201.pdf"
+          and len(autofile.picture_sig(a.get("data") or b"")) == 1
+          and any(f["fileTypeId"] == 113 for f in tpro.loads[2600201]["files"]), st1.line())
+    check("with a comment that says what it is",
+          a.get("comment") == "Doc Intake Bot: Lumper receipt, Capstone at Walmart 6012, 10/13/26 - load 2600201", a.get("comment"))
+    ar = autofile.ref(2600201, a_sha)
+    row = log.rows.get(ar) or [""] * 14
+    check("its row goes to the lumper tab, not the pod's", log.tabs.get(ar) == "Upload Log - Lumper", str(log.tabs.get(ar)))
+    check("and says what was read, the checks, and the type",
+          row[6].startswith("Lumper receipt - Capstone at Walmart 6012") and row[10] == "Lumper" and row[13].startswith("UPLOADED")
+          and row[9] == "all passed (lumper receipt: sent on load 2600201's email chain (the load number in its subject); "
+                        "PO # PO2600201 is on the receipt)"
+          and row[3] == "Frankie Saiz", str(row))
+    check("the ledger keeps the kind", rows[(2600201, a_sha)]["kind"] == "LUMPER" and rows[(2600201, a_sha)]["outcome"] == "uploaded")
+    br = autofile.ref(2600202, b_sha)
+    check("the destination alone ties a receipt to the load", ups.get(2600202, [{}])[0].get("type") == "Lumper"
+          and "destination WALMART DC 6012, Atlanta is on the receipt" in (log.rows.get(br) or [""] * 14)[9], str(log.rows.get(br)))
+    check("whichever pod's load, on the lumper tab", log.tabs.get(br) == "Upload Log - Lumper" and log.rows[br][3] == "Jesse Klingler")
+    cr = autofile.ref(2600203, c_sha)
+    check("a receipt nothing ties to the load is held, on the lumper tab", 2600203 not in ups
+          and rows[(2600203, c_sha)]["outcome"] == "held" and log.tabs.get(cr) == "Upload Log - Lumper"
+          and "nothing on the receipt ties it to the load" in log.rows[cr][13], str(log.rows.get(cr)))
+    check("a receipt that came after the POD goes up on the finished load", ups.get(2600204, [{}])[0].get("type") == "Lumper"
+          and rows[(2600204, d_sha)]["outcome"] == "uploaded", str(rows.get((2600204, d_sha))))
+    check("and the BOL beside it is read once, not needed, and kept off the sheet",
+          d_bol in reads and rows[(2600204, d_bol)]["outcome"] == "not_needed" and autofile.ref(2600204, d_bol) not in log.rows
+          and "Documents Received" in rows[(2600204, d_bol)]["status"], str(dict(rows[(2600204, d_bol)]) if (2600204, d_bol) in rows else None))
+    check("a receipt already on the load under Lumper is not uploaded again", 2600205 not in ups
+          and rows[(2600205, e_sha)]["outcome"] == "on_file", str(dict(rows[(2600205, e_sha)]) if (2600205, e_sha) in rows else None))
+    f = ups.get(2600206, [{}])[0]
+    check("a texted receipt is filed again under Lumper, naming the copy", f.get("type") == "Lumper"
+          and f.get("comment") == "Doc Intake Bot: Lumper receipt, 10/13/26, copy of Driver Supplied BOL 602 - load 2600206", f.get("comment"))
+    check("a receipt whose thread named another load is held", 2600207 not in ups and rows[(2600207, g_sha)]["outcome"] == "held"
+          and "a reply in the email thread named a different load" in rows[(2600207, g_sha)]["status"], str(rows.get((2600207, g_sha))))
+    h = {u["type"]: u for u in ups.get(2600208, [])}
+    check("a POD and a receipt in one email are two uploads, neither carrying the other",
+          set(h) == {"Bill Of Lading", "Lumper"} and all(len(autofile.picture_sig(u["data"])) == 1 for u in h.values())
+          and "lumper" not in h["Bill Of Lading"]["comment"].lower(), str([(u["type"], u["comment"]) for u in ups.get(2600208, [])]))
+    check("old mail on a finished load is left alone", not any(k[0] == 2600209 for k in rows) and 2600209 not in ups)
+    n_reads, n_ups = len(reads), len(tpro.uploads)
+    st2 = autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    check("a second run reads and uploads nothing", len(reads) == n_reads and len(tpro.uploads) == n_ups and st2.logged == 0, st2.line())
+    # A lumper row that leaves the sheet is taken off the lumper tab.
+    conn.execute("UPDATE autofile SET logged=0 WHERE load_id=2600203")
+    autofile.flush_log(conn, log, s.tabs, lumper_tab=s.lumper_tab)
+    check("a lumper row is removed from the lumper tab", cr not in log.rows and log.removed_on.get(cr) == "Upload Log - Lumper")
+
+    # Switched off, a receipt is other paperwork, as before, and finished loads are not looked at.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    off = autofile.Settings(terminals=frozenset({1160}), mode="on", lumper=False)
+    load_row(2600210, "pod_expected", "delivered")
+    tpro.add(2600210)
+    (o_sha,) = mail(2600210, "m210", [(_picture(212), receipt(2600210))], when=now)
+    load_row(2600211, "complete", "delivered")
+    tpro.add(2600211, doc="Documents Received")
+    mail(2600211, "m211", [(_picture(213), receipt(2600211))], when=now)
+    autofile.run(conn, tpro, store, read, _AutoLog(), off, deadline=_time.monotonic() + 600)
+    outcomes = {(r["load_id"], r["sha256"]): r["outcome"] for r in conn.execute("SELECT load_id, sha256, outcome FROM autofile")}
+    check("switched off, a receipt is set aside and a finished load is not looked at",
+          outcomes == {(2600210, o_sha): "not_bol_pod"} and not tpro.uploads, str(outcomes))
+
+
 def test_a_pod_with_a_tab_of_its_own() -> None:
     """30 Sep 2026: Jesse Klingler's pod (terminal 1138) joins the pilot with its own sheet tab,
     "Upload Log - Klinger". Rows are routed by the load's terminal; every other pod keeps the
@@ -3658,7 +3819,7 @@ class _AutoTPro:
             self.fail_uploads -= 1
             raise TProError(500, "/files/upload", "backend hiccup")
         self.next_id += 1
-        f = {"id": self.next_id, "fileTypeId": {"Bill Of Lading": 12, "Driver Supplied BOL": 363}[document_type],
+        f = {"id": self.next_id, "fileTypeId": {"Bill Of Lading": 12, "Driver Supplied BOL": 363, "Lumper": 113}[document_type],
              "fileTypeName": document_type, "comments": comments, "uploadById": 4211,
              "dateCreated": "2026-09-24T15:00:00Z", "fileName": filename}
         self.loads[record_id]["files"].append(f)
@@ -3674,9 +3835,11 @@ class _AutoLog:
         self.tabs: dict[str, str | None] = {}
         self.writes = 0
         self.removed: set[str] = set()
+        self.removed_on: dict[str, str | None] = {}
 
     def remove(self, refs, tab=None):
         for r in refs:
+            self.removed_on[r] = tab
             if self.rows.pop(r, None) is not None:
                 self.removed.add(r)
         return len(refs)
@@ -4708,6 +4871,7 @@ if __name__ == "__main__":
     test_a_pod_short_of_the_confidence_bar_goes_up_when_the_page_corroborates_it()
     test_an_undated_receiver_signature_counts_the_day_it_arrived()
     test_a_dock_check_in_sheet_rides_with_the_pod()
+    test_lumper_receipts()
     test_a_pod_with_a_tab_of_its_own()
     test_a_new_pod_tab_is_styled_like_the_first()
     test_sheet_times_are_eastern()

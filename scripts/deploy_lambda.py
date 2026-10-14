@@ -89,6 +89,9 @@ REPORT_FROM = "DocIntake@circle-analytics.com"
 AUTO_TERMINALS = "1160,1138,1101,1134,1074"
 UPLOAD_TABS = {1160: "Upload Log - Saiz", 1138: "Upload Log - Klingler", 1101: "Upload Log - Boyanowski",
                1134: "Upload Log - Cunningham", 1074: "Upload Log - Paper"}
+# Lumper receipts (14 Oct 2026, autofile.judge_lumper): uploaded under TransportPro's Lumper type and logged,
+# for every pod, on one tab styled like the pod tabs. INTAKE_LUMPER=off switches that rule off alone.
+LUMPER_TAB = "Upload Log - Lumper"
 
 
 def _collector_env(env: dict) -> dict:
@@ -115,6 +118,7 @@ def _worker_env(env: dict) -> dict:
             # sheet id is Circle's and lives in .env, not in this public repository.
             "INTAKE_AUTO_UPLOAD": env.get("INTAKE_AUTO_UPLOAD", "on"), "INTAKE_AUTO_TERMINALS": AUTO_TERMINALS,
             "INTAKE_UPLOAD_TABS": json.dumps({str(k): v for k, v in UPLOAD_TABS.items()}),
+            "INTAKE_LUMPER": "on", "INTAKE_LUMPER_TAB": LUMPER_TAB,
             # A safety limit, not a budget (24 Sep 2026): with the quick look and the brief full read a
             # normal day for the pilot pod is about $1. The limit only stops a runaway.
             "INTAKE_AUTO_DAILY_USD": "50", "INTAKE_AUTO_MAX_READS": "60",

@@ -20,8 +20,9 @@ Carriers and drivers email BOLs and PODs to the `ratecon@` Google Group. Every 1
 - checks the Load Management loads against TransportPro;
 - for the pilot pods (Frankie Saiz 1160, Jesse Klingler 1138, Julialynn Boyanowski 1101, Dalton
   Cunningham 1134 and Paper 1074, by TransportPro terminal), has Claude read the new paperwork
-  and uploads the BOLs and PODs that pass every check;
-- writes what it uploaded, or held back and why, to the pod's **Upload log** Google Sheet.
+  and uploads the BOLs, PODs and, since 14 Oct 2026, lumper receipts that pass every check;
+- writes what it uploaded, or held back and why, to the pod's **Upload log** Google Sheet
+  (lumper receipts to a tab of their own, for every pod).
 
 Nothing depends on one run finishing. Work a run doesn't reach stays recorded as undone, and the
 next run picks it up. [Section 7](#7-when-the-bot-cannot-finish-how-work-carries-over) lists every
@@ -61,7 +62,7 @@ pilot terminals only (`AUTO_TERMINALS` in `scripts/deploy_lambda.py`).
 | IAM roles | `circle-doc-intake-collector`, `-worker`, `-scheduler` | least-privilege policies are in `scripts/deploy_lambda.py` |
 | Logs | `/aws/lambda/<function>` | 90-day retention; one JSON summary line per run |
 | S3 bucket | `INTAKE_S3_BUCKET` in `.env` | kept out of this public repository |
-| Upload log | `INTAKE_UPLOAD_SHEET_ID` in `.env`, one tab per pod from `INTAKE_UPLOAD_TABS`: `Upload Log - Saiz` (1160) and `Upload Log - Klingler` (1138) since 30 Sep 2026, `Upload Log - Boyanowski` (1101), `Upload Log - Cunningham` (1134) and `Upload Log - Paper` (1074) since 12 Oct 2026; a pod with no tab named falls back to `Upload log` | shared with the service account as an editor |
+| Upload log | `INTAKE_UPLOAD_SHEET_ID` in `.env`, one tab per pod from `INTAKE_UPLOAD_TABS`: `Upload Log - Saiz` (1160) and `Upload Log - Klingler` (1138) since 30 Sep 2026, `Upload Log - Boyanowski` (1101), `Upload Log - Cunningham` (1134) and `Upload Log - Paper` (1074) since 12 Oct 2026; a pod with no tab named falls back to `Upload log`. Every pod's lumper receipts go to `Upload Log - Lumper` (`INTAKE_LUMPER_TAB`, 14 Oct 2026) | shared with the service account as an editor |
 | Region | us-east-1 | the AWS account behind `AWS_PROFILE` in `.env`, shared with other projects |
 
 Both functions run from the same zip (`deploy/collector.zip`). Each handler picks its entry point.
@@ -245,10 +246,10 @@ paperwork already on them.
 | `pod_mislabelled` | a read POD sits on the load under a type that doesn't say POD | 1 h | yes |
 | `pod_unverified` | Documents Received on a POD claim nobody has read | 6 h | yes |
 | `pod_unsigned` | Documents Received, but the POD on file has no receiver signature or stamp | 24 h | yes |
-| `complete` | Documents Received | never | no |
+| `complete` | Documents Received | never | only for a lumper receipt in its mail of the last 7 days (6.8) |
 | `out_of_scope` | service level not in scope | 24 h | no |
 | `error` | a TransportPro read failed | 1 h | no |
-| `not_in_view` | left the Load Management view | never | no |
+| `not_in_view` | left the Load Management view | never | only for a lumper receipt in its mail of the last 7 days (6.8) |
 
 Auto-upload works loads in this order: `pod_expected`, `pod_unsigned`, `pod_mislabelled`,
 `pod_unverified`, `wrong_doc_type`, `filed_status_pending`, `bol_expected`, `not_yet_due`
@@ -259,8 +260,8 @@ Auto-upload works loads in this order: `pod_expected`, `pod_unsigned`, `pod_misl
 ## 6. Auto-upload, step by step
 
 Code: [`intake/autofile.py`](../intake/autofile.py). The house rules are in its docstring: only
-BOLs and PODs are ever uploaded or logged, and a POD goes in as Bill Of Lading. Read the docstring
-before changing anything here.
+BOLs, PODs and lumper receipts are ever uploaded or logged, and a POD goes in as Bill Of Lading. Read
+the docstring before changing anything here. Lumper receipts have rules of their own: section 6.8.
 
 ### 6.1 Which loads get looked at
 
@@ -355,7 +356,7 @@ truck's stage.
 | quick look settled it: a texted BOL | on_file | no |
 | quick look settled it: anything else it set aside (a photo, not freight, other paperwork) | not_bol_pod | no |
 | personal ID on the page (licence, passport and similar) | personal_id | no, never uploaded |
-| the AI read it as `other` or `unknown`, or as anything but a BOL or POD (lumper, packing list, photo…) | not_bol_pod (a packing list can still go up inside a BOL or POD upload, 6.5) | no |
+| the AI read it as `other` or `unknown`, or as anything but a BOL, POD or lumper receipt (packing list, photo…) | not_bol_pod (a packing list can still go up inside a BOL or POD upload, 6.5; a lumper receipt is judged by 6.8) | no |
 | **already on the load**: the same bytes, or the same picture page for page, under a type that counts (any paperwork type for a BOL; a clearing type for a POD). Only the file's BOL and POD pages are compared, because those are the only pages an upload carries. | on_file, or uploaded if it's the bot's own earlier upload | no (an upload: yes) |
 | **the load already has one**. For a BOL: type 12, or a Driver Supplied BOL that reads as a BOL or POD. For a POD: type 360 or 53, or type 12 with a POD comment or that reads as a POD. | not_needed | no |
 | a Driver Supplied BOL on the load isn't read yet, so there's no telling whether a BOL is there | no decision this run | – |
@@ -518,7 +519,8 @@ is the hand-off to a person.
    25 Sep 2026; before it, 8 of the first 21 uploads carried such pages.
 4. **Type**, set in `filing.FILE_AS` by the manager's rule of 24 Sep 2026:
    - a **POD** goes in as **Bill Of Lading** (12), which clears Waiting for Documents;
-   - a **BOL** goes in as **Driver Supplied BOL** (363), which doesn't.
+   - a **BOL** goes in as **Driver Supplied BOL** (363), which doesn't;
+   - a **lumper receipt** goes in as **Lumper** (113), its own type (6.8).
 5. **Comment**: what the page really is, for example `Doc Intake Bot: POD, signed by M PRI 9/24, 2 pages - load 2572862`.
    When the upload is a copy of a file already on the load, the comment says so:
    `copy of Driver Supplied BOL 31442466 + 31442467`.
@@ -549,6 +551,49 @@ In `dry-run` mode nothing is uploaded and no sheet rows are written. Decisions a
   header row. The first pod tab was formatted by hand; every later one copies it.
 - A row that should no longer show, such as a page that went up inside another row, is deleted,
   unless the pod has written something in O or P.
+- Lumper receipts, uploaded or held, go to one tab for every pod, `Upload Log - Lumper` (6.8). The
+  ledger's `autofile.kind` says which tab a row belongs on.
+
+### 6.8 Lumper receipts (14 Oct 2026)
+
+A file the full read calls a lumper receipt - `document_type` `lumper` with a page of role `lumper`
+(`is_lumper_receipt`; a file that is only the driver's dock check-in sheet is not one and rides with the
+POD as before) - is uploaded under TransportPro's own **Lumper** type (113). The pod filed these by hand
+until now. The rule is the pod's own for filing one: the receipt must have come on the load's chain, and
+the destination, the PO number or the BOL number on it must be the load's. The checks are `judge_lumper`:
+
+| Check | What passes |
+|---|---|
+| confidence | the AI is at least 85% sure it is a lumper receipt (`INTAKE_AUTO_MIN_CONFIDENCE`; no corroboration floor) |
+| chain | an emailed receipt reached the load by its email thread - the load number in the subject, or the thread bound to the load - and no reply in the thread named a different load (`lumper_chain`); a texted receipt is on the load already, as Driver Supplied BOL |
+| tie | a reference number TransportPro holds for the load is printed on the receipt - the PO, the BOL number, the pickup or load number, a number from a stop's notes (`match_facts_detail`) - **or** the receipt names the destination: its facility (the consignee as the reader read it, else the shipper) in the delivery stop's city, sharing its street or its name (`destination_match`, the `same_street` / `same_name` rules of 6.4). A city alone is not enough |
+
+Nothing waits for the truck's stage. The sheet's Checks column reads
+`all passed (lumper receipt: sent on load 2612789's email chain (the load number in its subject); PO # 4501234 is on the receipt)`
+or `... destination WALMART DC 6012, Bentonville is on the receipt)`; a hold says which check failed.
+
+- **One file, one upload.** A receipt never takes companions and never rides inside a BOL or POD upload
+  (`can_join`): a POD emailed beside it goes up as before, without it, and the receipt goes up on its own.
+  Only its receipt pages go up, plus the lumper company's check-in sheet when the same file carries it
+  (`LUMPER_ROLES`, `LUMPER_RIDERS`); a BOL or POD page in a lumper file stays out.
+- **Already on the load** under Lumper, the same bytes or the same picture: on_file, nothing uploaded.
+  Under any other type - a receipt the driver texted, which TransportPro files as Driver Supplied BOL -
+  it goes up again under Lumper and the comment says `copy of Driver Supplied BOL 31442466`. Lumper-type
+  files are downloaded and hashed like paperwork (`HASHED_TYPES`); they are never read.
+- **Comment**: `Doc Intake Bot: Lumper receipt, Capstone at Walmart DC 6012, 10/13/26 - load 2612789`:
+  the facility and the date the reader found, then the page count and the copy it re-files. The reader
+  is told to put the facility that issued the receipt in the consignee block, with its street.
+- **After the POD.** A receipt comes as often after the POD as with it, so a load already showing
+  Documents Received - or gone from the view (`LUMPER_STATES`) - is still looked at when mail of the last
+  7 days (`LUMPER_DAYS`) on it has no final decision (`lumper_loads`). Its emailed files are read like any
+  other; a BOL or POD among them is recorded as not needed, in the ledger only. Older mail on a finished
+  load, and the pictures texted onto it, are left alone.
+- **The sheet.** Every lumper row - uploaded or held - goes to one tab for every pod,
+  `Upload Log - Lumper` (`INTAKE_LUMPER_TAB`), created with the header and the look of the first pod tab
+  on the first write; the Pod column says whose load it is. The ledger's `autofile.kind` (BOL, POD or
+  LUMPER, schema 17) routes it. The morning report lists held receipts with the other holds.
+- `INTAKE_LUMPER=off` switches the rule off: a lumper receipt is then set aside as other paperwork, and
+  finished loads are not looked at.
 
 ---
 
@@ -657,7 +702,7 @@ flowchart TD
 
 ## 8. The ledger
 
-One SQLite file ([`intake/db.py`](../intake/db.py), schema version 16), about 32 MB as of 25 Sep 2026.
+One SQLite file ([`intake/db.py`](../intake/db.py), schema version 17), about 32 MB as of 25 Sep 2026.
 The ledger is the index; S3 is the archive. Two rules carry it:
 
 - `part` is one row per **occurrence** of an attachment, and `attachment` is one row per **unique
@@ -676,7 +721,7 @@ The ledger is the index; S3 is the archive. Two rules carry it:
 | `picture_sig` | unique file | per-page thumbnails for "same picture" checks |
 | `tpro_file` | file on a load in TransportPro | its type, comment, uploader and hash |
 | `load` | load | state, stage, reason, `next_check_at`, `last_checked_at`, `in_view` |
-| `autofile` | (load, document) | the bot's decision: outcome, `final`, status text, sheet row, file id, upload attempts |
+| `autofile` | (load, document) | the bot's decision: outcome, `final`, status text, sheet row, file id, upload attempts, `kind` (BOL, POD or LUMPER, which picks the sheet tab) |
 | `autofile_load` | load | when the bot last looked at it |
 | `filing` | (load, document) uploaded | the double-filing guard |
 | `notification` | event on a load | what the team would be told (recorded, not sent) |
@@ -762,7 +807,7 @@ account is shared with other projects, and the `project=circle-doc-intake` tag i
 cost-allocation tag. To measure spend, use Cost Explorer's resource-level view for the Lambdas,
 bucket and secrets, plus the "Claude Opus 5 (Amazon Bedrock Edition)" service line.
 
-**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 475 offline checks: no network, no
+**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 693 offline checks: no network, no
 model, no credentials. Run it before every deploy.
 
 **Changing the pilot's pods.** Change `AUTO_TERMINALS` in `scripts/deploy_lambda.py` and deploy. A pod that

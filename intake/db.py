@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # Backoff for a failed read, by attempt. After the last one the file is left alone and reported as
 # a permanent failure: a .MOV or a corrupt part fails identically every time, and retrying it on a
@@ -427,6 +427,12 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE TABLE IF NOT EXISTS read_part (sha256 TEXT NOT NULL, first_page INTEGER NOT NULL, "
                      "last_page INTEGER NOT NULL, extraction_json TEXT NOT NULL, model TEXT, cost_usd REAL, read_at TEXT, "
                      "PRIMARY KEY (sha256, first_page))")
+    if have < 17:
+        # Lumper receipts (intake/autofile.py, 14 Oct 2026): what kind of document a decision is about - BOL,
+        # POD or LUMPER - so the Upload log can send every lumper row to the lumper tab, whichever pod's
+        # load it is on. Rows written before carry NULL and are BOLs and PODs.
+        if "kind" not in {r[1] for r in conn.execute("PRAGMA table_info(autofile)")}:
+            conn.execute("ALTER TABLE autofile ADD COLUMN kind TEXT")
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 

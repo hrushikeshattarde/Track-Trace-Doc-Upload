@@ -12,7 +12,7 @@ One invocation:
                    check     then the loads whose next check has come round, oldest first
                  changed + check together stay within INTAKE_LOAD_LIMIT loads a run
                  auto_upload  for the pilot terminals only (INTAKE_AUTO_TERMINALS: the Frankie Saiz
-                             pod from 24 Sep 2026, five pods since 12 Oct): read new BOLs and PODs with the AI, upload what
+                             pod from 24 Sep 2026, five pods since 12 Oct): read new BOLs, PODs and lumper receipts with the AI, upload what
                              passes every check, log every decision to the pod's Upload log sheet -
                              see autofile.py. INTAKE_AUTO_UPLOAD off / dry-run / on switches it
     4. hand the ledger back
@@ -218,7 +218,7 @@ def login_from(secret: str, env) -> dict:
 
 
 def _auto_upload(conn, tpro, store, auto: autofile.Settings, env, deadline: float, failed: list[str]) -> str:
-    """Step 4 for the pilot terminals: read, upload what passes, log every BOL and POD."""
+    """Step 4 for the pilot terminals: read, upload what passes, log every BOL, POD and lumper receipt."""
     from . import aws_lambda, ingest, sheets
     # The brief full read (short notes, low effort) and the quick look that decides which pages need
     # it: measured 24 Sep 2026, the same decisions for about a third of the cost. One read renders at

@@ -1,4 +1,6 @@
-"""The pod's Upload log: one tab of a Google Sheet, one row per BOL or POD the bot decided about.
+"""The pod's Upload log: one tab of a Google Sheet, one row per BOL or POD the bot decided about -
+and, since 14 Oct 2026, one tab for every pod's lumper receipts, "Upload Log - Lumper"
+(autofile.LUMPER_TAB), styled like the pod tabs.
 
 Written as the Gmail service account itself (no `sub`, so no mailbox is impersonated); the sheet is
 shared with that account's address as an editor. Only the Sheets values API is used.
