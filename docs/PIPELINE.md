@@ -572,14 +572,22 @@ Nothing waits for the truck's stage. The sheet's Checks column reads
 `all passed (lumper receipt: sent on load 2612789's email chain (the load number in its subject); PO # 4501234 is on the receipt)`
 or `... destination WALMART DC 6012, Bentonville is on the receipt)`; a hold says which check failed.
 
-- **One file, one upload.** A receipt never takes companions and never rides inside a BOL or POD upload
-  (`can_join`): a POD emailed beside it goes up as before, without it, and the receipt goes up on its own.
-  Only its receipt pages go up, plus the lumper company's check-in sheet when the same file carries it
-  (`LUMPER_ROLES`, `LUMPER_RIDERS`); a BOL or POD page in a lumper file stays out.
+- **The receipts of one sending go up as one file** - one email, or one burst of texts, as a BOL's pages
+  do - and nothing else joins them: a receipt never rides inside a BOL or POD upload and no BOL or POD
+  page rides in a Lumper one (`can_join`). A POD emailed beside a receipt goes up as before, without it,
+  and the receipt goes up on its own. Only receipt pages go up, plus the lumper company's check-in sheet
+  when the same file carries it (`LUMPER_ROLES`, `LUMPER_RIDERS`); two photos of one receipt are one page
+  (`without_repeats_across`).
 - **Already on the load** under Lumper, the same bytes or the same picture: on_file, nothing uploaded.
   Under any other type - a receipt the driver texted, which TransportPro files as Driver Supplied BOL -
   it goes up again under Lumper and the comment says `copy of Driver Supplied BOL 31442466`. Lumper-type
   files are downloaded and hashed like paperwork (`HASHED_TYPES`); they are never read.
+- **The load already has one.** A load with any Lumper file on it, whoever filed it, does not need another
+  (`_has_lumper`, the rule BOLs and PODs follow): the receipt is recorded as not needed, in the ledger
+  only. Load 2573229 (14 Oct 2026, the first run): the driver's photo of a Caribbean Freezer Services
+  receipt went up beside the scan of the same slip filed four days earlier, because a scan and a photo
+  are not the same picture, and the API cannot take a file down. A receipt in a later sending, or a
+  second stop's receipt, on a load that has one is the pod's to file.
 - **Comment**: `Doc Intake Bot: Lumper receipt, Capstone at Walmart DC 6012, 10/13/26 - load 2612789`:
   the facility and the date the reader found, then the page count and the copy it re-files. The reader
   is told to put the facility that issued the receipt in the consignee block, with its street.
@@ -807,7 +815,7 @@ account is shared with other projects, and the `project=circle-doc-intake` tag i
 cost-allocation tag. To measure spend, use Cost Explorer's resource-level view for the Lambdas,
 bucket and secrets, plus the "Claude Opus 5 (Amazon Bedrock Edition)" service line.
 
-**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 693 offline checks: no network, no
+**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 696 offline checks: no network, no
 model, no credentials. Run it before every deploy.
 
 **Changing the pilot's pods.** Change `AUTO_TERMINALS` in `scripts/deploy_lambda.py` and deploy. A pod that

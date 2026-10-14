@@ -20,13 +20,16 @@ of their loads that is not yet complete:
              decision (already on file, not needed, waiting) is kept in the ledger only
 
 Lumper receipts (14 Oct 2026). A file the AI reads as the printed lumper receipt goes up as well, under
-TransportPro's own Lumper type - one file, one upload, never inside a BOL or POD and never with one
-inside it (judge_lumper). Its checks are the pod's rule for filing one by hand: the AI is at least 85%
+TransportPro's own Lumper type - the receipts of one sending as one file, never inside a BOL or POD
+and never with one inside it (judge_lumper). Its checks are the pod's rule for filing one by hand: the AI is at least 85%
 sure of it; it reached the load on the load's own email chain - the thread bound to this load, no reply
 naming another - or was texted onto the load; and one thing on it ties it to the load: the destination
 (the receipt's facility in the delivery stop's city, by street or by name), the PO number, the BOL
-number or another reference number TransportPro holds. Nothing waits for the truck's stage. Every
-lumper row, uploaded or held, goes to one tab of the sheet for every pod (Settings.lumper_tab,
+number or another reference number TransportPro holds. Nothing waits for the truck's stage. A load
+that already has a Lumper file does not need another, whoever filed it (_has_lumper, the BOL/POD
+rule): load 2573229, 14 Oct 2026, the driver's photo of a receipt whose scan had been filed four days
+earlier went up as a second copy, and the API cannot delete it. Every lumper row, uploaded or held,
+goes to one tab of the sheet for every pod (Settings.lumper_tab,
 "Upload Log - Lumper"). A receipt comes as often after the POD as with it, so a load already showing
 Documents Received, or gone from the view, is still looked at for one for LUMPER_DAYS after its mail
 arrived; the BOLs and PODs in that mail are read and recorded as not needed, in the ledger only.
@@ -401,9 +404,9 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
             groups: dict[tuple, list[Decision]] = {}
             for dec in decisions:
                 if dec.ready:
-                    # A BOL or POD takes the pages sent with it; a lumper receipt is one file, one upload.
-                    sending = dec.doc.source if dec.kind == LUMPER else (dec.doc.batch or dec.doc.source)
-                    groups.setdefault((sending, dec.kind), []).append(dec)
+                    # The pages sent together go up together - a lumper receipt's too: the receipts of one
+                    # email are one Lumper file - though nothing of another kind joins a lumper set (below).
+                    groups.setdefault((dec.doc.batch or dec.doc.source, dec.kind), []).append(dec)
             # The other pages sent with each document join it - a POD's first, then a BOL's - and a
             # page one set claims leaves every other, so nothing goes up twice.
             claimed: dict[int, tuple] = {}
@@ -1652,6 +1655,13 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
         copy = _covering(d.sha256, mine, [of for of in filed if not counts_as(of, kind)])
         dec.refiles = f"{copy.file.get('fileTypeName')} {copy.file.get('id')}" if copy is not None else ""
     if kind == LUMPER:
+        # Does the load need it? One lumper receipt per load, as one BOL and one POD: a second one is a
+        # copy far more often than a second stop's, and a copy cannot be taken down again.
+        has = _has_lumper(filed)
+        if has is not None:
+            dec.outcome = NOT_NEEDED
+            dec.status = f"NOT NEEDED - the load already has a lumper receipt on file: {has.named()}; nothing uploaded"
+            return dec
         return judge_lumper(conn, s, row, load, d, dec)
     if _docs_received(load):
         # Looked at for a lumper receipt (lumper_loads): its BOLs and PODs are nothing the load needs.
@@ -1847,6 +1857,11 @@ def _has_bol(conn, filed: list[OnFile]) -> tuple[OnFile | None, bool]:
                 return of, False
             unknown = unknown or reads is None
     return None, unknown
+
+
+def _has_lumper(filed: list[OnFile]) -> OnFile | None:
+    """The Lumper file already on the load, if any - the pod's, the bot's or an integration's."""
+    return next((of for of in filed if of.type_id == LUMPER_TYPE), None)
 
 
 def _has_pod(conn, filed: list[OnFile]) -> tuple[OnFile | None, bool]:

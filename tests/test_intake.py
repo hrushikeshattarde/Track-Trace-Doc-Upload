@@ -622,6 +622,18 @@ def test_lumper_receipts() -> None:
     load_row(2600209, "complete", "delivered")
     tpro.add(2600209, doc="Documents Received")
     mail(2600209, "m209", [(_picture(211), receipt(2600209))], when="2026-09-24T12:00:00+00:00")
+    # J: the load already has a Lumper file - a scan of the receipt the driver then photographed (2573229).
+    load_row(2600212, "not_in_view", "delivered")
+    scanned = {"id": 603, "fileTypeId": 113, "fileTypeName": "Lumper", "uploadById": 1, "comments": "2600212",
+               "dateCreated": "2026-10-10T03:50:59Z"}
+    tpro.add(2600212, files=[(scanned, _picture(214))])
+    (j_sha,) = mail(2600212, "m212", [(_picture(215), receipt(2600212, facility="Caribbean Freezer Services"))], when=now)
+    # K: two receipts in one email go up as one Lumper file, and the load then has one: a third, in a
+    # later email, is not needed.
+    load_row(2600213, "pod_expected", "delivered")
+    tpro.add(2600213)
+    k1, k2 = mail(2600213, "m213", [(_picture(216), receipt(2600213)), (_picture(217), receipt(2600213))], when=now)
+    (k3,) = mail(2600213, "m214", [(_picture(218), receipt(2600213))], when=now)
 
     st1 = autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
     ups: dict[int, list] = {}
@@ -668,6 +680,17 @@ def test_lumper_receipts() -> None:
           set(h) == {"Bill Of Lading", "Lumper"} and all(len(autofile.picture_sig(u["data"])) == 1 for u in h.values())
           and "lumper" not in h["Bill Of Lading"]["comment"].lower(), str([(u["type"], u["comment"]) for u in ups.get(2600208, [])]))
     check("old mail on a finished load is left alone", not any(k[0] == 2600209 for k in rows) and 2600209 not in ups)
+    check("a load that already has a Lumper file does not get another, and the ledger says why", 2600212 not in ups
+          and rows[(2600212, j_sha)]["outcome"] == "not_needed" and "already has a lumper receipt on file: Lumper 603" in rows[(2600212, j_sha)]["status"]
+          and autofile.ref(2600212, j_sha) not in log.rows, str(dict(rows[(2600212, j_sha)]) if (2600212, j_sha) in rows else None))
+    k_ups = ups.get(2600213, [])
+    check("two receipts in one email go up as one Lumper file", len(k_ups) == 1 and k_ups[0]["type"] == "Lumper"
+          and len(autofile.picture_sig(k_ups[0]["data"])) == 2 and k_ups[0]["comment"].endswith(", 2 pages - load 2600213")
+          and rows[(2600213, k1)]["outcome"] == "uploaded" and rows[(2600213, k2)]["outcome"] == "uploaded",
+          str([(u["comment"], len(autofile.picture_sig(u["data"]))) for u in k_ups]))
+    check("and a third receipt in a later email is not needed, the load having one",
+          rows[(2600213, k3)]["outcome"] == "not_needed" and "already has a lumper receipt on file" in rows[(2600213, k3)]["status"],
+          str(dict(rows[(2600213, k3)]) if (2600213, k3) in rows else None))
     n_reads, n_ups = len(reads), len(tpro.uploads)
     st2 = autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
     check("a second run reads and uploads nothing", len(reads) == n_reads and len(tpro.uploads) == n_ups and st2.logged == 0, st2.line())
