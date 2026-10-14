@@ -1108,6 +1108,14 @@ def test_lumper_receipts_company_wide() -> None:
     autofile.run(conn, tpro, store, read, _AutoLog(), narrow, deadline=_time.monotonic() + 600, quick=quick)
     check("a narrowed scope leaves other terminals alone", not reads and not tpro.uploads
           and conn.execute("SELECT COUNT(*) FROM autofile").fetchone()[0] == 0)
+    # The other pods' loads come ahead of the pilot's not-yet-due ones in the look order.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    load_row(2600257, "not_yet_due", "dispatched")
+    load_row(2600258, "pod_expected", "at consignee")
+    conn.execute("INSERT INTO load (load_id, state, terminal, in_view, source) VALUES (2600259, 'new', 1078, 0, 'mail')")
+    mail(2600259, "m259", [(_picture(259), receipt(2600259))], when=now)
+    order = [r["load_id"] for r in autofile._loads(conn, frozenset({1160}), lumper=True)]
+    check("a lumper-scope load is looked at before the pilot's not-yet-due loads", order == [2600258, 2600259, 2600257], str(order))
 
 
 def test_one_row_per_load_once_it_has_its_pod() -> None:

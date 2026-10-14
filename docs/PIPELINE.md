@@ -170,7 +170,7 @@ so its working deadline is about 540 s in.
 |---|---|
 | mail | at 40% of the run, about 216 s |
 | load checks | at 150 loads (`INTAKE_LOAD_LIMIT`); no time limit of their own |
-| auto-upload: looking at loads | 300 s before the deadline; loads are looked at four at a time, one TransportPro client per thread (`LOOK_THREADS`, `TransportPro.clone`, 14 Oct 2026) |
+| auto-upload: looking at loads | 240 s before the deadline (the other pods' lumper-scope loads come ahead of the pilot's not-yet-due ones); loads are looked at four at a time, one TransportPro client per thread (`LOOK_THREADS`, `TransportPro.clone`, 14 Oct 2026) |
 | auto-upload: quick looks | at most 60 s (`QUICK_LOOK_S`); a page still waiting gets the full read |
 | auto-upload: full reads | until 90 s before the deadline, six at a time (`READERS`); unfinished reads are abandoned |
 | auto-upload: starting an upload | not with less than 45 s to the deadline |
@@ -866,7 +866,7 @@ account is shared with other projects, and the `project=circle-doc-intake` tag i
 cost-allocation tag. To measure spend, use Cost Explorer's resource-level view for the Lambdas,
 bucket and secrets, plus the "Claude Opus 5 (Amazon Bedrock Edition)" service line.
 
-**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 744 offline checks: no network, no
+**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 745 offline checks: no network, no
 model, no credentials. Run it before every deploy.
 
 **Changing the pilot's pods.** Change `AUTO_TERMINALS` in `scripts/deploy_lambda.py` and deploy. A pod that

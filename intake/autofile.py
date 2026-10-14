@@ -119,7 +119,8 @@ EST_READ_USD = 0.04          # a brief full read, for the safety limit; the reco
 # How sure the quick look must be that a page is a photo before the full read is skipped. On the 24 Sep
 # 2026 pages it never called a BOL or POD a photo at any confidence; 0.8 keeps a margin.
 QUICK_TRUST = 0.8
-LOOK_UNTIL_S = 300           # stop looking at more loads this long before the deadline
+LOOK_UNTIL_S = 240           # stop looking at more loads this long before the deadline (300 until the evening of 14 Oct 2026:
+                             # with six readers the reads no longer need the time, and the look phase was ending early)
 READ_UNTIL_S = 90            # ...stop waiting for reads
 UPLOAD_NEEDS_S = 45          # ...and do not start an upload with less than this left
 MAX_UPLOAD_ATTEMPTS = 3
@@ -809,7 +810,14 @@ def _loads(conn, terminals: frozenset[int], lumper: bool = False,
         f"SELECT * FROM load WHERE in_view=1 AND terminal IN ({marks}) AND state IN "
         f"({','.join('?' * len(LOAD_ORDER))}) ORDER BY CASE state {cases} ELSE 99 END, next_check_at",
         (*sorted(terminals), *LOAD_ORDER)).fetchall()
-    return rows + (lumper_loads(conn, terminals, limit=lumper_limit, scope=lumper_terminals) if lumper else [])
+    if not lumper:
+        return rows
+    # Ahead of the pilot's not-yet-due loads, which are the least urgent and the most numerous (190 in
+    # view on 14 Oct 2026): the first company-wide run looked at 85 pilot loads and ran out of time before
+    # reaching a single other pod's load.
+    urgent = [r for r in rows if r["state"] != "not_yet_due"]
+    later = [r for r in rows if r["state"] == "not_yet_due"]
+    return urgent + lumper_loads(conn, terminals, limit=lumper_limit, scope=lumper_terminals) + later
 
 
 def lumper_loads(conn, pilot: frozenset[int], limit: int = LUMPER_LOADS_PER_RUN,
