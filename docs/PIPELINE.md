@@ -20,7 +20,8 @@ minutes the **worker** Lambda does four things:
 - records that mail in its **ledger**, a SQLite file kept in S3;
 - checks the Load Management loads against TransportPro;
 - for the pilot pods (Frankie Saiz 1160, Jesse Klingler 1138, Julialynn Boyanowski 1101, Dalton
-  Cunningham 1134 and Paper 1074, by TransportPro terminal), has Claude read the new paperwork
+  Cunningham 1134 and Paper 1074, and since 14 Oct 2026 Isiah Greenfield 1076, FT Roewer 1146,
+  Andrew Fischer 1082 and Megan Goodwin 1089, by TransportPro terminal), has Claude read the new paperwork
   and uploads the BOLs, PODs and, since 14 Oct 2026, lumper receipts that pass every check;
 - writes what it uploaded, or held back and why, to the pod's **Upload log** Google Sheet
   (lumper receipts to a tab of their own, for every pod).
@@ -64,7 +65,7 @@ pilot terminals only (`AUTO_TERMINALS` in `scripts/deploy_lambda.py`).
 | Logs | `/aws/lambda/<function>` | 90-day retention; one JSON summary line per run |
 | S3 bucket | `INTAKE_S3_BUCKET` in `.env` | kept out of this public repository |
 | Groups | `INTAKE_GROUPS` on the collector: `ratecon@circledelivers.com,fwefs@circledelivers.com` (14 Oct 2026; the older `INTAKE_GROUP`, one address, still works) | the delegated user is a member of both. The history listing covers the whole mailbox; the groups decide the re-walk window, the sender unwrapping and the envelope's `to_group` |
-| Upload log | `INTAKE_UPLOAD_SHEET_ID` in `.env`, one tab per pod from `INTAKE_UPLOAD_TABS`: `Upload Log - Saiz` (1160) and `Upload Log - Klingler` (1138) since 30 Sep 2026, `Upload Log - Boyanowski` (1101), `Upload Log - Cunningham` (1134) and `Upload Log - Paper` (1074) since 12 Oct 2026; a pod with no tab named falls back to `Upload log`. Every pod's lumper receipts go to `Upload Log - Lumper` (`INTAKE_LUMPER_TAB`, 14 Oct 2026) | shared with the service account as an editor |
+| Upload log | `INTAKE_UPLOAD_SHEET_ID` in `.env`, one tab per pod from `INTAKE_UPLOAD_TABS`: `Upload Log - Saiz` (1160) and `Upload Log - Klingler` (1138) since 30 Sep 2026, `Upload Log - Boyanowski` (1101), `Upload Log - Cunningham` (1134) and `Upload Log - Paper` (1074) since 12 Oct 2026, `Upload Log - Greenfield` (1076), `Upload Log - Roewer` (1146), `Upload Log - Fischer` (1082) and `Upload Log - Goodwin` (1089) since 14 Oct 2026; a pod with no tab named falls back to `Upload log`. Every pod's lumper receipts go to `Upload Log - Lumper` (`INTAKE_LUMPER_TAB`, 14 Oct 2026) | shared with the service account as an editor |
 | Region | us-east-1 | the AWS account behind `AWS_PROFILE` in `.env`, shared with other projects |
 
 Both functions run from the same zip (`deploy/collector.zip`). Each handler picks its entry point.

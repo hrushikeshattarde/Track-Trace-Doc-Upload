@@ -1,9 +1,10 @@
 """Step 4 for the pilot pods: read the new paperwork, upload what passes, log every BOL, POD and lumper receipt.
 
 Runs inside the worker, after the load checks, for the terminals in INTAKE_AUTO_TERMINALS - the
-Frankie Saiz pod (1160) from 24 Sep 2026, Jesse Klingler's (1138) from 30 Sep, and Julialynn
-Boyanowski's (1101), Dalton Cunningham's (1134) and the Paper pod (1074) from 12 Oct 2026. For each
-of their loads that is not yet complete:
+Frankie Saiz pod (1160) from 24 Sep 2026, Jesse Klingler's (1138) from 30 Sep, Julialynn
+Boyanowski's (1101), Dalton Cunningham's (1134) and the Paper pod (1074) from 12 Oct 2026, and Isiah
+Greenfield's (1076), FT Roewer's (1146), Andrew Fischer's (1082) and Megan Goodwin's (1089) from
+14 Oct 2026. For each of their loads that is not yet complete:
 
     look     the load in TransportPro and its File History, downloading paperwork not seen before
     read     new emailed documents (from the S3 archive) and Driver Supplied BOLs somebody else put on

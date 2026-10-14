@@ -938,7 +938,8 @@ def test_a_pod_with_a_tab_of_its_own() -> None:
     spec.loader.exec_module(deploy)
     live = autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_AUTO_TERMINALS": deploy.AUTO_TERMINALS,
                                        "INTAKE_UPLOAD_TABS": json.dumps({str(k): v for k, v in deploy.UPLOAD_TABS.items()})})
-    check("the deployed pods are the five of 12 Oct 2026", live.terminals == frozenset({1160, 1138, 1101, 1134, 1074}), str(live.terminals))
+    check("the deployed pods are the five of 12 Oct 2026 and the four of 14 Oct",
+          live.terminals == frozenset({1160, 1138, 1101, 1134, 1074, 1076, 1146, 1082, 1089}), str(live.terminals))
     check("every deployed pod has a tab of its own", set(live.tabs) == live.terminals, str(live.tabs))
     check("and every tab is named like the log", all(v.startswith("Upload Log - ") for v in live.tabs.values())
           and len(set(live.tabs.values())) == len(live.tabs), str(live.tabs))
