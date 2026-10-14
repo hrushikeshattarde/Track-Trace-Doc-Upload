@@ -3,10 +3,13 @@
 A pod raises an EFS (or Relay) payment - a lumper fee, most often - through a form. The form mails
 fwefs@circledelivers.com as "EFS Request for <load>", one labelled line per field, and whoever issues
 the code replies on the thread with the Money Transfer code, the Report Reference number and the
-amount. Measured 14 Oct 2026 over the 12 messages the chain had ever carried: no attachment came on
-it. What it carries is what the pod paid for the load - the reason, the amount, the PO, the payee -
-which is exactly what ties a lumper receipt to its load when the receipt names none of TransportPro's
-numbers (intake.autofile.judge_lumper). mailsync records each request and its payment in the ledger's
+amount. The form and the code reply carry no attachment; the replies that follow often do (14 Oct
+2026, loads 2610157 and 2605852): the Relay Payments or EFS receipt for the "Unloading payment", a PDF
+with the lumper company's own receipt printed under it, or the pod's printout of the receipt the
+driver texted. Those go down the ordinary path - collected, read, and judged as lumper receipts by
+intake.autofile. What this module keeps is the form: what the pod paid for the load - the reason, the
+amount, the PO, the payee - which ties a lumper receipt to its load when the receipt names none of
+TransportPro's numbers (judge_lumper). mailsync records each request and its payment in the ledger's
 efs_request table; nothing here calls Gmail.
 """
 from __future__ import annotations

@@ -194,8 +194,10 @@ If the load checks run long, auto-upload gets less time. Nothing is lost; the re
    - Pull the load's next check forward to **now**.
    - An `EFS Request for <load>` message on `fwefs@` (14 Oct 2026) is the pod's payment form: its
      reason, amount, PO, payee and carrier go into `efs_request` ([`intake/efs.py`](../intake/efs.py)),
-     and the reply that issued the Money Transfer code completes the row. No attachment has ever come
-     on that chain (12 messages to 14 Oct 2026); the form is the evidence.
+     and the reply that issued the Money Transfer code completes the row. Later replies on the thread
+     often carry the Relay Payments or EFS receipt for the unloading payment, a PDF with the lumper
+     company's own receipt printed under it, or the pod's printout of the receipt the driver texted;
+     those are attachments like any other and go through the read and the lumper checks (6.8).
    - Mail with no load number: its kept parts are recorded as `pending` and the message goes on the
      `unresolved` list.
    - No Gmail, TransportPro or model calls.
