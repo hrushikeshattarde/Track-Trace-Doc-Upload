@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 # Backoff for a failed read, by attempt. After the last one the file is left alone and reported as
 # a permanent failure: a .MOV or a corrupt part fails identically every time, and retrying it on a
@@ -433,6 +433,16 @@ def migrate(conn: sqlite3.Connection) -> None:
         # load it is on. Rows written before carry NULL and are BOLs and PODs.
         if "kind" not in {r[1] for r in conn.execute("PRAGMA table_info(autofile)")}:
             conn.execute("ALTER TABLE autofile ADD COLUMN kind TEXT")
+    if have < 18:
+        # Two Google Groups (14 Oct 2026): which one a message came to, and the EFS payment requests the
+        # pods raise on fwefs@ - the reason, the amount, the PO and the payee the pod paid for a load -
+        # which autofile.judge_lumper counts as evidence for the lumper receipt that follows.
+        if "to_group" not in {r[1] for r in conn.execute("PRAGMA table_info(message)")}:
+            conn.execute("ALTER TABLE message ADD COLUMN to_group TEXT")
+        conn.execute("CREATE TABLE IF NOT EXISTS efs_request (message_id TEXT PRIMARY KEY, thread_id TEXT, "
+                     "load_id INTEGER, reason TEXT, amount TEXT, po TEXT, payee TEXT, carrier TEXT, requester TEXT, "
+                     "channel TEXT, notes TEXT, requested_at TEXT, code TEXT, reference TEXT, paid_amount TEXT, paid_at TEXT)")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_efs_request_load ON efs_request (load_id)")
     if have < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -471,11 +481,41 @@ def message_seen(conn: sqlite3.Connection, message_id: str) -> bool:
 def insert_message(conn: sqlite3.Connection, **f: Any) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO message (message_id, thread_id, internal_date, from_domain, from_internal, "
-        "subject_load_numbers, load_id, routing_tier, part_count, processed_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "subject_load_numbers, load_id, routing_tier, part_count, processed_at, to_group) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (f["message_id"], f["thread_id"], f.get("internal_date"), f.get("from_domain"),
          int(bool(f.get("from_internal"))), f.get("subject_load_numbers"), f.get("load_id"),
-         f.get("routing_tier"), f.get("part_count", 0), now_iso()),
+         f.get("routing_tier"), f.get("part_count", 0), now_iso(), f.get("to_group")),
     )
+
+
+# ------------------------------------------------------------------ EFS requests ----
+
+def upsert_efs_request(conn: sqlite3.Connection, *, message_id: str, thread_id: str, load_id: int | None,
+                       requested_at: str | None, reason=None, amount=None, po=None, payee=None, carrier=None,
+                       requester=None, channel=None, notes=None, **_ignored) -> None:
+    """An EFS payment request from the fwefs@ chain (intake/efs.py), keyed by the form's message."""
+    conn.execute(
+        "INSERT INTO efs_request (message_id, thread_id, load_id, reason, amount, po, payee, carrier, requester, "
+        "channel, notes, requested_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(message_id) DO UPDATE SET load_id=COALESCE(excluded.load_id, efs_request.load_id), "
+        "reason=excluded.reason, amount=excluded.amount, po=excluded.po, payee=excluded.payee, carrier=excluded.carrier, "
+        "requester=excluded.requester, channel=excluded.channel, notes=excluded.notes",
+        (message_id, thread_id, load_id, reason, amount, po, payee, carrier, requester, channel, notes, requested_at))
+
+
+def set_efs_payment(conn: sqlite3.Connection, *, thread_id: str, paid_at: str | None, code=None, reference=None,
+                    amount=None) -> int:
+    """The reply that issued the code, on the request's thread. Returns how many requests it completed."""
+    return conn.execute(
+        "UPDATE efs_request SET code=COALESCE(?, code), reference=COALESCE(?, reference), "
+        "paid_amount=COALESCE(?, paid_amount), paid_at=COALESCE(paid_at, ?) WHERE thread_id=?",
+        (code, reference, amount, paid_at, thread_id)).rowcount
+
+
+def efs_requests(conn: sqlite3.Connection, load_id: int) -> list[sqlite3.Row]:
+    """Every EFS request raised for the load, oldest first."""
+    return conn.execute("SELECT * FROM efs_request WHERE load_id=? ORDER BY requested_at, message_id",
+                        (int(load_id),)).fetchall()
 
 
 # ------------------------------------------------------------------ threads ----

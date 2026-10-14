@@ -18,7 +18,13 @@ from typing import Any
 
 from . import collector, gmail as gm, store as s3store
 
-GROUP = "ratecon@circledelivers.com"
+# The Google Groups collected (two since 14 Oct 2026): ratecon@, where carriers and drivers send their
+# paperwork, and fwefs@, where the pods raise EFS payment requests - lumper fees among them. INTAKE_GROUPS
+# lists them; the older INTAKE_GROUP, one address, still works. The history listing covers the whole
+# delegated mailbox either way; the groups decide the re-walk window after an outage, the sender
+# unwrapping, and which chain the envelope says a message came to.
+GROUPS = ("ratecon@circledelivers.com", "fwefs@circledelivers.com")
+GROUP = GROUPS[0]
 
 # Kept back from the timeout so a run that is stopped by its deadline still writes its bookmark.
 RESERVE_S = 30
@@ -33,7 +39,7 @@ def handler(event: dict | None, context: Any) -> dict:
     store = s3store.Store(env["INTAKE_S3_BUCKET"], env.get("INTAKE_S3_PREFIX", ""), client=boto3.client("s3"))
     gmail = gm.Delegated(_service_account(env["INTAKE_GMAIL_SECRET"]), subject=env["PAYBOT_GMAIL_USER"])
 
-    st = collector.run(gmail, store, group=env.get("INTAKE_GROUP", GROUP),
+    st = collector.run(gmail, store, group=env.get("INTAKE_GROUPS") or env.get("INTAKE_GROUP") or GROUPS,
                        max_messages=int(env.get("INTAKE_MAX_MESSAGES", "400")),
                        deadline=started + remaining - RESERVE_S,
                        bookmark_key=env.get("INTAKE_BOOKMARK_KEY", collector.BOOKMARK_KEY))

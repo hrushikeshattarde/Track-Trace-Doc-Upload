@@ -127,6 +127,7 @@ class Extraction(BaseModel):
     times: Times
     pieces: Optional[str] = None
     weight_lbs: Optional[str] = None
+    amount: Optional[str] = Field(default=None, description="The total paid or charged as printed on a receipt or invoice - a lumper receipt's total, e.g. '250.00'. Null when the page shows none.")
     photo_stamp: PhotoStamp = Field(default_factory=PhotoStamp)
     pages: List[PageInfo]
     notes: str = Field(description="Anything a reviewer should know: handwriting, glare, several documents in one file, unusual layout.")

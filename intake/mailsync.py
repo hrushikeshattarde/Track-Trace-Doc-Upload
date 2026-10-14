@@ -13,13 +13,14 @@ is caught by widening `days`, which is safe because a message already seen costs
 """
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import gzip
 import json
 import time
 from dataclasses import dataclass
 
-from . import db, filters, routing, store as s3store
+from . import db, efs, filters, routing, store as s3store
 
 
 @dataclass
@@ -77,7 +78,9 @@ def record(conn, body: dict, key: str, st: IngestStats) -> None:
         db.insert_message(conn, message_id=mid, thread_id=thread_id, internal_date=when,
                           from_domain=domain, from_internal=domain.endswith("circledelivers.com"),
                           subject_load_numbers=",".join(str(x) for x in routing.loads_in(env.get("subject"))) or None,
-                          load_id=load_id, routing_tier=env.get("routing_tier"), part_count=len(parts))
+                          load_id=load_id, routing_tier=env.get("routing_tier"), part_count=len(parts),
+                          to_group=env.get("to_group"))
+        _record_efs(conn, body, env, mid, thread_id, when, load_id)
         for i, a in enumerate(parts):
             keep = a.get("decision") == filters.KEEP
             # An unrouted message's documents wait as PENDING, exactly as Loop A leaves them: they are
@@ -108,6 +111,25 @@ def record(conn, body: dict, key: str, st: IngestStats) -> None:
         conn.execute("ROLLBACK")
         raise
     st.ingested += 1
+
+
+def _record_efs(conn, body: dict, env: dict, mid: str, thread_id: str, when: str | None, load_id) -> None:
+    """An EFS payment request on the fwefs@ chain (14 Oct 2026), or the reply that issued its code, into
+    efs_request: what the pod paid for the load - the reason, the amount, the PO, the payee - is evidence
+    for the lumper receipt that comes later (autofile.judge_lumper). Any other mail is left alone."""
+    subject = env.get("subject") or ""
+    named = efs.request_load(subject)
+    if named is None or not body.get("raw_rfc822_b64"):
+        return
+    text = efs.text_of(base64.b64decode(body["raw_rfc822_b64"]))
+    request = efs.parse_request(text)
+    if request is not None:
+        db.upsert_efs_request(conn, message_id=mid, thread_id=thread_id, load_id=load_id or named,
+                              requested_at=when, **request)
+        return
+    payment = efs.parse_payment(text)
+    if payment:
+        db.set_efs_payment(conn, thread_id=thread_id, paid_at=when, **payment)
 
 
 def _keys(store: s3store.Store, prefix: str):

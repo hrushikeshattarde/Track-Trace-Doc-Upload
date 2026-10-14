@@ -127,10 +127,12 @@ def write_bookmark(store: s3store.Store, bm: Bookmark, key: str = BOOKMARK_KEY, 
 
 # -------------------------------------------------------------------------------------- run ----
 
-def run(gmail: gm.Delegated, store: s3store.Store, *, group: str, max_messages: int = 400,
+def run(gmail: gm.Delegated, store: s3store.Store, *, group, max_messages: int = 400,
         deadline: float | None = None, bookmark_key: str = BOOKMARK_KEY, verbose: bool = False) -> Stats:
-    """One collection pass. Returns what it did; st.error is set when it stopped on one."""
+    """One collection pass. Returns what it did; st.error is set when it stopped on one. `group` is the
+    Google Group collected, or several (routing.groups_of): ratecon@ and fwefs@ since 14 Oct 2026."""
     st = Stats()
+    groups = routing.groups_of(group)
     bm = read_bookmark(store, bookmark_key)
     st.cursor_from = bm.history_id
     try:
@@ -140,7 +142,7 @@ def run(gmail: gm.Delegated, store: s3store.Store, *, group: str, max_messages: 
         # everything already stored is found by its key and costs a fetch, never a second copy.
         days = _gap_days(bm.taken_at)
         latest = str(gmail.profile().get("historyId") or "")        # before the search: see ingest
-        refs = gmail.search(f"to:{group} newer_than:{days}d", cap=100_000)
+        refs = _search_groups(gmail, groups, days)
         st.mode = f"re-walk ({days}d, bookmark older than Gmail keeps history)"
         bm.stored = []
     st.listed = len(refs)
@@ -154,7 +156,7 @@ def run(gmail: gm.Delegated, store: s3store.Store, *, group: str, max_messages: 
             st.stopped_by = "message cap" if i >= max_messages else "time limit"
             break
         try:
-            _collect_one(gmail, store, ref, group=group, st=st, verbose=verbose)
+            _collect_one(gmail, store, ref, group=groups, st=st, verbose=verbose)
         except Exception as e:                                   # noqa: BLE001 - saved, then reported
             # Stop here rather than skip it: a Gmail outage or an S3 refusal is not an absence, and
             # moving past this message would lose it. What finished before it is kept.
@@ -173,7 +175,16 @@ def run(gmail: gm.Delegated, store: s3store.Store, *, group: str, max_messages: 
     return st
 
 
-def _collect_one(gmail: gm.Delegated, store: s3store.Store, ref: dict, *, group: str, st: Stats,
+def _search_groups(gmail: gm.Delegated, groups: list[str], days: int) -> list[dict]:
+    """The re-walk window over every group, each message once."""
+    seen: dict[str, dict] = {}
+    for g in groups:
+        for r in gmail.search(f"to:{g} newer_than:{days}d", cap=100_000):
+            seen.setdefault(r["id"], r)
+    return list(seen.values())
+
+
+def _collect_one(gmail: gm.Delegated, store: s3store.Store, ref: dict, *, group, st: Stats,
                  verbose: bool) -> None:
     mid = ref["id"]
     try:
@@ -189,8 +200,9 @@ def _collect_one(gmail: gm.Delegated, store: s3store.Store, ref: dict, *, group:
     thread_id = msg.get("threadId") or ref.get("threadId") or mid
     parsed = email.message_from_bytes(raw, policy=policy.default)
     subject = str(parsed.get("Subject") or "")
-    frm = routing.original_sender({"from": str(parsed.get("From") or ""),
-                                   "x-original-sender": str(parsed.get("X-Original-Sender") or "")}, group)
+    headers = {k.lower(): str(v) for k, v in parsed.items()}
+    frm = routing.original_sender(headers, group)
+    came_to = routing.group_addressed(headers, group)        # which chain: ratecon@, fwefs@, or neither
 
     route = routing.resolve(subject, msg.get("snippet"), None)
     if len(routing.loads_in(subject)) != 1 and thread_id != mid:
@@ -228,6 +240,7 @@ def _collect_one(gmail: gm.Delegated, store: s3store.Store, ref: dict, *, group:
     envelope = {"thread_id": thread_id, "load_id": route.load_id, "routing_tier": route.tier,
                 "routing_reason": route.reason, "subject": subject, "from": frm,
                 "from_domain": routing.sender_domain(frm), "internal_date": internal_date,
+                "to_group": came_to,
                 "labels": msg.get("labelIds") or [], "part_count": len(manifest),
                 "collected_by": "collector"}
     put = store.put_mail(message_id=mid, internal_date=internal_date, raw=raw, envelope=envelope,

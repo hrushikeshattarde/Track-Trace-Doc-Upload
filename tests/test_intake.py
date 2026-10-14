@@ -714,6 +714,199 @@ def test_lumper_receipts() -> None:
           outcomes == {(2600210, o_sha): "not_bol_pod"} and not tpro.uploads, str(outcomes))
 
 
+EFS_FORM = """Name of requester: Jennifer Banks
+Requester email: jennifer.banks@circledelivers.com
+Account Manager: Garrett Weybright
+Carrier Rep: Roberto Mitre
+EFS Reason: Lumper
+Payee's name: Jordan Joyce
+Tax ID number: 88-1578877
+Link Y/N: No
+Link for Payment: N/A
+Payment amount: 140.00
+Manager approval needed: $0-$299: No approval needed
+Carrier's name: AHMED
+Carrier's phone number: (817) 670-0559
+EFS or Relay: EFS
+PO #: 112246
+Caller info matches load info: Yes
+Additional Notes: (blank)
+"""
+EFS_REPLY = """Verified per call with driver
+   - Money Transfer code *3448293841*,
+   Report Reference # *165929700*,
+   Amount *140.00*,
+   Issued to *Jordan Joyce Tax ID 88-1578877*,
+   Notes *Lumper for load 2605852*.
+
+On Wed, Oct 14, 2026 at 10:52 AM <formresponse@circledelivers.com> wrote:
+> Name of requester: Jennifer Banks
+> EFS Reason: Lumper
+> Payment amount: 999.00
+> PO #: 999999
+"""
+
+
+def test_two_groups_are_collected() -> None:
+    """14 Oct 2026: the pods raise EFS payment requests on fwefs@circledelivers.com - a form mails the
+    group as "EFS Request for <load>", and the reply carries the Money Transfer code. The collector now
+    knows both groups: the sender unwrapping and the re-walk window cover each, and the envelope says
+    which chain a message came to. The worker records the request's amount, PO and payee in the ledger
+    (intake/efs.py): the chain carries no attachments, so the form is what vouches for a lumper receipt."""
+    print("collector: two groups, and the EFS request in the ledger")
+    from intake import efs
+
+    check("a setting may name one group, a list, or a sequence",
+          routing.groups_of("ratecon@circledelivers.com") == ["ratecon@circledelivers.com"]
+          and routing.groups_of("ratecon@circledelivers.com, fwefs@circledelivers.com") == ["ratecon@circledelivers.com", "fwefs@circledelivers.com"]
+          and routing.groups_of(("a@x.com", "b@x.com")) == ["a@x.com", "b@x.com"] and routing.groups_of(None) == [])
+    groups = ["ratecon@circledelivers.com", "fwefs@circledelivers.com"]
+    check("the group a message came to is read from its recipients or its List-ID",
+          routing.group_addressed({"to": "joe@circledelivers.com", "cc": "FWEFS <fwefs@circledelivers.com>"}, groups) == "fwefs@circledelivers.com"
+          and routing.group_addressed({"to": "joe@circledelivers.com", "list-id": "<fwefs.circledelivers.com>"}, groups) == "fwefs@circledelivers.com"
+          and routing.group_addressed({"to": "ratecon@circledelivers.com"}, groups) == "ratecon@circledelivers.com"
+          and routing.group_addressed({"to": "joe@circledelivers.com"}, groups) is None)
+    check("the sender is unwrapped for either group",
+          routing.original_sender({"from": "FWEFS <fwefs@circledelivers.com>", "x-original-sender": "formresponse@circledelivers.com"}, groups)
+          == "formresponse@circledelivers.com"
+          and routing.original_sender({"from": "Ratecon <ratecon@circledelivers.com>", "x-original-sender": "d@c.example"}, "ratecon@circledelivers.com") == "d@c.example")
+    check("the EFS subject names the load", efs.request_load("Re: EFS Request for 2605852") == 2605852 and efs.request_load("Load 2605852 POD") is None)
+    req = efs.parse_request(EFS_FORM)
+    check("the form is read field by field", req is not None and req["reason"] == "Lumper" and req["amount"] == "140.00"
+          and req["po"] == "112246" and req["payee"] == "Jordan Joyce" and req["carrier"] == "AHMED" and req["notes"] is None, str(req))
+    check("a reply is not a form, and carries the code, the reference and the amount - never the quoted form's",
+          efs.parse_request(EFS_REPLY) is None
+          and efs.parse_payment(EFS_REPLY) == {"code": "3448293841", "reference": "165929700", "amount": "140.00"}, str(efs.parse_payment(EFS_REPLY)))
+    check("amounts are compared as money", efs.money("$1,250.5") == "1250.50" and efs.money("140") == "140.00" and efs.money("n/a") is None)
+
+    page = png(1200, 1600, b"E")
+    msgs = [
+        raw_mail("e1", "te", "EFS Request for 2605852", when_ms=1_758_600_000_000, to="fwefs@circledelivers.com",
+                 frm="FWEFS <fwefs@circledelivers.com>", original="formresponse@circledelivers.com", body=EFS_FORM),
+        raw_mail("e2", "te", "Re: EFS Request for 2605852", when_ms=1_758_600_100_000,
+                 to="jennifer.banks@circledelivers.com, fwefs@circledelivers.com",
+                 frm="Jennifer Banks <jennifer.banks@circledelivers.com>", original=None, body=EFS_REPLY),
+        raw_mail("e3", "tr", "Load 2605852 lumper receipt", when_ms=1_758_600_200_000,
+                 attachments=[("receipt.png", page, "image/png")]),
+        raw_mail("e4", "tp", "lunch?", when_ms=1_758_600_300_000, to="hrushikesh@circledelivers.com",
+                 frm="Pat <pat@circledelivers.com>", original=None),
+    ]
+    gmail = FakeRawGmail(msgs)
+    fake, store = _bookmarked_store()
+    st = collector.run(gmail, store, group=groups)
+    check("every message is stored, as before", st.mail_stored == 4 and not st.error, st.line())
+    e1, e2, e3, e4 = (_mail_obj(fake, store, m) for m in ("e1", "e2", "e3", "e4"))
+    check("the envelope says which chain a message came to",
+          e1["envelope"]["to_group"] == "fwefs@circledelivers.com" and e2["envelope"]["to_group"] == "fwefs@circledelivers.com"
+          and e3["envelope"]["to_group"] == "ratecon@circledelivers.com" and e4["envelope"]["to_group"] is None,
+          str([x["envelope"].get("to_group") for x in (e1, e2, e3, e4)]))
+    check("the fwefs@ rewrite is undone too", e1["envelope"]["from"] == "formresponse@circledelivers.com", e1["envelope"]["from"])
+    check("the EFS mail is routed to its load by the subject", e1["envelope"]["load_id"] == 2605852 and e2["envelope"]["load_id"] == 2605852)
+    gmail.expired = True
+    fake2, store2 = _bookmarked_store()
+    collector.run(gmail, store2, group="ratecon@circledelivers.com, fwefs@circledelivers.com")
+    check("a re-walk after an outage covers both groups",
+          [q.split(" ")[0] for q in gmail.searches] == ["to:ratecon@circledelivers.com", "to:fwefs@circledelivers.com"], str(gmail.searches))
+
+    conn = fresh_db()
+    st2 = mailsync.ingest_recent(conn, store, days=2, today=dt.date(2025, 9, 23))
+    check("the worker records every message, with its chain", st2.ingested == 4
+          and conn.execute("SELECT to_group FROM message WHERE message_id='e1'").fetchone()[0] == "fwefs@circledelivers.com"
+          and conn.execute("SELECT to_group FROM message WHERE message_id='e3'").fetchone()[0] == "ratecon@circledelivers.com"
+          and conn.execute("SELECT to_group FROM message WHERE message_id='e4'").fetchone()[0] is None, st2.line())
+    rows = db.efs_requests(conn, 2605852)
+    check("and the EFS request, completed by the reply that issued the code",
+          len(rows) == 1 and rows[0]["reason"] == "Lumper" and rows[0]["amount"] == "140.00" and rows[0]["po"] == "112246"
+          and rows[0]["payee"] == "Jordan Joyce" and rows[0]["code"] == "3448293841" and rows[0]["reference"] == "165929700"
+          and rows[0]["paid_amount"] == "140.00" and rows[0]["thread_id"] == "te", str([dict(r) for r in rows]))
+    check("a second pass changes nothing", mailsync.ingest_recent(conn, store, days=2, today=dt.date(2025, 9, 23)).ingested == 0
+          and len(db.efs_requests(conn, 2605852)) == 1)
+
+
+def test_efs_requests_vouch_for_a_lumper_receipt() -> None:
+    """14 Oct 2026: what the pod paid for the load on the fwefs@ chain ties the receipt to the load when
+    nothing on the receipt matches TransportPro: the EFS request's PO counts as a reference number of
+    the load's, and a total equal to the EFS lumper payment is a tie of its own. The sheet names the
+    chain a document came on."""
+    print("auto-upload: EFS requests vouch for a lumper receipt")
+    import time as _time
+    from intake import autofile
+    from pod_intake import reader as rd
+    from pod_intake.schema import Extraction
+
+    def receipt(load_id, numbers, *, amount=None, facility=None):
+        r = _reading(load_id, "lumper", numbers=numbers, city="Atlanta")
+        r["consignee"] = {"name": facility, "city": "Atlanta"}
+        r["delivery_date"] = "10/14/26"
+        r["amount"] = amount
+        r["pages"] = [{"page": 1, "role": "lumper", "legibility": 0.9}]
+        return r
+
+    merged = rd.merge_readings([(1, {**receipt(1, [], amount=None), "pages": []}), (11, {**receipt(1, [], amount="140.00"), "pages": []})])
+    check("a reading merged from pieces keeps the total", merged.get("amount") == "140.00", str(merged.get("amount")))
+    ex = Extraction.model_validate(receipt(1, [("PO", "112246")], amount="$140.00"))
+    load = _tp_auto(1)
+    facts, strong = autofile.match_facts_detail(ex, load, extra=[("EFS request PO #", "112246", True)])
+    check("an EFS request's PO is a reference number of the load's", strong == ["EFS request PO # 112246"], str((facts, strong)))
+
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    now = db.now_iso()
+    # A: the receipt names only the lumper company's PO - the one the pod typed on the EFS form.
+    load_row(2600301, "pod_expected", "delivered")
+    tpro.add(2600301)
+    (a_sha,) = mail(2600301, "m301", [(_picture(301), receipt(2600301, [("PO", "112246")], amount="140.00"))], when=now)
+    db.upsert_efs_request(conn, message_id="efs301", thread_id="tefs301", load_id=2600301, requested_at=now,
+                          reason="Lumper", amount="140.00", po="112246", payee="Jordan Joyce")
+    db.set_efs_payment(conn, thread_id="tefs301", paid_at=now, code="3448293841")
+    # B: no number at all on the receipt, but its total is the EFS lumper payment.
+    load_row(2600302, "pod_expected", "delivered")
+    tpro.add(2600302)
+    (b_sha,) = mail(2600302, "m302", [(_picture(302), receipt(2600302, [("Receipt #", "55512")], amount="$250.00", facility="Capstone Logistics"))], when=now)
+    db.upsert_efs_request(conn, message_id="efs302", thread_id="tefs302", load_id=2600302, requested_at=now,
+                          reason="Lumper", amount="250", po=None, payee="Capstone")
+    # C: the same, but the total is not what the pod paid: held, and the hold says so.
+    load_row(2600303, "pod_expected", "delivered")
+    tpro.add(2600303)
+    (c_sha,) = mail(2600303, "m303", [(_picture(303), receipt(2600303, [("Receipt #", "55513")], amount="$275.00", facility="Capstone Logistics"))], when=now)
+    db.upsert_efs_request(conn, message_id="efs303", thread_id="tefs303", load_id=2600303, requested_at=now,
+                          reason="Lumper", amount="250.00", po=None, payee="Capstone")
+    # D: a receipt that came on the fwefs@ chain itself, with TransportPro's PO.
+    load_row(2600304, "pod_expected", "delivered")
+    tpro.add(2600304)
+    (d_sha,) = mail(2600304, "m304", [(_picture(304), receipt(2600304, [("PO", "PO2600304")], amount="90.00"))], when=now)
+    conn.execute("UPDATE message SET to_group='fwefs@circledelivers.com' WHERE message_id='m304'")
+    # E: a detention EFS request is not a lumper payment: its PO still counts, its amount does not.
+    load_row(2600305, "pod_expected", "delivered")
+    tpro.add(2600305)
+    (e_sha,) = mail(2600305, "m305", [(_picture(305), receipt(2600305, [("Receipt #", "55514")], amount="150.00", facility="Capstone Logistics"))], when=now)
+    db.upsert_efs_request(conn, message_id="efs305", thread_id="tefs305", load_id=2600305, requested_at=now,
+                          reason="Detention", amount="150.00", po=None, payee="AHMED")
+
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    ups = {u["load"]: u for u in tpro.uploads}
+    rows = {(r["load_id"], r["sha256"]): r for r in conn.execute("SELECT * FROM autofile")}
+    ar = autofile.ref(2600301, a_sha)
+    check("the EFS request's PO ties the receipt to the load", ups.get(2600301, {}).get("type") == "Lumper"
+          and "EFS request PO # 112246 is on the receipt" in log.rows[ar][9] and "EFS request PO # 112246" in log.rows[ar][8]
+          and "EFS lumper request on the load: $140.00 to Jordan Joyce, PO 112246, code issued" in log.rows[ar][9], str(log.rows.get(ar)))
+    br = autofile.ref(2600302, b_sha)
+    check("a total equal to the EFS lumper payment ties a receipt with no numbers at all", ups.get(2600302, {}).get("type") == "Lumper"
+          and "the receipt's total 250.00 is the EFS lumper payment the pod requested on the load's fwefs@ chain" in log.rows[br][9], str(log.rows.get(br)))
+    cr = autofile.ref(2600303, c_sha)
+    check("a total that is not the payment is held, and the hold says what the pod paid", 2600303 not in ups
+          and rows[(2600303, c_sha)]["outcome"] == "held"
+          and "its total (275.00) is not the EFS lumper payment of $250.00 the pod requested" in rows[(2600303, c_sha)]["status"],
+          str(rows.get((2600303, c_sha), {}) and dict(rows[(2600303, c_sha)])))
+    dr = autofile.ref(2600304, d_sha)
+    check("a document's row names the chain it came on", ups.get(2600304, {}).get("type") == "Lumper"
+          and log.rows[dr][5].startswith("Email ") and " to fwefs@ from " in log.rows[dr][5]
+          and "sent on load 2600304's email chain on fwefs@ (the load number in its subject)" in log.rows[dr][9], str(log.rows.get(dr)))
+    check("a detention payment vouches for nothing", 2600305 not in ups and rows[(2600305, e_sha)]["outcome"] == "held"
+          and "EFS lumper payment" not in rows[(2600305, e_sha)]["status"], str(dict(rows[(2600305, e_sha)])) if (2600305, e_sha) in rows else "no row")
+
+
 def test_a_pod_with_a_tab_of_its_own() -> None:
     """30 Sep 2026: Jesse Klingler's pod (terminal 1138) joins the pilot with its own sheet tab,
     "Upload Log - Klinger". Rows are routed by the load's terminal; every other pod keeps the
@@ -3161,15 +3354,20 @@ def test_unread_documents_are_tagged_unchecked() -> None:
 
 
 def raw_mail(mid: str, thread: str, subject: str, *, when_ms: int, snippet: str = "",
-             attachments: list[tuple[str, bytes, str]] | None = None) -> dict:
+             attachments: list[tuple[str, bytes, str]] | None = None, to: str = "ratecon@circledelivers.com",
+             frm: str = "Ratecon <ratecon@circledelivers.com>", original: str | None = "driver@carrier.example",
+             body: str = "paperwork attached", list_id: str | None = None) -> dict:
     """A message as Gmail's format=raw returns it: the whole RFC822, base64url."""
     from email.message import EmailMessage
     m = EmailMessage()
-    m["From"] = "Ratecon <ratecon@circledelivers.com>"
-    m["X-Original-Sender"] = "driver@carrier.example"
-    m["To"] = "ratecon@circledelivers.com"
+    m["From"] = frm
+    if original:
+        m["X-Original-Sender"] = original
+    m["To"] = to
+    if list_id:
+        m["List-ID"] = list_id
     m["Subject"] = subject
-    m.set_content("paperwork attached")
+    m.set_content(body)
     for name, data, mime in attachments or []:
         maintype, subtype = mime.split("/")
         m.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
@@ -3193,6 +3391,7 @@ class FakeRawGmail:
         self.failing: set[str] = set()
         self.expired = False
         self.searched = ""
+        self.searches: list[str] = []
 
     def profile(self) -> dict:
         return {"historyId": "3000"}
@@ -3207,6 +3406,7 @@ class FakeRawGmail:
 
     def search(self, query: str, cap: int = 2000) -> list[dict]:
         self.searched = query
+        self.searches.append(query)
         return self._refs()
 
     def message(self, message_id: str, fmt: str = "full") -> dict:
@@ -4864,6 +5064,7 @@ if __name__ == "__main__":
     test_collector_resumes_where_it_stopped()
     test_collector_errors_and_deletions()
     test_collector_bookmark_is_guarded()
+    test_two_groups_are_collected()
     test_lambda_wiring()
     test_mail_from_s3_reaches_the_ledger()
     test_the_ledger_goes_back_only_over_what_was_taken()
@@ -4895,6 +5096,7 @@ if __name__ == "__main__":
     test_an_undated_receiver_signature_counts_the_day_it_arrived()
     test_a_dock_check_in_sheet_rides_with_the_pod()
     test_lumper_receipts()
+    test_efs_requests_vouch_for_a_lumper_receipt()
     test_a_pod_with_a_tab_of_its_own()
     test_a_new_pod_tab_is_styled_like_the_first()
     test_sheet_times_are_eastern()

@@ -97,7 +97,10 @@ LUMPER_TAB = "Upload Log - Lumper"
 def _collector_env(env: dict) -> dict:
     return {"INTAKE_S3_BUCKET": env["INTAKE_S3_BUCKET"], "INTAKE_S3_PREFIX": env.get("INTAKE_S3_PREFIX", ""),
             "INTAKE_BOOKMARK_KEY": BOOKMARK_KEY, "INTAKE_GMAIL_SECRET": GMAIL_SECRET,
-            "PAYBOT_GMAIL_USER": env["PAYBOT_GMAIL_USER"], "INTAKE_GROUP": "ratecon@circledelivers.com",
+            # The groups collected (14 Oct 2026): ratecon@ for the paperwork, fwefs@ for the pods' EFS
+            # payment requests, whose amount and PO vouch for a lumper receipt (intake/efs.py).
+            "PAYBOT_GMAIL_USER": env["PAYBOT_GMAIL_USER"],
+            "INTAKE_GROUPS": "ratecon@circledelivers.com,fwefs@circledelivers.com",
             "INTAKE_MAX_MESSAGES": "400"}
 
 

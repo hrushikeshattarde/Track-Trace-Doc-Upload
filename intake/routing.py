@@ -105,7 +105,32 @@ def sender_domain(from_header: str) -> str:
     return addr.split("@")[-1] if "@" in addr else ""
 
 
-def original_sender(headers: dict[str, str], group: str | None) -> str:
+def groups_of(group) -> list[str]:
+    """The group addresses in a setting: one address, a comma- or space-separated list, or a sequence.
+    Two groups since 14 Oct 2026: ratecon@, where carriers and drivers send paperwork, and fwefs@,
+    where the pods raise EFS payment requests - lumper fees among them."""
+    if not group:
+        return []
+    if isinstance(group, str):
+        return [g.strip() for g in re.split(r"[,\s]+", group) if g.strip()]
+    return [str(g).strip() for g in group if str(g).strip()]
+
+
+# Where a message says which group it came to: its recipients, and the list headers Google Groups adds
+# (List-ID carries the address with a dot for the @: <fwefs.circledelivers.com>).
+RECIPIENT_HEADERS = ("to", "cc", "delivered-to", "x-original-to", "list-id", "mailing-list", "x-beenthere")
+
+
+def group_addressed(headers: dict[str, str], group) -> str | None:
+    """Which configured group the message came to, or None for mail that came to none of them."""
+    blob = " ".join(str(headers.get(h) or "") for h in RECIPIENT_HEADERS).lower()
+    for g in groups_of(group):
+        if g.lower() in blob or g.lower().replace("@", ".") in blob:
+            return g
+    return None
+
+
+def original_sender(headers: dict[str, str], group) -> str:
     """Google Groups rewrites From to the group address and hides the real sender in
     X-Original-Sender. Without this every external carrier looks like an internal message.
 
@@ -115,6 +140,7 @@ def original_sender(headers: dict[str, str], group: str | None) -> str:
     reported as one failed step rather than 500 lost messages.
     """
     frm = headers.get("from", "")
-    if group and group.lower() in frm.lower() and headers.get("x-original-sender"):
-        return headers["x-original-sender"]
+    for g in groups_of(group):
+        if g.lower() in frm.lower() and headers.get("x-original-sender"):
+            return headers["x-original-sender"]
     return frm

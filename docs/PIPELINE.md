@@ -12,9 +12,10 @@ hours are US Eastern.
 
 ## 1. In one paragraph
 
-Carriers and drivers email BOLs and PODs to the `ratecon@` Google Group. Every 15 minutes the
-**collector** Lambda copies new mail and its attachments from Gmail into S3. Every 15 minutes the
-**worker** Lambda does four things:
+Carriers and drivers email BOLs and PODs to the `ratecon@` Google Group, and the pods raise EFS
+payment requests - lumper fees among them - on the `fwefs@` group (collected since 14 Oct 2026). Every
+15 minutes the **collector** Lambda copies new mail and its attachments from Gmail into S3. Every 15
+minutes the **worker** Lambda does four things:
 
 - records that mail in its **ledger**, a SQLite file kept in S3;
 - checks the Load Management loads against TransportPro;
@@ -62,6 +63,7 @@ pilot terminals only (`AUTO_TERMINALS` in `scripts/deploy_lambda.py`).
 | IAM roles | `circle-doc-intake-collector`, `-worker`, `-scheduler` | least-privilege policies are in `scripts/deploy_lambda.py` |
 | Logs | `/aws/lambda/<function>` | 90-day retention; one JSON summary line per run |
 | S3 bucket | `INTAKE_S3_BUCKET` in `.env` | kept out of this public repository |
+| Groups | `INTAKE_GROUPS` on the collector: `ratecon@circledelivers.com,fwefs@circledelivers.com` (14 Oct 2026; the older `INTAKE_GROUP`, one address, still works) | the delegated user is a member of both. The history listing covers the whole mailbox; the groups decide the re-walk window, the sender unwrapping and the envelope's `to_group` |
 | Upload log | `INTAKE_UPLOAD_SHEET_ID` in `.env`, one tab per pod from `INTAKE_UPLOAD_TABS`: `Upload Log - Saiz` (1160) and `Upload Log - Klingler` (1138) since 30 Sep 2026, `Upload Log - Boyanowski` (1101), `Upload Log - Cunningham` (1134) and `Upload Log - Paper` (1074) since 12 Oct 2026; a pod with no tab named falls back to `Upload log`. Every pod's lumper receipts go to `Upload Log - Lumper` (`INTAKE_LUMPER_TAB`, 14 Oct 2026) | shared with the service account as an editor |
 | Region | us-east-1 | the AWS account behind `AWS_PROFILE` in `.env`, shared with other projects |
 
@@ -107,7 +109,9 @@ Code: [`intake/aws_lambda.py`](../intake/aws_lambda.py) → [`intake/collector.p
       - otherwise, a single load number in the body snippet;
       - otherwise, **unresolved**.
 
-      A subject naming several loads counts as ambiguous, not decisive.
+      A subject naming several loads counts as ambiguous, not decisive. The envelope also says which
+      group the message came to (`to_group`: `ratecon@`, `fwefs@`, or none), from its recipient and
+      list headers (`routing.group_addressed`).
    3. Take every attachment-like part, largest first, at most 12. The rest are marked `over_part_cap`.
    4. **Free filters** ([`filters.py`](../intake/filters.py)). Everything not dropped here is kept.
 
@@ -188,6 +192,10 @@ If the load checks run long, auto-upload gets less time. Nothing is lost; the re
      - one placeholder `attachment` row per new SHA-256, unread;
      - the thread's binding to the load.
    - Pull the load's next check forward to **now**.
+   - An `EFS Request for <load>` message on `fwefs@` (14 Oct 2026) is the pod's payment form: its
+     reason, amount, PO, payee and carrier go into `efs_request` ([`intake/efs.py`](../intake/efs.py)),
+     and the reply that issued the Money Transfer code completes the row. No attachment has ever come
+     on that chain (12 messages to 14 Oct 2026); the form is the evidence.
    - Mail with no load number: its kept parts are recorded as `pending` and the message goes on the
      `unresolved` list.
    - No Gmail, TransportPro or model calls.
@@ -582,6 +590,13 @@ or `... destination WALMART DC 6012, Bentonville is on the receipt)`; a hold say
   Under any other type - a receipt the driver texted, which TransportPro files as Driver Supplied BOL -
   it goes up again under Lumper and the comment says `copy of Driver Supplied BOL 31442466`. Lumper-type
   files are downloaded and hashed like paperwork (`HASHED_TYPES`); they are never read.
+- **The EFS chain vouches for it** (14 Oct 2026). The pod's EFS request for the load, from `fwefs@`,
+  adds its PO to the load's reference numbers (`efs_facts`, shown as `EFS request PO #`), and when
+  nothing else ties the receipt to the load, a total equal to the EFS lumper payment does
+  (`efs_amount_match`; the reader now transcribes a receipt's total into `amount`). The Checks column
+  then also notes `EFS lumper request on the load: $140.00 to Jordan Joyce, PO 112246, code issued`,
+  and a hold says the total did not match the payment. The sheet's Arrived by column names the chain
+  a document came on when it is known (`Email ... to fwefs@ from ...`).
 - **The load already has one.** A load with any Lumper file on it, whoever filed it, does not need another
   (`_has_lumper`, the rule BOLs and PODs follow): the receipt is recorded as not needed, in the ledger
   only. Load 2573229 (14 Oct 2026, the first run): the driver's photo of a Caribbean Freezer Services
@@ -710,7 +725,7 @@ flowchart TD
 
 ## 8. The ledger
 
-One SQLite file ([`intake/db.py`](../intake/db.py), schema version 17), about 32 MB as of 25 Sep 2026.
+One SQLite file ([`intake/db.py`](../intake/db.py), schema version 18), about 32 MB as of 25 Sep 2026.
 The ledger is the index; S3 is the archive. Two rules carry it:
 
 - `part` is one row per **occurrence** of an attachment, and `attachment` is one row per **unique
@@ -720,7 +735,8 @@ The ledger is the index; S3 is the archive. Two rules carry it:
 
 | Table | One row per | Used for |
 |---|---|---|
-| `message` | Gmail message | routing (load, tier); `message_seen` makes a replay free |
+| `message` | Gmail message | routing (load, tier), `to_group` (which Google Group it came to); `message_seen` makes a replay free |
+| `efs_request` | EFS payment request on `fwefs@` | reason, amount, PO, payee, carrier, and the code once issued: a lumper receipt's evidence (6.8) |
 | `thread` | Gmail thread | the load a thread is bound to |
 | `part` | attachment occurrence | the filter decision (`keep`, `too_small`, …) and its SHA-256 |
 | `attachment` | unique file | the reading (`extraction_json`), cost, error and retry state (`read_attempts`, `next_read_at`) |
@@ -815,7 +831,7 @@ account is shared with other projects, and the `project=circle-doc-intake` tag i
 cost-allocation tag. To measure spend, use Cost Explorer's resource-level view for the Lambdas,
 bucket and secrets, plus the "Claude Opus 5 (Amazon Bedrock Edition)" service line.
 
-**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 696 offline checks: no network, no
+**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 718 offline checks: no network, no
 model, no credentials. Run it before every deploy.
 
 **Changing the pilot's pods.** Change `AUTO_TERMINALS` in `scripts/deploy_lambda.py` and deploy. A pod that

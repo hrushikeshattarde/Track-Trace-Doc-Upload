@@ -316,6 +316,7 @@ class Doc:
     # 24 Sep 2026 and again on 25 Sep beside the Costco sticker it belongs with.
     batches: frozenset[str] = frozenset()
     arrived_at: str | None = None   # when it arrived, ISO UTC: the email's date, or the file's dateCreated
+    to_group: str | None = None     # the Google Group an email came to: ratecon@..., fwefs@... (14 Oct 2026)
 
 
 @dataclass
@@ -819,7 +820,7 @@ def _open(decided: dict, sha: str) -> bool:
 
 def _email_docs(conn, load_id: int) -> list[Doc]:
     rows = conn.execute(
-        "SELECT p.sha256, p.filename, p.part_id, m.message_id, m.internal_date, m.from_domain "
+        "SELECT p.sha256, p.filename, p.part_id, m.message_id, m.internal_date, m.from_domain, m.to_group "
         "FROM part p JOIN message m ON m.message_id = p.message_id "
         "WHERE m.load_id=? AND p.decision='keep' AND p.sha256 IS NOT NULL", (load_id,)).fetchall()
 
@@ -836,10 +837,12 @@ def _email_docs(conn, load_id: int) -> list[Doc]:
         if r["sha256"] in seen:
             continue
         seen.add(r["sha256"])
+        to = r["to_group"]
         out.append(Doc(r["sha256"], r["filename"] or r["sha256"][:12], f"email:{r['message_id']}",
-                       f"Email {eastern(r['internal_date'])} from {r['from_domain'] or 'an unknown sender'}",
+                       f"Email {eastern(r['internal_date'])}" + (f" to {to.split('@')[0]}@" if to else "")
+                       + f" from {r['from_domain'] or 'an unknown sender'}",
                        message_id=r["message_id"], order=i, batch=f"email:{r['message_id']}",
-                       batches=frozenset(sent_in[r["sha256"]]), arrived_at=r["internal_date"]))
+                       batches=frozenset(sent_in[r["sha256"]]), arrived_at=r["internal_date"], to_group=to))
     return out
 
 
@@ -1621,7 +1624,10 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
     else:
         return Decision(d, NOT_PAPERWORK, f"read as {type_name}", ex=ex)
     dec = Decision(d, "ready", kind=kind, ex=ex, conf=ex.document_type_confidence)
-    dec.facts, dec.strong = match_facts_detail(ex, load)
+    # What the pod paid for the load on the fwefs@ chain is evidence for a lumper receipt: the EFS
+    # request's PO is a reference number of the load's as much as TransportPro's are (14 Oct 2026).
+    efs = db.efs_requests(conn, int(row["load_id"])) if kind == LUMPER else []
+    dec.facts, dec.strong = match_facts_detail(ex, load, extra=efs_facts(efs))
     strong = len(dec.strong)
 
     # Already on the load? The same file, or the same picture under a type that counts. Only the pages
@@ -1662,7 +1668,7 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
             dec.outcome = NOT_NEEDED
             dec.status = f"NOT NEEDED - the load already has a lumper receipt on file: {has.named()}; nothing uploaded"
             return dec
-        return judge_lumper(conn, s, row, load, d, dec)
+        return judge_lumper(conn, s, row, load, d, dec, efs=efs)
     if _docs_received(load):
         # Looked at for a lumper receipt (lumper_loads): its BOLs and PODs are nothing the load needs.
         dec.outcome = NOT_NEEDED
@@ -1735,7 +1741,7 @@ def counts_as(of: OnFile, kind: str) -> bool:
     return of.type_id == LUMPER_TYPE
 
 
-def judge_lumper(conn, s: Settings, row, load: dict, d: Doc, dec: Decision) -> Decision:
+def judge_lumper(conn, s: Settings, row, load: dict, d: Doc, dec: Decision, efs: list | None = None) -> Decision:
     """The checks for a lumper receipt (14 Oct 2026) - the pod's rule for filing one by hand: the receipt
     must have come on the load's own chain, and the destination, the PO number or the BOL number on it
     must be the load's.
@@ -1748,11 +1754,15 @@ def judge_lumper(conn, s: Settings, row, load: dict, d: Doc, dec: Decision) -> D
                     PO, the BOL number, the pickup or load number, a number from a stop's notes
                     (match_facts_detail) - or the receipt names the destination: its facility in the
                     delivery stop's city, sharing its street or its name (destination_match). A city
-                    alone is every load on the lane, and is not enough
+                    alone is every load on the lane, and is not enough - or the receipt's total is
+                    the EFS lumper payment the pod requested for the load on the fwefs@ chain
+                    (efs_amount_match, 14 Oct 2026; the request's PO already counts among the load's
+                    reference numbers, efs_facts)
 
     Nothing waits for the truck's stage: the receipt is paid at the dock and comes when it comes. The
     outcome is ready, or held with the check that failed; `allowed` carries the evidence for the sheet."""
     ex = dec.ex
+    efs = efs or []
     if ex.document_type_confidence < s.min_confidence:
         dec.failed.append(f"AI only {ex.document_type_confidence:.0%} sure it is a lumper receipt (needs {s.min_confidence:.0%})")
         dec.why.add("confidence")
@@ -1762,17 +1772,62 @@ def judge_lumper(conn, s: Settings, row, load: dict, d: Doc, dec: Decision) -> D
         dec.why.add("conflict")
     tie = f"{dec.strong[0]} is on the receipt" if dec.strong else destination_match(ex, load)
     if tie is None:
+        tie = efs_amount_match(ex, efs)
+    if tie is None:
         stop = (stop_of(load, "CN") or {}).get("location") or {}
         where = ", ".join(str(x) for x in (stop.get("companyName"), stop.get("city")) if x) or "unknown"
+        paid = [r for r in efs if "lumper" in str(r["reason"] or "").lower()]
         dec.failed.append("nothing on the receipt ties it to the load: none of the load's numbers (PO, BOL, pickup, "
-                          f"load) is on it and its facility is not the delivery stop ({where})")
+                          f"load) is on it and its facility is not the delivery stop ({where})"
+                          + (f"; its total ({_money(ex.amount) or ex.amount or 'none read'}) is not the EFS lumper "
+                             f"payment of ${paid[-1]['amount']} the pod requested" if paid else ""))
         dec.why.add("facts")
     if dec.failed:
         dec.outcome = HELD
         dec.status = f"HELD - lumper receipt: {'; '.join(dec.failed)}; not uploaded, a person should look"
         return dec
-    dec.allowed += [f"lumper receipt: {chain}", tie]
+    dec.allowed += [f"lumper receipt: {chain}", tie] + efs_notes(efs)
     return dec
+
+
+def _money(value) -> str | None:
+    from .efs import money
+    return money(value)
+
+
+def efs_facts(rows: list) -> list[tuple[str, str, bool]]:
+    """The reference numbers the pod's EFS requests for the load add to TransportPro's: the PO typed on
+    the form, for match_facts_detail."""
+    out: list[tuple[str, str, bool]] = []
+    for r in rows or []:
+        if r["po"] and all(r["po"] != v for _, v, _ in out):
+            out.append(("EFS request PO #", str(r["po"]), True))
+    return out
+
+
+def efs_amount_match(ex, rows: list) -> str | None:
+    """Why the receipt is the one the pod paid for - or None: its total is the amount of an EFS lumper
+    request raised for the load on the fwefs@ chain."""
+    from .efs import money
+    total = money(getattr(ex, "amount", None))
+    if not total:
+        return None
+    for r in rows or []:
+        if "lumper" in str(r["reason"] or "").lower() and money(r["amount"]) == total:
+            when = eastern(r["requested_at"]) if r["requested_at"] else "undated"
+            return (f"the receipt's total {total} is the EFS lumper payment the pod requested on the load's fwefs@ "
+                    f"chain ({when}" + (f", to {r['payee']}" if r["payee"] else "") + ")")
+    return None
+
+
+def efs_notes(rows: list) -> list[str]:
+    """What the pod paid for the load, for the sheet's Checks column beside the checks that passed."""
+    out = []
+    for r in rows or []:
+        if "lumper" in str(r["reason"] or "").lower():
+            out.append(f"EFS lumper request on the load: ${r['amount']}" + (f" to {r['payee']}" if r["payee"] else "")
+                       + (f", PO {r['po']}" if r["po"] else "") + (f", code issued" if r["code"] else ""))
+    return out
 
 
 def lumper_chain(conn, load_id: int, d: Doc) -> tuple[str, bool]:
@@ -1783,7 +1838,8 @@ def lumper_chain(conn, load_id: int, d: Doc) -> tuple[str, bool]:
         routing, conflicted = filing._routing_of(conn, load_id, d.sha256)
         how = {"subject": "the load number in its subject", "thread": "the thread bound to the load",
                "paper": "the numbers on the paper"}.get(routing or "", "the thread bound to the load")
-        return f"sent on load {load_id}'s email chain ({how})", bool(conflicted)
+        where = f" on {d.to_group.split('@')[0]}@" if d.to_group else ""
+        return f"sent on load {load_id}'s email chain{where} ({how})", bool(conflicted)
     return f"on load {load_id} in TransportPro ({d.arrived})", False
 
 
@@ -1905,8 +1961,9 @@ def _core(v: str) -> str:
     return re.sub(r"^[A-Z]+|[A-Z]+$", "", v)
 
 
-def load_facts(load: dict) -> list[tuple[str, str, bool, str]]:
-    """(label, comparable value, strong?, as shown) for everything on the load a page can match."""
+def load_facts(load: dict, extra: list[tuple[str, str, bool]] | tuple = ()) -> list[tuple[str, str, bool, str]]:
+    """(label, comparable value, strong?, as shown) for everything on the load a page can match, and
+    for `extra` (label, value, strong?) facts from elsewhere - an EFS request's PO (efs_facts)."""
     facts: list[tuple[str, str, bool, str]] = []
 
     def add(label: str, raw: Any, strong: bool) -> None:
@@ -1928,6 +1985,8 @@ def load_facts(load: dict) -> list[tuple[str, str, bool, str]]:
                         facts.append((label, pv, True, f"{raw} ({part})"))
 
     add("load #", load.get("id"), True)
+    for label, raw, strong_ in extra or ():
+        add(label, raw, strong_)
     for k, v in (load.get("reference") or {}).items():
         if isinstance(v, (str, int, float)):
             if k in _WEAK_REFS:
@@ -1959,11 +2018,12 @@ def match_facts(ex, load: dict) -> tuple[list[str], int]:
     return hits, len(strong)
 
 
-def match_facts_detail(ex, load: dict) -> tuple[list[str], list[str]]:
-    """([every fact that matches], [the reference numbers among them])."""
+def match_facts_detail(ex, load: dict, extra: list[tuple[str, str, bool]] | tuple = ()) -> tuple[list[str], list[str]]:
+    """([every fact that matches], [the reference numbers among them]). `extra` adds facts the load
+    has beyond TransportPro's (load_facts)."""
     page = [(_norm(n.value), _whole(n.value)) for n in ex.numbers]
     page += [("", _whole(x)) for x in (ex.pieces, ex.weight_lbs) if x]
-    facts = load_facts(load)
+    facts = load_facts(load, extra)
     hits: list[str] = []
     strong: list[str] = []
     used: set[int] = set()          # one number on the page is one fact, however many fields it resembles
