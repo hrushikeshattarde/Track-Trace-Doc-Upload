@@ -2186,6 +2186,8 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
                                           roles_up=LUMPER_ROLES if kind == LUMPER else UPLOAD_ROLES,
                                           riders={"POD": POD_RIDERS, LUMPER: LUMPER_RIDERS}.get(kind, frozenset()))
     without_repeats_across(members)
+    if kind == LUMPER:
+        without_same_pictures(conn, members)
     data, filename, content_type = upload_payload([only_pages(m.doc.data, m.pages) for m in members if m.pages],
                                                   kind, load_id)
     comment = upload_comment(members, kind, load_id)
@@ -2353,6 +2355,23 @@ def without_repeats_across(members: list[Decision]) -> None:
             loser.left_out = sorted(loser.left_out + [(ln, "repeat")])
             if loser is first:
                 seen[key] = (m, n)
+
+
+def without_same_pictures(conn, members: list[Decision]) -> None:
+    """Two shots of one receipt sent together go up once. Load 2594934 (14 Oct 2026): the same screenshot
+    of a Capstone receipt was attached twice to one email, and the Lumper file went up with it on both
+    pages. A lumper set takes no companions, so the picture rule companions() applies to a BOL's or POD's
+    second shot is applied here: a member whose kept pages are all the same picture as pages already in
+    the set is left out as a repeat, and the set still records it as uploaded."""
+    kept: list[list[int]] = []
+    for m in sorted(members, key=lambda x: x.doc.order):
+        sig = cached_sig(conn, m.doc.sha256) or []
+        mine = [sig[n - 1] for n in (m.pages or []) if 0 < n <= len(sig)]
+        if mine and kept and all(any(_diff(p, q) < SAME_PICTURE for q in kept) for p in mine):
+            m.left_out = sorted(m.left_out + [(n, "repeat") for n in (m.pages or [])])
+            m.pages = []
+            continue
+        kept.extend(mine)
 
 
 def same_page_by_numbers(a, b, doc_ref: str | None) -> bool:

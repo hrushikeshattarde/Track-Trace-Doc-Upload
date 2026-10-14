@@ -634,6 +634,10 @@ def test_lumper_receipts() -> None:
     tpro.add(2600213)
     k1, k2 = mail(2600213, "m213", [(_picture(216), receipt(2600213)), (_picture(217), receipt(2600213))], when=now)
     (k3,) = mail(2600213, "m214", [(_picture(218), receipt(2600213))], when=now)
+    # L: the same shot of one receipt attached twice to one email (2594934, 14 Oct 2026): it goes up once.
+    load_row(2600214, "pod_expected", "delivered")
+    tpro.add(2600214)
+    l1, l2 = mail(2600214, "m215", [(_picture(219), receipt(2600214)), (_picture(219, "JPEG"), receipt(2600214))], when=now)
 
     st1 = autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
     ups: dict[int, list] = {}
@@ -688,6 +692,12 @@ def test_lumper_receipts() -> None:
           and len(autofile.picture_sig(k_ups[0]["data"])) == 2 and k_ups[0]["comment"].endswith(", 2 pages - load 2600213")
           and rows[(2600213, k1)]["outcome"] == "uploaded" and rows[(2600213, k2)]["outcome"] == "uploaded",
           str([(u["comment"], len(autofile.picture_sig(u["data"]))) for u in k_ups]))
+    l_ups = ups.get(2600214, [])
+    check("the same shot attached twice goes up once, and the row says a page was a repeat",
+          len(l_ups) == 1 and len(autofile.picture_sig(l_ups[0]["data"])) == 1 and "2 pages" not in l_ups[0]["comment"]
+          and rows[(2600214, l1)]["outcome"] == "uploaded" and rows[(2600214, l2)]["outcome"] == "uploaded"
+          and "left out: 1 repeated page" in log.rows[autofile.ref(2600214, l1)][4],
+          str((len(l_ups), [u["comment"] for u in l_ups], log.rows.get(autofile.ref(2600214, l1)))))
     check("and a third receipt in a later email is not needed, the load having one",
           rows[(2600213, k3)]["outcome"] == "not_needed" and "already has a lumper receipt on file" in rows[(2600213, k3)]["status"],
           str(dict(rows[(2600213, k3)]) if (2600213, k3) in rows else None))
