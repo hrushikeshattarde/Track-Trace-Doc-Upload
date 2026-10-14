@@ -1226,6 +1226,143 @@ def test_reads_the_bot_no_longer_pays_for() -> None:
     check("while other paperwork there is still read, for a lumper receipt", b_other in reads)
 
 
+def test_a_bol_copy_is_parked_until_the_consignee() -> None:
+    """14 Oct 2026: 25 of the day's reads, about $1, were emailed pages the quick look was sure were BOLs
+    on loads that had their BOL already, and every one was recorded as not needed after the read. The
+    read cannot simply be dropped - one sure BOL in six is a signed POD by the full read - so the page
+    is parked instead (park_bol): waiting, unread, in the ledger only, while the truck is short of the
+    consignee and the appointment is ahead; not needed once a POD lands or the load shows Documents
+    Received; read and judged as before once the truck is at the consignee without a POD."""
+    print("auto-upload: a BOL copy is parked until the consignee")
+    import hashlib as _h
+    import time as _time
+    from intake import autofile
+
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    log = _AutoLog()
+    said: dict[str, tuple[str, float]] = {}
+    now = db.now_iso()
+
+    def quick(data, filename):
+        return (*said[_h.sha256(data).hexdigest()], "claude-haiku-4-5", 0.002)
+
+    def sha(data):
+        return _h.sha256(data).hexdigest()
+
+    def rep_bol(fid, comment=""):
+        return {"id": fid, "fileTypeId": 12, "fileTypeName": "Bill Of Lading", "uploadById": 4352, "comments": comment,
+                "dateCreated": "2026-10-14T13:00:00Z"}
+
+    def row(load_id, sha_):
+        got = conn.execute("SELECT * FROM autofile WHERE load_id=? AND sha256=?", (load_id, sha_)).fetchone()
+        return dict(got) if got else {}
+
+    def run(settings=s):
+        return autofile.run(conn, tpro, store, read, log, settings, deadline=_time.monotonic() + 600, quick=quick)
+
+    # A: the truck is loaded, the appointment is ahead, the pod filed the BOL. The carrier emails a copy
+    # the quick look is sure is a BOL - which is the signed POD, as one in six is.
+    load_row(2600300, "wrong_doc_type", "loaded")
+    tpro.add(2600300, files=[(rep_bol(301), _picture(300))], delivery="2099-01-01")
+    (a,) = mail(2600300, "m300", [(_picture(301), _reading(2600300, "proof_of_delivery", receiver=True))], when=now)
+    said[sha(_picture(301))] = ("bol", 0.95)
+    # B: the same, the BOL on file as the driver's text; a POD will land by hand.
+    load_row(2600301, "wrong_doc_type", "loaded")
+    texted = {"id": 311, "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL", "uploadById": 1,
+              "comments": "Driver Supplied Image - 2600301", "dateCreated": "2026-10-14T13:00:00Z"}
+    tpro.add(2600301, files=[(texted, _picture(310))], delivery="2099-01-01")
+    said[sha(_picture(310))] = ("bol", 0.95)
+    (b,) = mail(2600301, "m301", [(_picture(311), _reading(2600301))], when=now)
+    said[sha(_picture(311))] = ("bol", 0.9)
+    # C: a page the quick look calls a POD is never parked.
+    load_row(2600302, "wrong_doc_type", "loaded")
+    tpro.add(2600302, files=[(rep_bol(321), _picture(320))], delivery="2099-01-01")
+    (c,) = mail(2600302, "m302", [(_picture(321), _reading(2600302, "proof_of_delivery", receiver=True))], when=now)
+    said[sha(_picture(321))] = ("pod", 0.95)
+    # D: the appointment has passed: read at once, as before.
+    load_row(2600303, "wrong_doc_type", "loaded")
+    tpro.add(2600303, files=[(rep_bol(331), _picture(330))], delivery="2026-10-01")
+    (d_,) = mail(2600303, "m303", [(_picture(331), _reading(2600303))], when=now)
+    said[sha(_picture(331))] = ("bol", 0.95)
+    # E: no BOL on the load: read at once, as before, and it goes up.
+    load_row(2600304, "bol_expected", "loaded")
+    tpro.add(2600304, delivery="2099-01-01")
+    (e,) = mail(2600304, "m304", [(_picture(341), _reading(2600304))], when=now)
+    said[sha(_picture(341))] = ("bol", 0.95)
+    # F: parked, then the load finishes while the bot is not looking (its mail is too old for the lumper
+    # look): the start of the next run withdraws the row from the ledger alone.
+    load_row(2600305, "wrong_doc_type", "loaded")
+    tpro.add(2600305, files=[(rep_bol(351), _picture(350))], delivery="2099-01-01")
+    (f,) = mail(2600305, "m305", [(_picture(351), _reading(2600305))], when="2026-09-01T12:00:00+00:00")
+    said[sha(_picture(351))] = ("bol", 0.95)
+    # G: parked, then the load shows Documents Received on the next look.
+    load_row(2600306, "wrong_doc_type", "loaded")
+    tpro.add(2600306, files=[(rep_bol(361), _picture(360))], delivery="2099-01-01")
+    (g,) = mail(2600306, "m306", [(_picture(361), _reading(2600306))], when=now)
+    said[sha(_picture(361))] = ("bol", 0.95)
+
+    stats = run()
+    check("a sure BOL copy on a load with its BOL, the truck loaded, is parked: not read, waiting, not final, ledger only",
+          a not in reads and row(2600300, a).get("outcome") == "waiting" and row(2600300, a).get("final") == 0
+          and row(2600300, a).get("status", "").startswith("WAITING - a BOL copy by the quick look")
+          and "Bill Of Lading 301" in row(2600300, a)["status"] and "2099-01-01" in row(2600300, a)["status"]
+          and row(2600300, a)["kind"] == "BOL" and autofile.ref(2600300, a) not in log.rows, str(row(2600300, a)))
+    check("so is one whose BOL on file is the driver's text, read as a BOL by the quick look",
+          b not in reads and row(2600301, b).get("outcome") == "waiting" and "Driver Supplied BOL 311" in row(2600301, b).get("status", ""),
+          str(row(2600301, b)))
+    check("the run counts what it parked", stats.parked == 4 and "4 parked" in stats.line(), f"{stats.parked}: {stats.line()}")
+    check("a page the quick look calls a POD is read, whatever the load has on file",
+          c in reads and row(2600302, c).get("outcome") == "waiting" and "receiver-signed" in row(2600302, c).get("status", ""),
+          str(row(2600302, c)))
+    check("a page on a load whose appointment has passed is read at once", d_ in reads and row(2600303, d_).get("outcome") == "not_needed",
+          str(row(2600303, d_)))
+    check("and so is one on a load with no BOL on file, which goes up", e in reads and any(u["load"] == 2600304 for u in tpro.uploads))
+    before = len(reads)
+    run()
+    check("another run with nothing moved leaves the parked pages parked, unread",
+          len(reads) == before and row(2600300, a).get("outcome") == "waiting" and row(2600301, b).get("outcome") == "waiting")
+
+    # A reaches the consignee with no POD on file; B gets a POD by hand; F finished unseen; G shows Documents Received.
+    conn.execute("UPDATE load SET stage='at consignee', last_checked_at=? WHERE load_id=2600300", ("9999-01-01T00:00:00+00:00",))
+    tpro.loads[2600301]["files"].append(rep_bol(312, "POD"))
+    tpro.loads[2600301]["bytes"][312] = _picture(312)
+    conn.execute("UPDATE load SET state='complete', doc_status='Documents Received' WHERE load_id=2600305")
+    tpro.loads[2600306]["load"]["status"]["documentStatus"] = "Documents Received"
+    run()
+    check("at the consignee with no POD the parked page gets the full read - and the POD it was goes up",
+          a in reads and row(2600300, a).get("outcome") == "uploaded"
+          and any(u["load"] == 2600300 and u["type"] == "Bill Of Lading" for u in tpro.uploads), str(row(2600300, a)))
+    check("once a POD is on the load the parked page is not needed, final, still unread",
+          b not in reads and row(2600301, b).get("outcome") == "not_needed" and row(2600301, b).get("final") == 1
+          and "Bill Of Lading 312" in row(2600301, b).get("status", ""), str(row(2600301, b)))
+    check("a parked page on a load that finished while the bot was not looking is withdrawn from the ledger alone",
+          f not in reads and row(2600305, f).get("outcome") == "not_needed" and row(2600305, f).get("final") == 1
+          and "Documents Received" in row(2600305, f).get("status", ""), str(row(2600305, f)))
+    check("and one on a load that shows Documents Received at the next look is not needed, unread",
+          g not in reads and row(2600306, g).get("outcome") == "not_needed" and row(2600306, g).get("final") == 1
+          and "Documents Received" in row(2600306, g).get("status", ""), str(row(2600306, g)))
+    check("nothing parked reached the sheet", not any(r.startswith(f"{lid}-") for r in log.rows for lid in (2600301, 2600305, 2600306)))
+
+    # The switch.
+    off = autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_AUTO_TERMINALS": "1160", "INTAKE_AUTO_PARK_BOL": "off"})
+    check("INTAKE_AUTO_PARK_BOL=off comes from the environment, and on is the default",
+          not off.park_bol and autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_AUTO_TERMINALS": "1160"}).park_bol)
+    load_row(2600307, "wrong_doc_type", "loaded")
+    tpro.add(2600307, files=[(rep_bol(371), _picture(370))], delivery="2099-01-01")
+    (h,) = mail(2600307, "m307", [(_picture(371), _reading(2600307))], when=now)
+    said[sha(_picture(371))] = ("bol", 0.95)
+    run(off)
+    check("with the switch off such a page is read at once, as before", h in reads and row(2600307, h).get("outcome") == "not_needed",
+          str(row(2600307, h)))
+    d = autofile.Doc(h, "x.png", "email:m307", "Email", message_id="m307")
+    ahead = _tp_auto(2600307, delivery="2099-01-01")
+    check("the rule itself answers nothing for an unsure BOL, a POD, or a load with no BOL on file",
+          autofile.park_bol(conn, s, d, ("bol", 0.7), "loaded", ahead, []) is None
+          and autofile.park_bol(conn, s, d, ("pod", 0.95), "loaded", ahead, []) is None
+          and autofile.park_bol(conn, s, d, ("bol", 0.95), "loaded", ahead, []) is None)
+
+
 def test_a_pod_with_a_tab_of_its_own() -> None:
     """30 Sep 2026: Jesse Klingler's pod (terminal 1138) joins the pilot with its own sheet tab,
     "Upload Log - Klinger". Rows are routed by the load's terminal; every other pod keeps the
@@ -5652,6 +5789,7 @@ if __name__ == "__main__":
     test_lumper_receipts_company_wide()
     test_one_row_per_load_once_it_has_its_pod()
     test_reads_the_bot_no_longer_pays_for()
+    test_a_bol_copy_is_parked_until_the_consignee()
     test_a_signature_added_after_pickup_is_the_receivers()
     test_efs_requests_vouch_for_a_lumper_receipt()
     test_a_pod_with_a_tab_of_its_own()

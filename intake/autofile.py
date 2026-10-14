@@ -65,6 +65,15 @@ A document is uploaded only when all of these hold:
 Duplicates are refused three ways: the filing table's key, a fresh File History check against
 every page's picture straight before each upload, and the in-run list of what this run uploaded.
 
+A BOL copy is parked (14 Oct 2026, park_bol). An emailed page the quick look is sure is a BOL, on a
+load that has its BOL already, is not read while the truck is short of the consignee and the delivery
+appointment is ahead: read, such a page was recorded as not needed every time - 25 reads, about $1,
+on 14 Oct 2026 - but one sure BOL in six is the signed POD by the full read, and a load still waiting
+for its POD must have it. So the page waits, in the ledger only, and is looked at again every run:
+not needed once the load has a POD on file or shows Documents Received; read in full, and judged like
+any other page, once the truck is at the consignee or the appointment has passed with no POD on the
+load. INTAKE_AUTO_PARK_BOL=off reads such pages at once, as before.
+
 Modes (INTAKE_AUTO_UPLOAD): off, dry-run (decides and prints, uploads nothing, writes no sheet) and
 on. Nothing else in the service uploads by itself.
 """
@@ -256,6 +265,7 @@ class Settings:
     lumper_loads: int = LUMPER_LOADS_PER_RUN   # loads looked at for a receipt per run beyond the pilot's working loads
     lumper_terminals: frozenset[int] | None = None   # where lumper receipts are handled: None is every terminal
     set_aside: frozenset[str] = SET_ASIDE  # the quick-look answers that spare a page the full read (needs_full_read)
+    park_bol: bool = True         # a sure BOL copy on a load with its BOL waits unread for the consignee (park_bol)
 
     @classmethod
     def from_env(cls, env, pods: dict[int, str] | None = None) -> "Settings":
@@ -276,7 +286,8 @@ class Settings:
                    lumper_loads=int(env.get("INTAKE_LUMPER_LOADS") or LUMPER_LOADS_PER_RUN),
                    lumper_terminals=_terminals_setting(env.get("INTAKE_LUMPER_TERMINALS")),
                    set_aside=(SET_ASIDE - {"rate_confirmation"}
-                              if (env.get("INTAKE_QUICK_RATECON") or "on").strip().lower() == "off" else SET_ASIDE))
+                              if (env.get("INTAKE_QUICK_RATECON") or "on").strip().lower() == "off" else SET_ASIDE),
+                   park_bol=(env.get("INTAKE_AUTO_PARK_BOL") or "on").strip().lower() != "off")
 
 
 @dataclass
@@ -292,6 +303,7 @@ class Stats:
     quick: int = 0
     reused: int = 0
     warmed: int = 0              # prompt-cache warm-ups made before a burst of reads (_warm)
+    parked: int = 0              # pages spared the full read this run as parked BOL copies (park_bol)
     outcomes: dict[str, int] = field(default_factory=dict)
     logged: int = 0
     errors: int = 0
@@ -304,8 +316,9 @@ class Stats:
             return "auto-upload: off"
         by = ", ".join(f"{k.replace('_', ' ')} {v}" for k, v in sorted(self.outcomes.items())) or "no decisions"
         return (f"auto-upload ({self.mode}): {self.looked} load(s) looked at, {self.quick} quick look(s), "
-                f"{self.read} full read(s), {self.reused} reading(s) reused "
-                f"(${self.spent:.2f}; ${self.spent_today:.2f} today), {self.uploads} upload(s) of "
+                f"{self.read} full read(s), {self.reused} reading(s) reused"
+                + (f", {self.parked} parked" if self.parked else "")
+                + f" (${self.spent:.2f}; ${self.spent_today:.2f} today), {self.uploads} upload(s) of "
                 f"{self.uploaded} document(s) | {by} | {self.logged} sheet row(s) written"
                 + (f" | {self.read_failed} read(s) failed" if self.read_failed else "")
                 + (f" | {self.errors} error(s)" if self.errors else "")
@@ -403,6 +416,7 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
     stats.spent_today = float(db.get_state(conn, f"ai_spend:{day}") or 0)
     if reopen_too_long(conn):
         print("  auto-upload: files held as too long under an earlier limit are read now")
+    withdraw_parked(conn)
 
     # 1. look - LOOK_THREADS loads at a time. The TransportPro reads run in threads, one client each;
     #    the ledger is read and written on this thread only.
@@ -1124,6 +1138,9 @@ def _read(conn, store, tpro, read, quick, s: Settings, stats: Stats, plans, dead
            the driver texted while the truck is not at the consignee yet - TransportPro has already
            filed it as Driver Supplied BOL, which is where a BOL belongs, and no POD can be uploaded
            before the consignee anyway
+        2b. a page the quick look is sure is a BOL, on a load that has its BOL, while the truck is
+           short of the consignee: parked unread until it gets there without a POD (park_bol,
+           14 Oct 2026)
         3. the full read (brief, ~$0.04) for everything else: every page that could be a POD or a
            BOL a load still needs, and every page the quick look is unsure of
 
@@ -1175,11 +1192,18 @@ def _read(conn, store, tpro, read, quick, s: Settings, stats: Stats, plans, dead
     if quick is not None:
         _quick_looks(conn, quick, stats, [x for x in left if quick_of(conn, x[2].sha256) is None], deadline)
     full, shas = [], set()
+    loads = {int(row["load_id"]): load for row, load, _, _ in plans}
     for row, filed, d in left:
         q = quick_of(conn, d.sha256) if quick is not None else None
-        if needs_full_read(d, q, (row["stage"] or "").lower(), s.set_aside) and on_file_by_picture(conn, store, tpro, filed, d, q) is None:
-            full.append((row, filed, d))
-            shas.add(d.sha256)
+        stage = (row["stage"] or "").lower()
+        if not needs_full_read(d, q, stage, s.set_aside) or on_file_by_picture(conn, store, tpro, filed, d, q) is not None:
+            continue
+        parked = park_bol(conn, s, d, q, stage, loads.get(int(row["load_id"])), filed)
+        if parked is not None:
+            stats.parked += parked.outcome == WAITING
+            continue
+        full.append((row, filed, d))
+        shas.add(d.sha256)
     # A texted POD takes its other pages into the full read, even ones only looked at before - page 1
     # can be set aside as a BOL while the truck's stage still says loaded, and page 2 arrive signed.
     for row, filed, d in list(full):
@@ -1455,7 +1479,8 @@ def _decide(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnFile]
                            kind=kind, quick=quick)
             dec.on_clearing = hit.type_id in st.CLEARING_TYPES
             return dec
-        return None                                   # not read yet: next run
+        # Parked, not needed, or None: not read yet, next run.
+        return park_bol(conn, s, d, q, (row["stage"] or "").lower(), load, filed)
     return judge(conn, s, row, load, filed, d, json.loads(att["extraction_json"]),
                  sig=lambda: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load))
 
@@ -1493,6 +1518,66 @@ def quick_decision(d: Doc, q: tuple[str, float]) -> Decision:
                                     f"(checked by quick look)", kind="BOL",
                         quick=f"BOL (quick look, {confidence:.0%} sure)")
     return Decision(d, NOT_PAPERWORK, f"quick look: {kind.replace('_', ' ')}")
+
+
+# How a parked page's status starts (park_bol); withdraw_parked finds the rows by it.
+PARKED = "WAITING - a BOL copy by the quick look"
+
+
+def park_bol(conn, s: Settings, d: Doc, q: tuple[str, float] | None, stage: str, load: dict | None,
+             filed: list[OnFile]) -> Decision | None:
+    """Spare an emailed page the full read while nothing could come of it (14 Oct 2026): the quick look
+    is sure it is a BOL, the load has its BOL already (_has_bol), and the truck is short of the consignee
+    with the delivery appointment still ahead. Read, such a page is recorded as not needed - 25 reads,
+    about $1, on 14 Oct 2026, not one of them needed - unless it is the signed POD, which the quick look
+    calls a sure BOL one time in six, and a load still waiting for its POD must have that. So the page
+    is parked: recorded as waiting, in the ledger only, and looked at again every run. Once the load has
+    a POD on file (_has_pod) or shows Documents Received, it is not needed, final. Once the truck is at
+    the consignee, or the appointment has passed, with no POD on the load, it gets the full read and is
+    judged like any other page. INTAKE_AUTO_PARK_BOL=off reads every such page at once.
+
+    The decision that spares the read, or None when the page is to be read. A load that shows Documents
+    Received is settled before this (needs_full_read, quick_decision); one the bot stops looking at
+    before it finishes is tidied by withdraw_parked."""
+    if not s.park_bol or q is None or d.on_file is not None or d.pilot is not True or d.done:
+        return None
+    kind, confidence = q
+    if kind != "bol" or confidence < QUICK_TRUST:
+        return None
+    bol = _has_bol(conn, filed)[0]
+    if bol is None:
+        return None
+    quick = f"BOL (quick look, {confidence:.0%} sure)"
+    pod = _has_pod(conn, filed)[0]
+    if pod is not None:
+        return Decision(d, NOT_NEEDED, f"NOT NEEDED - the load has its BOL ({bol.named()}) and a POD on file: {pod.named()}; "
+                                       f"a BOL copy by the quick look ({confidence:.0%} sure), not read in full",
+                        kind="BOL", quick=quick)
+    if stage in AT_CONSIGNEE:
+        return None
+    t, _ = _appointment(load)
+    if t is not None and dt.datetime.now(dt.timezone.utc) >= t:
+        return None
+    return Decision(d, WAITING, f"{PARKED} ({confidence:.0%} sure), not read in full; the load has its BOL ({bol.named()}); "
+                                f"read if the truck reaches the consignee without a POD"
+                                + (f" or the delivery appointment ({eastern(t)}) passes" if t is not None else ""),
+                    kind="BOL", quick=quick, final=False)
+
+
+def withdraw_parked(conn) -> int:
+    """A parked page (park_bol) on a load the load check has since seen finished - Documents Received -
+    is not needed, and the bot may never look at the load again to say so: a finished load is looked at
+    only for a lumper receipt, and only for LUMPER_DAYS after its mail arrived. Rewritten from the ledger
+    alone, at the start of every run. Returns how many."""
+    rows = conn.execute(
+        "SELECT a.load_id, a.sha256 FROM autofile a JOIN load l ON l.load_id = a.load_id "
+        "WHERE a.outcome=? AND a.final=0 AND a.status LIKE ? AND LOWER(COALESCE(l.doc_status, '')) LIKE '%received%'",
+        (WAITING, f"{PARKED}%")).fetchall()
+    for r in rows:
+        conn.execute("UPDATE autofile SET outcome=?, final=1, status=?, decided_at=? WHERE load_id=? AND sha256=? AND final=0",
+                     (NOT_NEEDED, "NOT NEEDED - the load shows Documents Received; a BOL copy by the quick look, parked unread "
+                                  "while the truck was short of the consignee, and never needed", db.now_iso(), r["load_id"], r["sha256"]))
+    return len(rows)
 
 
 DELIVERY_DAY_SLACK = 1        # a receiver may date the copy the day after the appointment

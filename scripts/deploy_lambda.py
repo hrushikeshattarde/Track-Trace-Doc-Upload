@@ -139,8 +139,9 @@ def _worker_env(env: dict) -> dict:
             # The prompt cache (14 Oct 2026): the reads' 10,125-token instruction sheet lives an hour
             # ("5m" for the old five-minute cache, which was cold at every run), and a run warms it
             # once before its parallel reads start. A sure rate confirmation is set aside by the quick
-            # look, unread ("off" sends them to the full read again).
-            "INTAKE_CACHE_TTL": "1h", "INTAKE_QUICK_RATECON": "on",
+            # look, unread ("off" sends them to the full read again), and a sure BOL copy on a load that
+            # has its BOL waits unread until the truck is at the consignee ("off" reads it at once).
+            "INTAKE_CACHE_TTL": "1h", "INTAKE_QUICK_RATECON": "on", "INTAKE_AUTO_PARK_BOL": "on",
             "INTAKE_GMAIL_SECRET": GMAIL_SECRET, "INTAKE_UPLOAD_SHEET_ID": env["INTAKE_UPLOAD_SHEET_ID"],
             # The bot's own TransportPro login, once an admin has made one and somebody has put it in
             # Secrets Manager as JSON {username, password}. Until then uploads go in as the reading login.
