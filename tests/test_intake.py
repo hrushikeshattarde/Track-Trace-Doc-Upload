@@ -1015,6 +1015,101 @@ def test_a_signature_added_after_pickup_is_the_receivers() -> None:
           str(rows.get((2600245, d2))))
 
 
+def test_lumper_receipts_company_wide() -> None:
+    """14 Oct 2026: lumper receipts are handled on every load in the company, not only the pilot pods'.
+    On another pod's load the bot reads emailed documents only, only when the quick look calls a page
+    other paperwork or cannot tell, files the receipt under Lumper on the lumper tab with the pod named,
+    and leaves that pod's BOLs and PODs alone. A pilot load the load check has not reached yet keeps its
+    BOL waiting for that check."""
+    print("auto-upload: lumper receipts company-wide")
+    import time as _time
+    from intake import autofile
+
+    check("the scope is every terminal unless narrowed",
+          autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on"}).lumper_terminals is None
+          and autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_LUMPER_TERMINALS": "all"}).lumper_terminals is None
+          and autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_LUMPER_TERMINALS": "1160, 1138"}).lumper_terminals == frozenset({1160, 1138}))
+    names = autofile.pod_names({"terminals": [{"id": 1160, "name": "POD (Frankie Saiz)"}, {"id": 1078, "name": "POD (Carrigan Charnstrom)"}],
+                                "non_pod_terminals": [{"id": 1158, "name": "Sales Team"}]})
+    check("the Pod column knows every terminal, pod or not", names == {1160: "Frankie Saiz", 1078: "Carrigan Charnstrom", 1158: "Sales Team"}, str(names))
+
+    def receipt(load_id, facility=None):
+        r = _reading(load_id, "lumper", numbers=[("PO", f"PO{load_id}")], city="Atlanta")
+        r["consignee"] = {"name": facility, "city": "Atlanta"}
+        r["delivery_date"] = "10/14/26"
+        r["pages"] = [{"page": 1, "role": "lumper", "legibility": 0.9}]
+        return r
+
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods=names)
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    now = db.now_iso()
+    quicks: dict[str, tuple[str, float]] = {}
+
+    def quick(data, filename):
+        kind, conf = quicks.get(hashlib.sha256(data).hexdigest(), ("other_paperwork", 0.9))
+        return kind, conf, "claude-haiku-4-5", 0.002
+
+    # A: another pod's load, not in the view, never checked: a receipt and a POD emailed, a picture texted.
+    conn.execute("INSERT INTO load (load_id, state, terminal, customer, in_view, source) VALUES (2600250, 'new', 1078, 'Perdue Farms', 0, 'mail')")
+    texted = {"id": 701, "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL", "uploadById": 1,
+              "comments": "Driver Supplied Image - 2600250", "dateCreated": "2026-10-14T13:00:00Z"}
+    tpro.add(2600250, files=[(texted, _picture(252))])
+    on_load(_picture(252), _reading(2600250, "proof_of_delivery", receiver=True))
+    a_rec, a_pod = mail(2600250, "m250", [(_picture(250), receipt(2600250, facility="Capstone at Albertsons")),
+                                          (_picture(251), _reading(2600250, "proof_of_delivery", receiver=True))], when=now)
+    quicks[a_pod] = ("pod", 0.95)
+    # B: a pilot load the load check has not reached, with a BOL.
+    conn.execute("INSERT INTO load (load_id, state, terminal, in_view, source) VALUES (2600253, 'new', 1160, 0, 'mail')")
+    tpro.add(2600253)
+    (b_bol,) = mail(2600253, "m253", [(_picture(253), _reading(2600253))], when=now)
+    # C: another pod's in-view load whose BOL the quick look could not place: read, then left to that pod.
+    conn.execute("INSERT INTO load (load_id, state, stage, terminal, in_view, source, last_checked_at) VALUES (2600254, 'bol_expected', 'loaded', 1082, 1, 'dashboard', ?)", (now,))
+    tpro.add(2600254)
+    (c_bol,) = mail(2600254, "m254", [(_picture(254), _reading(2600254))], when=now)
+    quicks[c_bol] = ("bol", 0.5)
+    # D: a load the mail created with no terminal at all: TransportPro says whose it is.
+    conn.execute("INSERT INTO load (load_id, state, in_view, source) VALUES (2600255, 'new', 0, 'mail')")
+    tpro.add(2600255)
+    tpro.loads[2600255]["load"]["assignedTerminal"] = 1158
+    (d_rec,) = mail(2600255, "m255", [(_picture(255), receipt(2600255, facility="Capstone at Kroger"))], when=now)
+
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600, quick=quick)
+    ups: dict[int, list] = {}
+    for u in tpro.uploads:
+        ups.setdefault(u["load"], []).append(u)
+    rows = {(r["load_id"], r["sha256"]): r for r in conn.execute("SELECT * FROM autofile")}
+    ar = autofile.ref(2600250, a_rec)
+    check("a receipt on another pod's load goes up under Lumper, on the lumper tab, with the pod named",
+          [u["type"] for u in ups.get(2600250, [])] == ["Lumper"] and log.tabs.get(ar) == "Upload Log - Lumper"
+          and log.rows[ar][3] == "Carrigan Charnstrom", str((ups.get(2600250), log.rows.get(ar))))
+    check("that pod's POD is set aside by the quick look, unread, and its texted picture is not read",
+          a_pod not in reads and rows[(2600250, a_pod)]["outcome"] == "not_bol_pod"
+          and hashlib.sha256(_picture(252)).hexdigest() not in reads, str((a_pod in reads, rows.get((2600250, a_pod)))))
+    check("a BOL on a pilot load not checked yet waits for the check", 2600253 not in ups
+          and rows[(2600253, b_bol)]["outcome"] == "waiting" and rows[(2600253, b_bol)]["final"] == 0, str(rows.get((2600253, b_bol))))
+    check("a BOL read on another pod's load is recorded as outside the pilot, ledger only", c_bol in reads and 2600254 not in ups
+          and rows[(2600254, c_bol)]["outcome"] == "outside_pilot" and rows[(2600254, c_bol)]["logged"] == 0
+          and autofile.ref(2600254, c_bol) not in log.rows, str(rows.get((2600254, c_bol))))
+    check("a load with no terminal in the ledger takes TransportPro's, and its receipt goes up",
+          [u["type"] for u in ups.get(2600255, [])] == ["Lumper"] and log.rows[autofile.ref(2600255, d_rec)][3] == "Sales Team"
+          and conn.execute("SELECT terminal FROM load WHERE load_id=2600255").fetchone()[0] == 1158, str(ups.get(2600255)))
+    # The load check reaches B: its BOL goes up as before.
+    conn.execute("UPDATE load SET state='bol_expected', stage='loaded', in_view=1, last_checked_at='9999-01-01T00:00:00+00:00' WHERE load_id=2600253")
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600, quick=quick)
+    check("and once checked, the pilot load's BOL goes up", [u["type"] for u in tpro.uploads if u["load"] == 2600253] == ["Driver Supplied BOL"],
+          str([(u["load"], u["type"]) for u in tpro.uploads]))
+    # Narrowed to the pilot's terminals, another pod's load is not looked at.
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    narrow = autofile.Settings(terminals=frozenset({1160}), mode="on", pods=names, lumper_terminals=frozenset({1160}))
+    conn.execute("INSERT INTO load (load_id, state, terminal, in_view, source) VALUES (2600256, 'new', 1078, 0, 'mail')")
+    tpro.add(2600256)
+    mail(2600256, "m256", [(_picture(256), receipt(2600256))], when=now)
+    autofile.run(conn, tpro, store, read, _AutoLog(), narrow, deadline=_time.monotonic() + 600, quick=quick)
+    check("a narrowed scope leaves other terminals alone", not reads and not tpro.uploads
+          and conn.execute("SELECT COUNT(*) FROM autofile").fetchone()[0] == 0)
+
+
 def test_a_pod_with_a_tab_of_its_own() -> None:
     """30 Sep 2026: Jesse Klingler's pod (terminal 1138) joins the pilot with its own sheet tab,
     "Upload Log - Klinger". Rows are routed by the load's terminal; every other pod keeps the
@@ -5208,6 +5303,7 @@ if __name__ == "__main__":
     test_an_undated_receiver_signature_counts_the_day_it_arrived()
     test_a_dock_check_in_sheet_rides_with_the_pod()
     test_lumper_receipts()
+    test_lumper_receipts_company_wide()
     test_a_signature_added_after_pickup_is_the_receivers()
     test_efs_requests_vouch_for_a_lumper_receipt()
     test_a_pod_with_a_tab_of_its_own()

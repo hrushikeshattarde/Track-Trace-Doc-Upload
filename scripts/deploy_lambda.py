@@ -123,7 +123,9 @@ def _worker_env(env: dict) -> dict:
             # sheet id is Circle's and lives in .env, not in this public repository.
             "INTAKE_AUTO_UPLOAD": env.get("INTAKE_AUTO_UPLOAD", "on"), "INTAKE_AUTO_TERMINALS": AUTO_TERMINALS,
             "INTAKE_UPLOAD_TABS": json.dumps({str(k): v for k, v in UPLOAD_TABS.items()}),
+            # Lumper receipts are company-wide (14 Oct 2026): every terminal, not only the pilot's.
             "INTAKE_LUMPER": "on", "INTAKE_LUMPER_TAB": LUMPER_TAB, "INTAKE_LUMPER_LOADS": "30",
+            "INTAKE_LUMPER_TERMINALS": "all",
             # A safety limit, not a budget (24 Sep 2026): with the quick look and the brief full read a
             # normal day for the pilot pod is about $1. The limit only stops a runaway.
             "INTAKE_AUTO_DAILY_USD": "50", "INTAKE_AUTO_MAX_READS": "60",

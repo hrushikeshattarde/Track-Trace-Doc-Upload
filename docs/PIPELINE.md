@@ -22,7 +22,8 @@ minutes the **worker** Lambda does four things:
 - for the pilot pods (Frankie Saiz 1160, Jesse Klingler 1138, Julialynn Boyanowski 1101, Dalton
   Cunningham 1134 and Paper 1074, and since 14 Oct 2026 Isiah Greenfield 1076, FT Roewer 1146,
   Andrew Fischer 1082 and Megan Goodwin 1089, by TransportPro terminal), has Claude read the new paperwork
-  and uploads the BOLs, PODs and, since 14 Oct 2026, lumper receipts that pass every check;
+  and uploads the BOLs and PODs that pass every check - and, since 14 Oct 2026, lumper receipts on
+  any load in the company, whatever its pod;
 - writes what it uploaded, or held back and why, to the pod's **Upload log** Google Sheet
   (lumper receipts to a tab of their own, for every pod).
 
@@ -634,6 +635,17 @@ or `... destination WALMART DC 6012, Bentonville is on the receipt)`; a hold say
   `Upload Log - Lumper` (`INTAKE_LUMPER_TAB`), created with the header and the look of the first pod tab
   on the first write; the Pod column says whose load it is. The ledger's `autofile.kind` (BOL, POD or
   LUMPER, schema 17) routes it. The morning report lists held receipts with the other holds.
+- **Company-wide** (14 Oct 2026). Lumper receipts are handled on every load, whatever pod it is on:
+  `INTAKE_LUMPER_TERMINALS` is `all` (a terminal list narrows it). Beyond the pilot pods' working loads,
+  any load with undecided mail from the last 7 days qualifies - finished, not yet checked, outside the
+  view, on any terminal - under the same per-run cap (`lumper_loads`). On a load whose pod is not in the
+  BOL/POD pilot only emailed documents are read, and only after the quick look calls a page other
+  paperwork or cannot tell; a page it is sure is a BOL, a POD or a photo is set aside unread, and a BOL
+  or POD that does get read is recorded as `outside_pilot`, in the ledger only. A BOL or POD on a pilot
+  load the load check has not reached yet waits for that check. A receipt gets the same checks as
+  anywhere and a row on the Lumper tab, whose Pod column names the pod or the terminal
+  (`pod_names` now knows the office and sales terminals too). The morning report still covers the
+  pilot pods only.
 - `INTAKE_LUMPER=off` switches the rule off: a lumper receipt is then set aside as other paperwork, and
   finished loads are not looked at.
 
@@ -850,7 +862,7 @@ account is shared with other projects, and the `project=circle-doc-intake` tag i
 cost-allocation tag. To measure spend, use Cost Explorer's resource-level view for the Lambdas,
 bucket and secrets, plus the "Claude Opus 5 (Amazon Bedrock Edition)" service line.
 
-**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 730 offline checks: no network, no
+**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 739 offline checks: no network, no
 model, no credentials. Run it before every deploy.
 
 **Changing the pilot's pods.** Change `AUTO_TERMINALS` in `scripts/deploy_lambda.py` and deploy. A pod that

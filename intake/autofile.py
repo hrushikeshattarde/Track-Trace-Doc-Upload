@@ -34,6 +34,11 @@ goes to one tab of the sheet for every pod (Settings.lumper_tab,
 "Upload Log - Lumper"). A receipt comes as often after the POD as with it, so a load already showing
 Documents Received, or gone from the view, is still looked at for one for LUMPER_DAYS after its mail
 arrived; the BOLs and PODs in that mail are read and recorded as not needed, in the ledger only.
+Lumper receipts are company-wide (14 Oct 2026; INTAKE_LUMPER_TERMINALS, "all" by default): a load on
+any terminal, in any state, is looked at when mail of the last LUMPER_DAYS on it has no decision. On a
+load outside the BOL/POD pilot only emailed documents are read, only after the quick look calls a page
+other paperwork or cannot tell, and a BOL or POD read there is recorded as outside the pilot, in the
+ledger only; a receipt gets the same checks as on a pilot load and a row on the lumper tab.
 INTAKE_LUMPER=off switches all of this off, and a lumper receipt is then set aside as before.
 
 A document is uploaded only when all of these hold:
@@ -157,8 +162,7 @@ LUMPER_ROLES = frozenset({"lumper"})
 LUMPER_RIDERS = frozenset({"dock_sheet"})
 LUMPER_TAB = "Upload Log - Lumper"            # every pod's lumper rows, on one tab of the sheet
 LUMPER_DAYS = 7                               # how long after its mail arrived a finished load is still looked at for a receipt
-LUMPER_LOADS_PER_RUN = 30                     # finished loads looked at for a receipt per run, newest mail first
-LUMPER_STATES = ("complete", "not_in_view")   # a finished load: no BOL or POD is work on it, a lumper receipt still is
+LUMPER_LOADS_PER_RUN = 30                     # loads looked at for a receipt per run beyond the pilot's working loads, newest mail first
 ROLE_WORDS = {"photo": "photo", "lumper": "lumper receipt", "dock_sheet": "dock check-in sheet",
               "weight_ticket": "scale ticket", "reefer_log": "reefer log",
               "invoice": "invoice", "rate_confirmation": "rate confirmation", "other": "other paperwork"}
@@ -167,7 +171,9 @@ ROLE_WORDS = {"photo": "photo", "lumper": "lumper receipt", "dock_sheet": "dock 
 UPLOADED, ON_FILE, NOT_NEEDED, HELD, WAITING, DRY = ("uploaded", "on_file", "not_needed", "held",
                                                     "waiting", "dry_run")
 NOT_PAPERWORK, PERSONAL_ID, UNREADABLE = "not_bol_pod", "personal_id", "unreadable"
-UNLOGGED = (NOT_PAPERWORK, PERSONAL_ID, UNREADABLE)
+# ...and a BOL or POD on a load whose pod is not in the pilot: looked at for a lumper receipt only (14 Oct 2026).
+OUTSIDE_PILOT = "outside_pilot"
+UNLOGGED = (NOT_PAPERWORK, PERSONAL_ID, UNREADABLE, OUTSIDE_PILOT)
 # What goes to the Upload log sheet: what the bot uploaded, and what it held back with the check that
 # failed. Already on file, not needed and waiting stay in the ledger only (the pod's ask, 24 Sep 2026).
 SHEET_OUTCOMES = (UPLOADED, HELD)
@@ -219,6 +225,14 @@ def eastern(when, suffix: bool = True) -> str:
 
 # ------------------------------------------------------------------------------ settings ----
 
+def _terminals_setting(value) -> frozenset[int] | None:
+    """A terminal list, or None for every terminal: "all", "*" or nothing."""
+    raw = (value or "").strip().lower()
+    if raw in ("", "all", "*"):
+        return None
+    return frozenset(int(x) for x in re.split(r"[,\s]+", raw) if x)
+
+
 @dataclass
 class Settings:
     terminals: frozenset[int] = frozenset()
@@ -233,7 +247,8 @@ class Settings:
     lane_rule: bool = True        # lane_match: a page with none of the load's numbers may go up on the lane and the date
     lumper: bool = True           # lumper receipts go up under Lumper (judge_lumper) and finished loads are looked at for them
     lumper_tab: str = LUMPER_TAB  # the one tab every pod's lumper rows go to
-    lumper_loads: int = LUMPER_LOADS_PER_RUN   # finished loads looked at for a receipt per run
+    lumper_loads: int = LUMPER_LOADS_PER_RUN   # loads looked at for a receipt per run beyond the pilot's working loads
+    lumper_terminals: frozenset[int] | None = None   # where lumper receipts are handled: None is every terminal
 
     @classmethod
     def from_env(cls, env, pods: dict[int, str] | None = None) -> "Settings":
@@ -251,7 +266,8 @@ class Settings:
                    lane_rule=(env.get("INTAKE_AUTO_LANE_RULE") or "on").strip().lower() != "off",
                    lumper=(env.get("INTAKE_LUMPER") or "on").strip().lower() != "off",
                    lumper_tab=(env.get("INTAKE_LUMPER_TAB") or "").strip() or LUMPER_TAB,
-                   lumper_loads=int(env.get("INTAKE_LUMPER_LOADS") or LUMPER_LOADS_PER_RUN))
+                   lumper_loads=int(env.get("INTAKE_LUMPER_LOADS") or LUMPER_LOADS_PER_RUN),
+                   lumper_terminals=_terminals_setting(env.get("INTAKE_LUMPER_TERMINALS")))
 
 
 @dataclass
@@ -326,6 +342,7 @@ class Doc:
     batches: frozenset[str] = frozenset()
     arrived_at: str | None = None   # when it arrived, ISO UTC: the email's date, or the file's dateCreated
     to_group: str | None = None     # the Google Group an email came to: ratecon@..., fwefs@... (14 Oct 2026)
+    pilot: bool | None = True       # on a load of a pilot pod (BOLs and PODs go up); False: lumper receipts only; None: not known yet
 
 
 @dataclass
@@ -380,7 +397,8 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
     #    the ledger is read and written on this thread only.
     plans: list[tuple[sqlite3.Row, dict, list[OnFile], list[Doc]]] = []
     clients = [tpro] + _clones(tpro, LOOK_THREADS - 1)
-    worth = [row for row in _loads(conn, s.terminals, lumper=s.lumper, lumper_limit=s.lumper_loads)
+    worth = [row for row in _loads(conn, s.terminals, lumper=s.lumper, lumper_limit=s.lumper_loads,
+                                   lumper_terminals=s.lumper_terminals)
              if _worth_a_look(conn, row, s)]
     for i in range(0, len(worth), len(clients)):
         if time.monotonic() > deadline - LOOK_UNTIL_S:
@@ -394,7 +412,7 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
                 stats.errors += 1
                 print(f"  ! auto-upload: load {row['load_id']}: {got}")
                 continue
-            plan = _look(conn, tpro, row, lumper=s.lumper, fetched=got)
+            plan = _look(conn, tpro, row, lumper=s.lumper, fetched=got, pilot_terminals=s.terminals)
             stats.looked += 1
             if plan is not None:
                 plans.append(plan)
@@ -780,36 +798,57 @@ def _sent_mates(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnF
 
 
 def _loads(conn, terminals: frozenset[int], lumper: bool = False,
-           lumper_limit: int = LUMPER_LOADS_PER_RUN) -> list[sqlite3.Row]:
+           lumper_limit: int = LUMPER_LOADS_PER_RUN, lumper_terminals: frozenset[int] | None = None) -> list[sqlite3.Row]:
     """The pilot pods' loads worth the bot's time, most urgent first - and, with `lumper`, up to
-    `lumper_limit` of their finished loads that recent mail may have brought a lumper receipt for, last."""
+    `lumper_limit` other loads, on any terminal in `lumper_terminals` (None: every terminal), that
+    recent mail may have brought a lumper receipt for, last."""
     cases = " ".join(f"WHEN '{x}' THEN {i}" for i, x in enumerate(LOAD_ORDER))
     marks = ",".join("?" * len(terminals))
     rows = conn.execute(
         f"SELECT * FROM load WHERE in_view=1 AND terminal IN ({marks}) AND state IN "
         f"({','.join('?' * len(LOAD_ORDER))}) ORDER BY CASE state {cases} ELSE 99 END, next_check_at",
         (*sorted(terminals), *LOAD_ORDER)).fetchall()
-    return rows + (lumper_loads(conn, terminals, limit=lumper_limit) if lumper else [])
+    return rows + (lumper_loads(conn, terminals, limit=lumper_limit, scope=lumper_terminals) if lumper else [])
 
 
-def lumper_loads(conn, terminals: frozenset[int], limit: int = LUMPER_LOADS_PER_RUN) -> list[sqlite3.Row]:
-    """The pilot pods' finished loads - Documents Received, or gone from the Load Management view - with
-    mail of the last LUMPER_DAYS that has no final decision, at most `limit` of them, the newest such
-    mail first. A lumper receipt comes when the carrier sends it, as often after the POD as with it,
-    and a finished load was never looked at again. Its older mail is left alone, so the first run under
-    this rule does not read three weeks of paperwork on loads nobody is waiting on; and the cap keeps
-    the look phase from starving the working loads' reads - four pods joined on 14 Oct 2026 with 1,565
-    such documents, and a run's reads fell to 13 of 60."""
-    marks = ",".join("?" * len(terminals))
+def lumper_loads(conn, pilot: frozenset[int], limit: int = LUMPER_LOADS_PER_RUN,
+                 scope: frozenset[int] | None = None) -> list[sqlite3.Row]:
+    """Every load that recent mail may have brought a lumper receipt for, beyond the pilot pods' working
+    loads (14 Oct 2026, company-wide): finished loads, loads not checked yet, loads outside the view,
+    loads on any terminal - or on the terminals in `scope`. A load qualifies when mail of the last
+    LUMPER_DAYS on it has no final decision; at most `limit` of them a run, the newest such mail first.
+    A lumper receipt comes when the carrier sends it, as often after the POD as with it. Older mail is
+    left alone, so the first run under this rule does not read weeks of paperwork nobody is waiting on;
+    the cap keeps the look phase from starving the working loads' reads (four pods joined on 14 Oct
+    2026 with 1,565 such documents, and a run's reads fell to 13 of 60)."""
     since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=LUMPER_DAYS)).isoformat(timespec="seconds")
+    params: list = [since]
+    where = ""
+    if scope is not None:
+        where += f" AND l.terminal IN ({','.join('?' * len(scope))})"
+        params += sorted(scope)
+    if pilot:
+        # The pilot pods' working loads are looked at anyway (_loads); not twice.
+        where += (f" AND NOT (l.in_view = 1 AND l.terminal IN ({','.join('?' * len(pilot))}) "
+                  f"AND l.state IN ({','.join('?' * len(LOAD_ORDER))}))")
+        params += [*sorted(pilot), *LOAD_ORDER]
+    params.append(int(limit))
     return conn.execute(
         "SELECT * FROM (SELECT l.*, (SELECT MAX(m.internal_date) FROM part p JOIN message m ON m.message_id = p.message_id "
         "    LEFT JOIN autofile a ON a.load_id = m.load_id AND a.sha256 = p.sha256 "
         "    WHERE m.load_id = l.load_id AND p.decision = 'keep' AND p.sha256 IS NOT NULL "
         "      AND m.internal_date >= ? AND (a.sha256 IS NULL OR a.final = 0)) AS newest_open_mail "
-        f"  FROM load l WHERE l.terminal IN ({marks}) AND l.state IN ({','.join('?' * len(LUMPER_STATES))})) "
-        "WHERE newest_open_mail IS NOT NULL ORDER BY newest_open_mail DESC, load_id LIMIT ?",
-        (since, *sorted(terminals), *LUMPER_STATES, int(limit))).fetchall()
+        f"  FROM load l WHERE 1 = 1{where}) "
+        "WHERE newest_open_mail IS NOT NULL ORDER BY newest_open_mail DESC, load_id LIMIT ?", params).fetchall()
+
+
+def in_pilot(pilot_terminals: frozenset[int], row, load: dict | None = None) -> bool | None:
+    """Whether the load is a pilot pod's, by the ledger row's terminal or, failing that, the load
+    record's; None when neither says."""
+    terminal = row["terminal"] if row["terminal"] is not None else (load or {}).get("assignedTerminal")
+    if terminal is None:
+        return None
+    return int(terminal) in pilot_terminals
 
 
 def _worth_a_look(conn, row, s: Settings) -> bool:
@@ -911,12 +950,20 @@ def _fetch_batch(conn, clients: list, rows: list, *, lumper: bool) -> dict[int, 
         return {lid: fut.result() for lid, fut in futures.items()}
 
 
-def _look(conn, tpro, row, lumper: bool = True, fetched: tuple | None = None) -> tuple | None:
+def _look(conn, tpro, row, lumper: bool = True, fetched: tuple | None = None,
+          pilot_terminals: frozenset[int] | None = None) -> tuple | None:
     load_id = int(row["load_id"])
     load, files, data = fetched if fetched is not None else (tpro.load(load_id), None, {})
     done = _docs_received(load)
+    pilot = True if pilot_terminals is None else in_pilot(pilot_terminals, row, load)
+    if row["terminal"] is None and load.get("assignedTerminal"):
+        # A load the mail created before any sweep saw it: its terminal, so its rows name the pod.
+        conn.execute("UPDATE load SET terminal=? WHERE load_id=? AND terminal IS NULL", (int(load["assignedTerminal"]), load_id))
+        row = conn.execute("SELECT * FROM load WHERE load_id=?", (load_id,)).fetchone() or row
     decided = _decided(conn, load_id)
     emailed = _email_docs(conn, load_id)
+    for d in emailed:
+        d.pilot = pilot
     # A load TransportPro is satisfied with needs no BOL or POD; the load check will mark it complete.
     # It can still be short a lumper receipt (14 Oct 2026), which comes as often after the POD as with
     # it, so its mail of the last LUMPER_DAYS is read for one. Older mail, and the pictures texted onto
@@ -930,7 +977,7 @@ def _look(conn, tpro, row, lumper: bool = True, fetched: tuple | None = None) ->
     for of in filed:
         # Driver Supplied BOLs somebody else filed: a driver's text, a rep. Their bytes are on the
         # load, not in the mail, and one of them may be the POD this load is waiting for.
-        if (not done and of.type_id == DRIVER_SUPPLIED and not of.by_bot and of.sha256 not in shas
+        if (not done and pilot and of.type_id == DRIVER_SUPPLIED and not of.by_bot and of.sha256 not in shas
                 and _open(decided, of.sha256)):
             shas.add(of.sha256)
             docs.append(file_doc(of, filed))
@@ -1245,6 +1292,10 @@ def needs_full_read(d: Doc, q: tuple[str, float] | None, stage: str) -> bool:
         return True
     kind, confidence = q
     if kind in ("photo", "not_freight") and confidence >= QUICK_TRUST:
+        return False
+    if d.pilot is False and kind in ("bol", "pod") and confidence >= QUICK_TRUST:
+        # Outside the BOL/POD pilot the full read serves lumper receipts only (14 Oct 2026): a page the
+        # quick look is sure is a BOL or a POD is not one, and is set aside unread.
         return False
     if d.on_file is not None and stage not in AT_CONSIGNEE and kind in ("bol", "other_paperwork", "photo", "not_freight"):
         return False
@@ -1690,6 +1741,14 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
         kind = LUMPER
     else:
         return Decision(d, NOT_PAPERWORK, f"read as {type_name}", ex=ex)
+    if kind != LUMPER and d.pilot is False:
+        # BOLs and PODs go up for the pilot pods (INTAKE_AUTO_TERMINALS); this load's pod is not one of
+        # them, and it was looked at for a lumper receipt only (14 Oct 2026). Ledger only, final.
+        return Decision(d, OUTSIDE_PILOT, f"read as a {kind}; BOLs and PODs go up for the pilot pods only", ex=ex)
+    if kind != LUMPER and (d.pilot is None or (row["state"] or "new") in ("new", "error")):
+        # No stage to judge a POD's timing by until the load check has seen the load: judged then.
+        return Decision(d, WAITING, "WAITING - the load has not been checked against TransportPro yet; judged after "
+                                    "its first check", kind=kind, ex=ex, final=False)
     dec = Decision(d, "ready", kind=kind, ex=ex, conf=ex.document_type_confidence)
     if later:
         dec.allowed.append(later)
@@ -2738,9 +2797,10 @@ def ref(load_id: int, sha: str) -> str:
 
 
 def pod_names(config: dict) -> dict[int, str]:
-    """'POD (Frankie Saiz)' -> 'Frankie Saiz', from the pod terminal map."""
+    """'POD (Frankie Saiz)' -> 'Frankie Saiz', from the pod terminal map - every terminal in it, the
+    office and sales terminals included, since lumper rows come from any pod's load (14 Oct 2026)."""
     out = {}
-    for t in config.get("terminals") or []:
+    for t in list(config.get("terminals") or []) + list(config.get("non_pod_terminals") or []):
         m = re.match(r"\s*POD\s*\((.*)\)\s*$", str(t.get("name") or ""))
         out[int(t["id"])] = (m.group(1) if m else str(t.get("name") or t["id"])).strip()
     return out
