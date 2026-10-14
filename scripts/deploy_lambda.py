@@ -33,7 +33,7 @@ What it creates, all in the account and region the .env's AWS_PROFILE points at:
                                                           login, the Gmail key (for the Upload log sheet), Bedrock reads, logs
                 circle-doc-intake-scheduler               may invoke the circle-doc-intake-* functions
     functions   circle-doc-intake-collector               python3.12, 10 min, 512 MB, concurrency 1, no retries
-                circle-doc-intake-worker                  python3.12, 10 min, 1.5 GB, concurrency 1, no retries
+                circle-doc-intake-worker                  python3.12, 10 min, 3 GB, concurrency 1, no retries
     logs        /aws/lambda/<function>                    90-day retention
     schedules   circle-doc-intake-every-15-min            the collector; rate(15 minutes)
                 circle-doc-intake-worker-every-15-min     the worker; rate(15 minutes); created DISABLED
@@ -123,7 +123,7 @@ def _worker_env(env: dict) -> dict:
             # sheet id is Circle's and lives in .env, not in this public repository.
             "INTAKE_AUTO_UPLOAD": env.get("INTAKE_AUTO_UPLOAD", "on"), "INTAKE_AUTO_TERMINALS": AUTO_TERMINALS,
             "INTAKE_UPLOAD_TABS": json.dumps({str(k): v for k, v in UPLOAD_TABS.items()}),
-            "INTAKE_LUMPER": "on", "INTAKE_LUMPER_TAB": LUMPER_TAB,
+            "INTAKE_LUMPER": "on", "INTAKE_LUMPER_TAB": LUMPER_TAB, "INTAKE_LUMPER_LOADS": "30",
             # A safety limit, not a budget (24 Sep 2026): with the quick look and the brief full read a
             # normal day for the pilot pod is about $1. The limit only stops a runaway.
             "INTAKE_AUTO_DAILY_USD": "50", "INTAKE_AUTO_MAX_READS": "60",
@@ -197,7 +197,8 @@ FUNCS = {
     "worker": {
         "name": "circle-doc-intake-worker", "schedule": "circle-doc-intake-worker-every-15-min",
         # 1.5 GB since 24 Sep 2026: the AI reads render page images, and a 27-page scan ran 1 GB out.
-        "handler": "intake.aws_worker.handler", "memory": 1536,
+        # 3 GB since 14 Oct 2026, for six full reads in parallel (1.5 GB with three; a run peaked at 1.2 GB).
+        "handler": "intake.aws_worker.handler", "memory": 3008,
         "secrets": lambda env: [TPRO_SECRET, GMAIL_SECRET] + ([env["INTAKE_TPRO_UPLOAD_SECRET"]]
                                                            if env.get("INTAKE_TPRO_UPLOAD_SECRET") else []),
         "env": _worker_env, "policy": _worker_policy, "log_filter": '"worker"',

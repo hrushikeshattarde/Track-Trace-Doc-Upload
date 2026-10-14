@@ -102,15 +102,20 @@ POD_COMMENT = re.compile(r"\bpod\b|proof|deliver", re.I)
 # measured boundary.
 SAME_PICTURE = 3.0
 
-READERS = 3                  # full reads in parallel
-QUICK_LOOKERS = 4            # quick looks in parallel
+# 14 Oct 2026: four pods joined at once and a run's reads were starved - the look phase ran to its limit,
+# the quick looks took what was left, and 13 to 30 full reads finished of 60 queued. Reads run six at a
+# time now (three before), the quick looks eight, the looks four, and the windows below moved.
+READERS = 6                  # full reads in parallel
+QUICK_LOOKERS = 8            # quick looks in parallel
+QUICK_LOOK_S = 60            # the quick looks get at most this long; a page without one gets the full read
+LOOK_THREADS = 4             # loads looked at in parallel, one TransportPro client each (TransportPro.clone)
 READ_TIMEOUT_S = 120         # one read, in the SDK
 EST_READ_USD = 0.04          # a brief full read, for the safety limit; the recorded cost is the real one
 # How sure the quick look must be that a page is a photo before the full read is skipped. On the 24 Sep
 # 2026 pages it never called a BOL or POD a photo at any confidence; 0.8 keeps a margin.
 QUICK_TRUST = 0.8
-LOOK_UNTIL_S = 240           # stop looking at more loads this long before the deadline
-READ_UNTIL_S = 120           # ...stop waiting for reads
+LOOK_UNTIL_S = 300           # stop looking at more loads this long before the deadline
+READ_UNTIL_S = 90            # ...stop waiting for reads
 UPLOAD_NEEDS_S = 45          # ...and do not start an upload with less than this left
 MAX_UPLOAD_ATTEMPTS = 3
 # How much the bot reads. Load 2571670 (24 Sep 2026): a 27-page, 10.6 MB CamScanner packet sent every
@@ -152,6 +157,7 @@ LUMPER_ROLES = frozenset({"lumper"})
 LUMPER_RIDERS = frozenset({"dock_sheet"})
 LUMPER_TAB = "Upload Log - Lumper"            # every pod's lumper rows, on one tab of the sheet
 LUMPER_DAYS = 7                               # how long after its mail arrived a finished load is still looked at for a receipt
+LUMPER_LOADS_PER_RUN = 30                     # finished loads looked at for a receipt per run, newest mail first
 LUMPER_STATES = ("complete", "not_in_view")   # a finished load: no BOL or POD is work on it, a lumper receipt still is
 ROLE_WORDS = {"photo": "photo", "lumper": "lumper receipt", "dock_sheet": "dock check-in sheet",
               "weight_ticket": "scale ticket", "reefer_log": "reefer log",
@@ -227,6 +233,7 @@ class Settings:
     lane_rule: bool = True        # lane_match: a page with none of the load's numbers may go up on the lane and the date
     lumper: bool = True           # lumper receipts go up under Lumper (judge_lumper) and finished loads are looked at for them
     lumper_tab: str = LUMPER_TAB  # the one tab every pod's lumper rows go to
+    lumper_loads: int = LUMPER_LOADS_PER_RUN   # finished loads looked at for a receipt per run
 
     @classmethod
     def from_env(cls, env, pods: dict[int, str] | None = None) -> "Settings":
@@ -243,7 +250,8 @@ class Settings:
                    tabs={int(k): str(v) for k, v in json.loads(env.get("INTAKE_UPLOAD_TABS") or "{}").items()},
                    lane_rule=(env.get("INTAKE_AUTO_LANE_RULE") or "on").strip().lower() != "off",
                    lumper=(env.get("INTAKE_LUMPER") or "on").strip().lower() != "off",
-                   lumper_tab=(env.get("INTAKE_LUMPER_TAB") or "").strip() or LUMPER_TAB)
+                   lumper_tab=(env.get("INTAKE_LUMPER_TAB") or "").strip() or LUMPER_TAB,
+                   lumper_loads=int(env.get("INTAKE_LUMPER_LOADS") or LUMPER_LOADS_PER_RUN))
 
 
 @dataclass
@@ -368,23 +376,29 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
     if reopen_too_long(conn):
         print("  auto-upload: files held as too long under an earlier limit are read now")
 
-    # 1. look
+    # 1. look - LOOK_THREADS loads at a time. The TransportPro reads run in threads, one client each;
+    #    the ledger is read and written on this thread only.
     plans: list[tuple[sqlite3.Row, dict, list[OnFile], list[Doc]]] = []
-    for row in _loads(conn, s.terminals, lumper=s.lumper):
+    clients = [tpro] + _clones(tpro, LOOK_THREADS - 1)
+    worth = [row for row in _loads(conn, s.terminals, lumper=s.lumper, lumper_limit=s.lumper_loads)
+             if _worth_a_look(conn, row, s)]
+    for i in range(0, len(worth), len(clients)):
         if time.monotonic() > deadline - LOOK_UNTIL_S:
             stats.stopped = "out of time while looking at loads"
             break
-        if not _worth_a_look(conn, row, s):
-            continue
-        try:
-            plan = _look(conn, tpro, row, lumper=s.lumper)
-        except TProError as e:
-            stats.errors += 1
-            print(f"  ! auto-upload: load {row['load_id']}: {e}")
-            continue
-        stats.looked += 1
-        if plan is not None:
-            plans.append(plan)
+        batch = worth[i:i + len(clients)]
+        fetched = _fetch_batch(conn, clients, batch, lumper=s.lumper)
+        for row in batch:
+            got = fetched.get(int(row["load_id"]))
+            if isinstance(got, TProError):
+                stats.errors += 1
+                print(f"  ! auto-upload: load {row['load_id']}: {got}")
+                continue
+            plan = _look(conn, tpro, row, lumper=s.lumper, fetched=got)
+            stats.looked += 1
+            if plan is not None:
+                plans.append(plan)
+    tpro.calls += sum(c.calls for c in clients[1:] if c is not tpro)
 
     # 2. read
     unread = _read(conn, store, tpro, read, quick, s, stats, plans, deadline, day)
@@ -765,33 +779,37 @@ def _sent_mates(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnF
     return out
 
 
-def _loads(conn, terminals: frozenset[int], lumper: bool = False) -> list[sqlite3.Row]:
-    """The pilot pods' loads worth the bot's time, most urgent first - and, with `lumper`, their
-    finished loads that recent mail may have brought a lumper receipt for, last."""
+def _loads(conn, terminals: frozenset[int], lumper: bool = False,
+           lumper_limit: int = LUMPER_LOADS_PER_RUN) -> list[sqlite3.Row]:
+    """The pilot pods' loads worth the bot's time, most urgent first - and, with `lumper`, up to
+    `lumper_limit` of their finished loads that recent mail may have brought a lumper receipt for, last."""
     cases = " ".join(f"WHEN '{x}' THEN {i}" for i, x in enumerate(LOAD_ORDER))
     marks = ",".join("?" * len(terminals))
     rows = conn.execute(
         f"SELECT * FROM load WHERE in_view=1 AND terminal IN ({marks}) AND state IN "
         f"({','.join('?' * len(LOAD_ORDER))}) ORDER BY CASE state {cases} ELSE 99 END, next_check_at",
         (*sorted(terminals), *LOAD_ORDER)).fetchall()
-    return rows + (lumper_loads(conn, terminals) if lumper else [])
+    return rows + (lumper_loads(conn, terminals, limit=lumper_limit) if lumper else [])
 
 
-def lumper_loads(conn, terminals: frozenset[int]) -> list[sqlite3.Row]:
+def lumper_loads(conn, terminals: frozenset[int], limit: int = LUMPER_LOADS_PER_RUN) -> list[sqlite3.Row]:
     """The pilot pods' finished loads - Documents Received, or gone from the Load Management view - with
-    mail of the last LUMPER_DAYS that has no final decision. A lumper receipt comes when the carrier
-    sends it, as often after the POD as with it, and a finished load was never looked at again. Its
-    older mail is left alone, so the first run under this rule does not read three weeks of paperwork
-    on loads nobody is waiting on."""
+    mail of the last LUMPER_DAYS that has no final decision, at most `limit` of them, the newest such
+    mail first. A lumper receipt comes when the carrier sends it, as often after the POD as with it,
+    and a finished load was never looked at again. Its older mail is left alone, so the first run under
+    this rule does not read three weeks of paperwork on loads nobody is waiting on; and the cap keeps
+    the look phase from starving the working loads' reads - four pods joined on 14 Oct 2026 with 1,565
+    such documents, and a run's reads fell to 13 of 60."""
     marks = ",".join("?" * len(terminals))
     since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=LUMPER_DAYS)).isoformat(timespec="seconds")
     return conn.execute(
-        f"SELECT l.* FROM load l WHERE l.terminal IN ({marks}) AND l.state IN ({','.join('?' * len(LUMPER_STATES))}) "
-        "AND EXISTS (SELECT 1 FROM part p JOIN message m ON m.message_id = p.message_id "
-        "            LEFT JOIN autofile a ON a.load_id = m.load_id AND a.sha256 = p.sha256 "
-        "            WHERE m.load_id = l.load_id AND p.decision = 'keep' AND p.sha256 IS NOT NULL "
-        "              AND m.internal_date >= ? AND (a.sha256 IS NULL OR a.final = 0)) "
-        "ORDER BY l.load_id", (*sorted(terminals), *LUMPER_STATES, since)).fetchall()
+        "SELECT * FROM (SELECT l.*, (SELECT MAX(m.internal_date) FROM part p JOIN message m ON m.message_id = p.message_id "
+        "    LEFT JOIN autofile a ON a.load_id = m.load_id AND a.sha256 = p.sha256 "
+        "    WHERE m.load_id = l.load_id AND p.decision = 'keep' AND p.sha256 IS NOT NULL "
+        "      AND m.internal_date >= ? AND (a.sha256 IS NULL OR a.final = 0)) AS newest_open_mail "
+        f"  FROM load l WHERE l.terminal IN ({marks}) AND l.state IN ({','.join('?' * len(LUMPER_STATES))})) "
+        "WHERE newest_open_mail IS NOT NULL ORDER BY newest_open_mail DESC, load_id LIMIT ?",
+        (since, *sorted(terminals), *LUMPER_STATES, int(limit))).fetchall()
 
 
 def _worth_a_look(conn, row, s: Settings) -> bool:
@@ -852,9 +870,50 @@ def same_sending(a: Doc, b: Doc) -> bool:
     return bool((a.batches or {a.batch}) & (b.batches or {b.batch}) - {None})
 
 
-def _look(conn, tpro, row, lumper: bool = True) -> tuple | None:
+def _clones(tpro, n: int) -> list:
+    """`n` more TransportPro clients for the look phase's threads, when the client can clone itself;
+    none otherwise, and the loads are looked at one by one as before."""
+    return [tpro.clone() for _ in range(n)] if n > 0 and hasattr(tpro, "clone") else []
+
+
+def _fetch_batch(conn, clients: list, rows: list, *, lumper: bool) -> dict[int, Any]:
+    """Each load's record and File History, and the bytes of any paperwork on it not hashed before,
+    fetched in parallel - one client per thread, because one TransportPro client is not thread-safe.
+    The ledger is read on the calling thread only: what each thread needs from it is worked out first.
+    Returns {load id: (load, files or None, {file id: bytes})}, or the TProError that stopped a load."""
+    ids = [int(r["load_id"]) for r in rows]
+    marks = ",".join("?" * len(ids))
+    hashed = {int(r[0]) for r in conn.execute(
+        f"SELECT t.tpro_file_id FROM tpro_file t JOIN picture_sig s ON s.sha256 = t.sha256 WHERE t.load_id IN ({marks})", ids)}
+    recent: dict[int, bool] = {}
+    for lid in ids:
+        decided = _decided(conn, lid)
+        recent[lid] = any(_open(decided, d.sha256) and _recent(d) for d in _email_docs(conn, lid))
+
+    def fetch(client, lid: int):
+        try:
+            load = client.load(lid)
+            if _docs_received(load) and not (lumper and recent[lid]):
+                return load, None, {}             # nothing to decide on a finished load: no File History call
+            files = client.files(lid)
+            data = {}
+            for f in files:
+                if f.get("id") and int(f.get("fileTypeId") or 0) in HASHED_TYPES and int(f["id"]) not in hashed:
+                    data[int(f["id"])] = client.download_file(int(f["id"]))[0]
+            return load, files, data
+        except TProError as e:
+            return e
+
+    if len(rows) == 1 or len(clients) == 1:
+        return {ids[0]: fetch(clients[0], ids[0])} if len(rows) == 1 else {lid: fetch(clients[0], lid) for lid in ids}
+    with ThreadPoolExecutor(max_workers=len(clients)) as pool:
+        futures = {lid: pool.submit(fetch, clients[i % len(clients)], lid) for i, lid in enumerate(ids)}
+        return {lid: fut.result() for lid, fut in futures.items()}
+
+
+def _look(conn, tpro, row, lumper: bool = True, fetched: tuple | None = None) -> tuple | None:
     load_id = int(row["load_id"])
-    load = tpro.load(load_id)
+    load, files, data = fetched if fetched is not None else (tpro.load(load_id), None, {})
     done = _docs_received(load)
     decided = _decided(conn, load_id)
     emailed = _email_docs(conn, load_id)
@@ -866,7 +925,7 @@ def _look(conn, tpro, row, lumper: bool = True) -> tuple | None:
     if done and not docs:
         _mark_looked(conn, load_id)
         return None
-    filed = on_file(conn, tpro, load_id, tpro.files(load_id))
+    filed = on_file(conn, tpro, load_id, files if files is not None else tpro.files(load_id), fetched=data)
     shas = {d.sha256 for d in emailed}
     for of in filed:
         # Driver Supplied BOLs somebody else filed: a driver's text, a rep. Their bytes are on the
@@ -940,10 +999,12 @@ def _arrived_on_file(f: dict) -> str:
     return f"File History: {f.get('fileTypeName')} uploaded {when}" + (f" ('{comment[:60]}')" if comment else "")
 
 
-def on_file(conn, tpro, load_id: int, files: list[dict]) -> list[OnFile]:
+def on_file(conn, tpro, load_id: int, files: list[dict], fetched: dict[int, bytes] | None = None) -> list[OnFile]:
     """Every paperwork file on the load, with its hash and thumbnails. A file is downloaded once:
-    its hash is kept in tpro_file and its thumbnails in picture_sig."""
+    its hash is kept in tpro_file and its thumbnails in picture_sig. `fetched` holds bytes a look-phase
+    thread downloaded already, by file id."""
     out = []
+    fetched = fetched or {}
     for f in files:
         if not f.get("id"):
             continue
@@ -955,7 +1016,9 @@ def on_file(conn, tpro, load_id: int, files: list[dict]) -> list[OnFile]:
         sig = cached_sig(conn, sha) if sha else None
         data = None
         if sha is None or sig is None:
-            data, _ = tpro.download_file(int(f["id"]))
+            data = fetched.get(int(f["id"]))
+            if data is None:
+                data, _ = tpro.download_file(int(f["id"]))
             sha = hashlib.sha256(data).hexdigest()
             db.record_tpro_file(conn, load_id, f, sha256=sha, size=len(data))
             sig = store_sig(conn, sha, data)
@@ -1198,7 +1261,9 @@ def _quick_looks(conn, quick, stats: Stats, items: list, deadline: float) -> Non
         return
     pool = ThreadPoolExecutor(max_workers=QUICK_LOOKERS)
     futures = {pool.submit(quick, d.data, d.filename): d for _, _, d in items}
-    done, _late = wait(futures, timeout=max(1.0, deadline - LOOK_UNTIL_S / 2 - time.monotonic()))
+    # At most QUICK_LOOK_S, so the full reads keep their window; a page whose quick look is still out
+    # simply gets the full read (needs_full_read with no quick look).
+    done, _late = wait(futures, timeout=max(1.0, min(QUICK_LOOK_S, deadline - READ_UNTIL_S - 30 - time.monotonic())))
     pool.shutdown(wait=False, cancel_futures=True)
     for fut in done:
         d = futures[fut]

@@ -113,6 +113,15 @@ class TransportPro:
         except NETWORK_ERRORS as e:
             raise TProError(0, path, f"network: {type(e).__name__}: {e}") from None
 
+    def clone(self) -> "TransportPro":
+        """Another client with the same login and the same token, for a thread of its own. One client
+        is not thread-safe - the token refresh and the call spacing are shared state - so the worker's
+        parallel look phase (intake/autofile.py, 14 Oct 2026) gives each thread a clone."""
+        other = TransportPro(self.base, self._user, self._password, timeout=self._timeout,
+                             min_interval=self._min_interval)
+        other._access, other._refresh_token = self._access, self._refresh_token
+        return other
+
     # -- transport ---------------------------------------------------------
     def get(self, path: str, params: dict[str, str] | None = None) -> Any:
         gap = self._min_interval - (time.time() - self._last_call)

@@ -54,7 +54,7 @@ pilot terminals only (`AUTO_TERMINALS` in `scripts/deploy_lambda.py`).
 | Piece | Name | Settings |
 |---|---|---|
 | Collector Lambda | `circle-doc-intake-collector` | python3.12, 512 MB, 10 min timeout, handler `intake.aws_lambda.handler` |
-| Worker Lambda | `circle-doc-intake-worker` | python3.12, 1.5 GB, 10 min timeout, handler `intake.aws_worker.handler` |
+| Worker Lambda | `circle-doc-intake-worker` | python3.12, 3 GB (1.5 GB until 14 Oct 2026), 10 min timeout, handler `intake.aws_worker.handler` |
 | Report Lambda | `circle-doc-intake-report` | python3.12, 512 MB, handler `intake.aws_report.handler`; 07:00 America/New_York daily; mails the loads the bot did not file from `DocIntake@circle-analytics.com` (SES) to `INTAKE_REPORT_TO` in `.env` |
 | Schedules (EventBridge Scheduler) | `circle-doc-intake-every-15-min`, `circle-doc-intake-worker-every-15-min` | `rate(15 minutes)`, no retries |
 | Concurrency | both functions | Reserved concurrency 1. A trigger older than 60 s is dropped, so a run that fires while another is going is skipped. The next quarter-hour is the retry. |
@@ -169,8 +169,9 @@ so its working deadline is about 540 s in.
 |---|---|
 | mail | at 40% of the run, about 216 s |
 | load checks | at 150 loads (`INTAKE_LOAD_LIMIT`); no time limit of their own |
-| auto-upload: looking at loads | 240 s before the deadline |
-| auto-upload: quick looks and full reads | 120 s before the deadline; unfinished reads are abandoned |
+| auto-upload: looking at loads | 300 s before the deadline; loads are looked at four at a time, one TransportPro client per thread (`LOOK_THREADS`, `TransportPro.clone`, 14 Oct 2026) |
+| auto-upload: quick looks | at most 60 s (`QUICK_LOOK_S`); a page still waiting gets the full read |
+| auto-upload: full reads | until 90 s before the deadline, six at a time (`READERS`); unfinished reads are abandoned |
 | auto-upload: starting an upload | not with less than 45 s to the deadline |
 | handing the ledger back | the 60 s reserve |
 
@@ -317,7 +318,7 @@ Each document without a reading goes down this ladder:
 | 3 | **Same picture already read on this load?** (every page within a mean difference of 3.0 of a read document's pages) Copy that reading. | $0 |
 | 4 | **Quick look**: Claude Haiku 4.5, first 3 pages at 1,100 px, 4 in parallel, 60 s timeout. (Haiku 5.5 is ready in the code - it is asked for low effort with room to think - but on 8 Oct 2026 Bedrock's Messages endpoint in us-east-1 did not serve it yet.) Answers `pod`, `bol`, `other_paperwork`, `photo` or `not_freight`, with a confidence. Stored in `quicklook`. | ~$0.002 |
 | 5 | **Skip the full read** only when the quick look says `photo` or `not_freight` at 80% or more, or when the page is already on the load (a texted picture), the truck isn't at the consignee, and the quick look called it `bol`, `other_paperwork`, `photo` or `not_freight`. A texted POD pulls the other pictures from its text batch into the full read. | – |
-| 6 | **Full read**: Claude Opus 5.5 on Bedrock (since 8 Oct 2026; Opus 5 before), effort `low`, brief notes, 1,568 px pages sent as JPEG, 3 reads in parallel, 120 s timeout each. A file over 10 pages (`CHUNK_PAGES`) is read in pieces of up to 10 pages, one read per piece (`pieces_to_read`, `_read_input`). Each piece's reading is kept in `read_part` until every piece is in; then `merge_readings` ([`pod_intake/reader.py`](../pod_intake/reader.py)) combines them into one reading for the whole file. The file is a POD if any piece is, the receiver's name and delivery times come from the piece that has them, and pages are numbered as in the file. The result is the `Extraction` in [`pod_intake/schema.py`](../pod_intake/schema.py), stored in `attachment.extraction_json`. | ~$0.04 a read; a 27-page packet ~$0.40 |
+| 6 | **Full read**: Claude Opus 5.5 on Bedrock (since 8 Oct 2026; Opus 5 before), effort `low`, brief notes, 1,568 px pages sent as JPEG, 6 reads in parallel (3 until 14 Oct 2026), 120 s timeout each. A file over 10 pages (`CHUNK_PAGES`) is read in pieces of up to 10 pages, one read per piece (`pieces_to_read`, `_read_input`). Each piece's reading is kept in `read_part` until every piece is in; then `merge_readings` ([`pod_intake/reader.py`](../pod_intake/reader.py)) combines them into one reading for the whole file. The file is a POD if any piece is, the receiver's name and delivery times come from the piece that has them, and pages are numbered as in the file. The result is the `Extraction` in [`pod_intake/schema.py`](../pod_intake/schema.py), stored in `attachment.extraction_json`. | ~$0.04 a read; a 27-page packet ~$0.40 |
 
 The full read returns:
 
@@ -611,7 +612,9 @@ or `... destination WALMART DC 6012, Bentonville is on the receipt)`; a hold say
   is told to put the facility that issued the receipt in the consignee block, with its street.
 - **After the POD.** A receipt comes as often after the POD as with it, so a load already showing
   Documents Received - or gone from the view (`LUMPER_STATES`) - is still looked at when mail of the last
-  7 days (`LUMPER_DAYS`) on it has no final decision (`lumper_loads`). Its emailed files are read like any
+  7 days (`LUMPER_DAYS`) on it has no final decision (`lumper_loads`) - at most 30 such loads a run, the
+  newest mail first (`INTAKE_LUMPER_LOADS`; four pods joined on 14 Oct 2026 with 1,565 such documents and
+  the look phase starved the working loads' reads). Its emailed files are read like any
   other; a BOL or POD among them is recorded as not needed, in the ledger only. Older mail on a finished
   load, and the pictures texted onto it, are left alone.
 - **The sheet.** Every lumper row - uploaded or held - goes to one tab for every pod,
@@ -686,7 +689,7 @@ object, and the same file read twice is one paid read.
 | Situation | What is kept | What happens next |
 |---|---|---|
 | Ledger upload refused (ETag changed) | Nothing from this run | The next run redoes it. Any upload it made is found on the load (the bot's own file, same bytes or same picture) and is **not uploaded again**. |
-| Lambda killed: timeout or out of memory | Nothing from this run | Same as above. On 24 Sep 2026 a 27-page scan ran the 1 GB worker out of memory; the page limit and 1.5 GB came from that. |
+| Lambda killed: timeout or out of memory | Nothing from this run | Same as above. On 24 Sep 2026 a 27-page scan ran the 1 GB worker out of memory; the page limit and 1.5 GB came from that, and 3 GB on 14 Oct 2026 for six reads in parallel. |
 | Trigger fires while a run is going | Dropped | The next quarter-hour |
 
 **How a load is sure to be looked at again.** A load with anything unread or an error goes into
@@ -834,7 +837,7 @@ account is shared with other projects, and the `project=circle-doc-intake` tag i
 cost-allocation tag. To measure spend, use Cost Explorer's resource-level view for the Lambdas,
 bucket and secrets, plus the "Claude Opus 5 (Amazon Bedrock Edition)" service line.
 
-**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 719 offline checks: no network, no
+**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 722 offline checks: no network, no
 model, no credentials. Run it before every deploy.
 
 **Changing the pilot's pods.** Change `AUTO_TERMINALS` in `scripts/deploy_lambda.py` and deploy. A pod that

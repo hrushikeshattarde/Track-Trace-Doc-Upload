@@ -709,6 +709,27 @@ def test_lumper_receipts() -> None:
     autofile.flush_log(conn, log, s.tabs, lumper_tab=s.lumper_tab)
     check("a lumper row is removed from the lumper tab", cr not in log.rows and log.removed_on.get(cr) == "Upload Log - Lumper")
 
+    # The finished-loads lookback is capped per run, newest mail first (14 Oct 2026: four pods joined at
+    # once with 1,565 such documents, and the look phase starved the reads).
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    for i, hours in enumerate((30, 10, 1)):
+        when = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).isoformat(timespec="seconds")
+        load_row(2600230 + i, "complete", "delivered")
+        tpro.add(2600230 + i, doc="Documents Received")
+        mail(2600230 + i, f"m23{i}", [(_picture(230 + i), receipt(2600230 + i))], when=when)
+    picked = [r["load_id"] for r in autofile.lumper_loads(conn, frozenset({1160}), limit=2)]
+    check("the finished-loads lookback is capped per run, newest mail first", picked == [2600232, 2600231], str(picked))
+    check("and the setting comes from the environment",
+          autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on", "INTAKE_LUMPER_LOADS": "7"}).lumper_loads == 7
+          and autofile.Settings.from_env({"INTAKE_AUTO_UPLOAD": "on"}).lumper_loads == autofile.LUMPER_LOADS_PER_RUN)
+    from intake import tpro as _tp
+    one = _tp.TransportPro("https://tp.example/api/", "u", "p", timeout=7)
+    one._access, one._refresh_token = "tok", "ref"
+    two = one.clone()
+    check("a TransportPro client clones with its login and token, for a thread of its own",
+          two is not one and two.base == "https://tp.example/api" and two._access == "tok" and two._refresh_token == "ref"
+          and two._timeout == 7 and two.calls == 0)
+
     # Switched off, a receipt is other paperwork, as before, and finished loads are not looked at.
     conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
     off = autofile.Settings(terminals=frozenset({1160}), mode="on", lumper=False)
@@ -4023,6 +4044,9 @@ class _AutoTPro:
         for f, data in files:
             self.loads[load_id]["files"].append(f)
             self.loads[load_id]["bytes"][f["id"]] = data
+
+    def clone(self):
+        return self                       # shares its state: the threads only read it
 
     def load(self, load_id):
         self.calls += 1
