@@ -938,6 +938,83 @@ def test_efs_requests_vouch_for_a_lumper_receipt() -> None:
           and "EFS lumper payment" not in rows[(2600305, e_sha)]["status"], str(dict(rows[(2600305, e_sha)])) if (2600305, e_sha) in rows else "no row")
 
 
+def test_a_signature_added_after_pickup_is_the_receivers() -> None:
+    """Load 2603304 (14 Oct 2026): the Sazerac BOL dated Oct 14 came at pickup signed by the shipper only,
+    and again at delivery with 'D. Sanders 10/14/26' across the body. Same calendar day, so the reader's
+    date rule could not place the signature and the delivery copy was held as unsigned. The reader now
+    reports a signature it cannot place, and the judge knows it was added after the truck left the
+    shipper because it read the same form earlier without it."""
+    print("auto-upload: a signature added after pickup is the receiver's")
+    import time as _time
+    from intake import autofile
+    from pod_intake import reader as rd
+    from pod_intake.schema import Extraction
+
+    def copy(load_id, *, conf, other=None, times=None):
+        r = _reading(load_id, "bill_of_lading", conf=conf, city="Highland Park")
+        r["numbers"][0]["kind"], r["numbers"][1]["kind"] = "pickup", "po"
+        r["numbers"].append({"label": "Seal No.", "kind": "seal", "value": "00002725", "handwritten": True, "confidence": 0.9})
+        r["ship_date"] = "Oct/14/2026"
+        if other:
+            r["signatures"] = {**r["signatures"], "other_signed": True, "other_name": other[0], "other_date": other[1]}
+        if times:
+            r["times"] = {"check_in": times[0], "check_out": times[1], "source": "handwritten", "at_stop": "unknown"}
+        return r
+
+    ex = Extraction.model_validate(copy(1, conf=0.85, other=("D. Sanders", "10/14/26")))
+    check("the schema carries a signature the reader could not place",
+          ex.signatures.other_signed and ex.signatures.other_name == "D. Sanders" and not ex.signatures.receiver_signed)
+    check("and an old reading without the field still validates", not Extraction.model_validate(_reading(1)).signatures.other_signed)
+    merged = rd.merge_readings([(1, copy(1, conf=0.9)), (11, copy(1, conf=0.85, other=("D. Sanders", "10/14/26")))])
+    check("a reading merged from pieces keeps it", merged["signatures"]["other_signed"] and merged["signatures"]["other_name"] == "D. Sanders")
+
+    s = autofile.Settings(terminals=frozenset({1160}), mode="on", pods={1160: "Frankie Saiz"})
+    conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+    log = _AutoLog()
+    now = dt.datetime.now(dt.timezone.utc)
+    early = (now - dt.timedelta(hours=11)).isoformat(timespec="seconds")
+    late = (now - dt.timedelta(minutes=30)).isoformat(timespec="seconds")
+    # A: the pickup copy early, the delivery copy later, the truck delivered.
+    load_row(2600240, "wrong_doc_type", "delivered")
+    tpro.add(2600240)
+    (a1,) = mail(2600240, "m240", [(_picture(240), copy(2600240, conf=0.93))], when=early)
+    (a2,) = mail(2600240, "m241", [(_picture(241), copy(2600240, conf=0.85, other=("D. Sanders", "10/14/26"), times=("16:00", "00:30")))], when=late)
+    # B: the delivery copy alone, nothing read before it: held, as before.
+    load_row(2600242, "wrong_doc_type", "delivered")
+    tpro.add(2600242)
+    (b1,) = mail(2600242, "m242", [(_picture(242), copy(2600242, conf=0.85, other=("D. Sanders", "10/14/26"), times=("16:00", "00:30")))], when=late)
+    # C: the earlier copy already carried the same signature: nothing was added at delivery.
+    load_row(2600243, "wrong_doc_type", "delivered")
+    tpro.add(2600243)
+    mail(2600243, "m243", [(_picture(243), copy(2600243, conf=0.93, other=("A. Shipper", "10/14/26")))], when=early)
+    (c2,) = mail(2600243, "m244", [(_picture(244), copy(2600243, conf=0.85, other=("A. Shipper", "10/14/26"), times=("16:00", "00:30")))], when=late)
+    # D: the truck still at the shipper: a second signature there is not the receiver's.
+    load_row(2600245, "bol_expected", "at shipper")
+    tpro.add(2600245)
+    mail(2600245, "m245", [(_picture(245), copy(2600245, conf=0.93))], when=early)
+    (d2,) = mail(2600245, "m246", [(_picture(246), copy(2600245, conf=0.85, other=("D. Sanders", "10/14/26")))], when=late)
+
+    autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+    ups = {}
+    for u in tpro.uploads:
+        ups.setdefault(u["load"], []).append(u)
+    rows = {(r["load_id"], r["sha256"]): r for r in conn.execute("SELECT * FROM autofile")}
+    pod = [u for u in ups.get(2600240, []) if u["type"] == "Bill Of Lading"]
+    check("the delivery copy goes up as the POD, signed by the name that appeared after pickup",
+          len(pod) == 1 and pod[0]["comment"] == "Doc Intake Bot: POD, signed by D. Sanders 10/14/26 - load 2600240"
+          and rows[(2600240, a2)]["outcome"] == "uploaded", str([(u["type"], u["comment"]) for u in ups.get(2600240, [])]))
+    row = log.rows.get(autofile.ref(2600240, a2)) or [""] * 14
+    check("and the sheet says why", "receiver's signature: 'D. Sanders 10/14/26' is on this copy and not on the copy of the same form read earlier" in row[9]
+          and row[6].startswith("POD - signed by D. Sanders 10/14/26"), str(row))
+    check("the delivery copy alone is still held", 2600242 not in ups and rows[(2600242, b1)]["outcome"] == "held"
+          and "no receiver signature or stamp" in rows[(2600242, b1)]["status"], str(rows.get((2600242, b1))))
+    check("a signature the pickup copy already carried proves nothing", not any(u["type"] == "Bill Of Lading" for u in ups.get(2600243, []))
+          and rows[(2600243, c2)]["outcome"] == "held", str(rows.get((2600243, c2))))
+    check("nor does one that appears while the truck is still at the shipper",
+          not any(u["type"] == "Bill Of Lading" for u in ups.get(2600245, [])) and rows[(2600245, d2)]["outcome"] in ("held", "on_file", "not_needed"),
+          str(rows.get((2600245, d2))))
+
+
 def test_a_pod_with_a_tab_of_its_own() -> None:
     """30 Sep 2026: Jesse Klingler's pod (terminal 1138) joins the pilot with its own sheet tab,
     "Upload Log - Klinger". Rows are routed by the load's terminal; every other pod keeps the
@@ -5131,6 +5208,7 @@ if __name__ == "__main__":
     test_an_undated_receiver_signature_counts_the_day_it_arrived()
     test_a_dock_check_in_sheet_rides_with_the_pod()
     test_lumper_receipts()
+    test_a_signature_added_after_pickup_is_the_receivers()
     test_efs_requests_vouch_for_a_lumper_receipt()
     test_a_pod_with_a_tab_of_its_own()
     test_a_new_pod_tab_is_styled_like_the_first()

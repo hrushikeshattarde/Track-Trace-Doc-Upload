@@ -37,6 +37,13 @@ class Signatures(BaseModel):
     receiver_name: Optional[str] = None
     receiver_date: Optional[str] = Field(default=None, description="As written, e.g. '9-11-26'.")
     stamp_present: bool = Field(default=False, description="True if a RECEIVING stamp - one that says the consignee took the freight, such as 'RECEIVED' with a date - appears on the page, inked or printed. A shipper's or a company's own stamp, or a letterhead logo, is not one.")
+    # A dated handwritten signature the reader could not attribute to the shipper, the driver or the receiver
+    # (14 Oct 2026, load 2603304: 'D. Sanders 10/14/26' across the body of a BOL dated the same day). Reported
+    # rather than dropped, so the judge can tell whose it is from what else it knows - that the same form was
+    # read earlier without it (intake.autofile.later_copy_signature).
+    other_signed: bool = Field(default=False, description="True when the page carries a dated handwritten signature you could not attribute to the shipper, the driver or the receiver. Report it here rather than dropping it.")
+    other_name: Optional[str] = Field(default=None, description="The name under that signature, as written.")
+    other_date: Optional[str] = Field(default=None, description="The date beside that signature, as written, e.g. '10/14/26'.")
 
 
 class Times(BaseModel):

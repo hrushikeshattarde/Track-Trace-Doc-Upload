@@ -405,6 +405,19 @@ consignee`. A page arriving before the delivery day, or from a truck still loade
 reference numbers on it match the load (`corroborated_bol`, 30 Sep 2026: USPS's Contract Route Vehicle Record
 reads as a BOL at 78% however it is described, and its route and trip are the pick number).
 
+**A signature that appears on a later copy is the receiver's** (`later_copy_signature`, 14 Oct 2026).
+Load 2603304: a Sazerac BOL dated Oct 14 came at pickup signed by the shipper only, and again at delivery
+with "D. Sanders 10/14/26" across the body. The reader tells the receiver's signature from the shipper's
+by its date, and a load loaded overnight and delivered the same calendar day defeats that, so the
+delivery copy was held as unsigned. The reader is now told the same-day rule (a second signature by a
+different person in the body or consignee block, with the shipper line already signed, is the
+receiver's) and reports a signature it still cannot place in `Signatures.other_signed` instead of
+dropping it. The judge then settles it from what it already read: when the same form - two reference
+or identity numbers in common - was read from a copy that arrived earlier without any receiver's mark,
+and the truck has left the shipper, the signature that appeared since is the receiver's. The reading is
+taken as a POD signed by that name on that date, and the Checks column says `receiver's signature:
+'D. Sanders 10/14/26' is on this copy and not on the copy of the same form read earlier (...)`.
+
 **A page with none of the load's numbers** (`lane_match`, 2 Oct 2026) goes up when the paperwork cannot
 carry them. Load 2598125: a TireHub BOL for a Mavis store names TireHub's LD numbers while TransportPro
 holds Penske's shipment number; load 2599137: a Baker Hughes delivery note names the shipper's invoice
@@ -837,7 +850,7 @@ account is shared with other projects, and the `project=circle-doc-intake` tag i
 cost-allocation tag. To measure spend, use Cost Explorer's resource-level view for the Lambdas,
 bucket and secrets, plus the "Claude Opus 5 (Amazon Bedrock Edition)" service line.
 
-**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 722 offline checks: no network, no
+**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 730 offline checks: no network, no
 model, no credentials. Run it before every deploy.
 
 **Changing the pilot's pods.** Change `AUTO_TERMINALS` in `scripts/deploy_lambda.py` and deploy. A pod that

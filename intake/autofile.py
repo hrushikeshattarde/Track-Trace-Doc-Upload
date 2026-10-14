@@ -1679,6 +1679,7 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
         return Decision(d, NOT_PAPERWORK, f"read as {ex.document_type}", ex=ex)
 
     stage = (row["stage"] or "").lower()
+    later = later_copy_signature(conn, int(row["load_id"]), d, ex, filed, stage)
     type_name, _ = classify_type(ex, {"dispatch_status": stage.title()})
     receiver = ex.signatures.receiver_signed or ex.document_type == "proof_of_delivery"
     if type_name == "Proof of Delivery":
@@ -1690,6 +1691,8 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
     else:
         return Decision(d, NOT_PAPERWORK, f"read as {type_name}", ex=ex)
     dec = Decision(d, "ready", kind=kind, ex=ex, conf=ex.document_type_confidence)
+    if later:
+        dec.allowed.append(later)
     # What the pod paid for the load on the fwefs@ chain is evidence for a lumper receipt: the EFS
     # request's PO is a reference number of the load's as much as TransportPro's are (14 Oct 2026).
     efs = db.efs_requests(conn, int(row["load_id"])) if kind == LUMPER else []
@@ -1795,6 +1798,58 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
                           f"{stage or 'at an unknown stage'}; uploads once it reaches the consignee" + waiting_note(ex, load))
             return dec
     return dec
+
+
+def later_copy_signature(conn, load_id: int, d: Doc, ex, filed: list[OnFile], stage: str) -> str | None:
+    """Whose a dated signature is, from what the bot already knows - or None.
+
+    Load 2603304 (14 Oct 2026): a Sazerac BOL dated Oct 14 was photographed at pickup, signed by the
+    shipper only, and again at delivery with 'D. Sanders 10/14/26' large across the body. The reader
+    tells the receiver's signature from the shipper's by its date, and here the truck loaded overnight
+    and delivered the same calendar day, so it could not, and the delivery copy was held as unsigned.
+    The reader now reports such a signature (Signatures.other_signed) instead of dropping it, and this
+    settles it: when the same form - two reference or identity numbers in common - was read earlier,
+    from a copy that arrived before this one and carried no receiver's mark, and the truck has left the
+    shipper, the signature that appeared since was written at delivery. It is the receiver's: the
+    reading is taken as a POD signed by that name on that date, and the sheet says why."""
+    sig = ex.signatures
+    if sig.receiver_signed or not getattr(sig, "other_signed", False):
+        return None
+    if (stage or "").lower() in ("", "planned", "dispatched", "at shipper"):
+        return None
+    mine = shipment_numbers(ex) | identity_numbers(ex)
+    when = _utc(d.arrived_at)
+    if len(mine) < 2 or when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    from pod_intake.schema import Extraction
+    for other in list(_email_docs(conn, load_id)) + [file_doc(of, filed) for of in filed]:
+        if other.sha256 == d.sha256:
+            continue
+        att = db.get_attachment(conn, other.sha256)
+        then = _utc(other.arrived_at)
+        if att is None or att["extraction_json"] is None or then is None:
+            continue
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=dt.timezone.utc)
+        if then >= when:
+            continue
+        o = Extraction.model_validate(json.loads(att["extraction_json"]))
+        if o.document_type not in ("bill_of_lading", "proof_of_delivery"):
+            continue
+        if o.signatures.receiver_signed or o.signatures.stamp_present or getattr(o.signatures, "other_signed", False):
+            continue
+        if len((shipment_numbers(o) | identity_numbers(o)) & mine) < 2:
+            continue
+        who = " ".join(x for x in (sig.other_name, sig.other_date) if x) or "the signature"
+        sig.receiver_signed = True
+        sig.receiver_name = sig.receiver_name or sig.other_name
+        sig.receiver_date = sig.receiver_date or sig.other_date
+        ex.document_type = "proof_of_delivery"
+        return (f"receiver's signature: '{who}' is on this copy and not on the copy of the same form read earlier "
+                f"({other.arrived}), so it was signed after the truck left the shipper")
+    return None
 
 
 def counts_as(of: OnFile, kind: str) -> bool:
