@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import anthropic
 
 from .normalize import Document
-from .schema import Adjudication, Extraction, reader_json_schema
+from .schema import Adjudication, CompactExtraction, Extraction, compact_to_extraction, reader_json_schema
 
 # Anthropic list prices per million tokens (input, output). Cache reads are billed at ~0.1x input,
 # cache writes at 1.25x input for the five-minute cache and 2x for the one-hour cache. Source:
@@ -186,12 +186,44 @@ def cache_control() -> dict:
     return {"type": "ephemeral", "ttl": "1h"} if ttl == "1h" else {"type": "ephemeral"}
 
 
-def _system_variants(system: str, schema_model, brief: bool) -> tuple[list[dict], list[dict]]:
+# Which answer form the full read asks for (15 Oct 2026): "full", the Extraction schema as it has
+# always been, or "compact", pod_intake.schema.CompactExtraction - each reference number one string,
+# the fields nothing downstream reads left out - parsed back into an Extraction. The answer is three
+# quarters of a read's cost, so the form is the lever; the default stays full until scripts/replay.py
+# has shown the compact form files the same pages the same way.
+FORM_SETTING = "INTAKE_READ_FORM"
+FULL, COMPACT = "full", "compact"
+FORMS = (FULL, COMPACT)
+COMPACT_NOTES = (
+    "\n\nAnswer in the compact form. Each reference number is ONE string in numbers[], 'label|kind|value|hw|conf': "
+    "the label printed beside it, its kind (bol, master_bill, po, pickup, shipment, delivery, invoice, load_or_trip, "
+    "order, seal, trailer, tractor, shipper_ref or other), the number exactly as printed, 1 if handwritten else 0, "
+    "and your confidence 0-1 - for example 'Pickup Nbr|pickup|P2600001|0|0.95' or "
+    "'(unlabeled handwriting)|other|27060|1|0.7'. This form has no photo_stamp, carrier_dot, carrier_mc, "
+    "driver_name or driver_phone fields: leave them out, and a camera overlay needs no transcription.")
+
+
+def read_form(env=None) -> str:
+    """The answer form INTAKE_READ_FORM names: full unless it says compact. Anything else is a
+    configuration error and says so, like the other settings."""
+    form = ((env if env is not None else os.environ).get(FORM_SETTING) or FULL).strip().lower()
+    if form not in FORMS:
+        raise ValueError(f"{FORM_SETTING} is {form!r}; it must be one of {', '.join(FORMS)}")
+    return form
+
+
+def schema_for(form: str):
+    """What the model is asked for in this form."""
+    return CompactExtraction if form == COMPACT else Extraction
+
+
+def _system_variants(system: str, schema_model, brief: bool, form: str = FULL) -> tuple[list[dict], list[dict]]:
     """The two forms of the cached system block a read may send: the plain one, for an endpoint that
     enforces the schema itself, and the one with the schema pasted at its end, for one that does not
     (Bedrock). Built in one place so that the warm-up (warm_cache) sends the very same bytes as the
-    reads - the cache is keyed on them."""
-    system = system + (BRIEF_NOTES if brief else "")
+    reads - the cache is keyed on them. The compact form's note comes after the brief one, so the
+    full form's bytes are exactly what they were before the compact form existed."""
+    system = system + (BRIEF_NOTES if brief else "") + (COMPACT_NOTES if form == COMPACT else "")
     schema_text = ("Respond with ONLY a JSON object that validates against this JSON schema. No prose, no code fences.\n"
                    + json.dumps(reader_json_schema(schema_model)))
     system_blocks = [{"type": "text", "text": system, "cache_control": cache_control()}]
@@ -199,8 +231,8 @@ def _system_variants(system: str, schema_model, brief: bool) -> tuple[list[dict]
     return system_blocks, schema_system
 
 
-def warm_cache(client, model: str, system: str = READER_SYSTEM, schema_model=Extraction, effort: str | None = None,
-               brief: bool = True) -> Usage:
+def warm_cache(client, model: str, system: str = READER_SYSTEM, schema_model=None, effort: str | None = None,
+               brief: bool = True, form: str | None = None) -> Usage:
     """Put the full read's instruction sheet into the prompt cache with a one-token request, so the
     reads that start together afterwards all find it there instead of each writing it (14 Oct 2026:
     two reads started at the same moment both paid the 10,125-token write). Same system bytes and the
@@ -208,12 +240,15 @@ def warm_cache(client, model: str, system: str = READER_SYSTEM, schema_model=Ext
     on refusal, so a warm-up on Bedrock warms the form the reads will use. Returns the usage; the
     caller counts its cost (under a cent when the cache is warm, the write when it is cold).
 
-    `model` is the bare name; `effort` and `brief` must be what the reads send. Nothing is parsed:
-    one token of answer is all that is asked for."""
+    `model` is the bare name; `effort`, `brief` and `form` must be what the reads send (`form` is
+    INTAKE_READ_FORM when not given, and `schema_model` is that form's schema unless one is passed).
+    Nothing is parsed: one token of answer is all that is asked for."""
     from .provider import model_id
 
     model = model_id(model)
-    system_blocks, schema_system = _system_variants(system, schema_model, brief)
+    form = form or read_form()
+    schema_model = schema_model or schema_for(form)
+    system_blocks, schema_system = _system_variants(system, schema_model, brief, form)
     messages = [{"role": "user", "content": [{"type": "text", "text": "Warm-up only. Answer with the single word OK."}]}]
     use_effort = bool(effort) and not _no_effort_model(model)
 
@@ -248,7 +283,7 @@ def warm_cache(client, model: str, system: str = READER_SYSTEM, schema_model=Ext
 
 
 def _structured_call(client, model: str, system: str, content: list[dict], schema_model, effort: str | None = None,
-                     brief: bool = False):
+                     brief: bool = False, form: str = FULL):
     """One call, schema-constrained where the endpoint supports it, tolerant where it does not.
 
     Against the Anthropic API, output_config.format guarantees valid JSON. Other endpoints - OpenRouter's
@@ -258,13 +293,15 @@ def _structured_call(client, model: str, system: str, content: list[dict], schem
     in advance whether structured outputs are available there.
 
     effort ("low" | "medium" | "high") trades thinking depth for cost on Opus 5 / Sonnet 5. It is not sent
-    for Haiku 4.5, which rejects the parameter. brief asks for short notes.
+    for Haiku 4.5, which rejects the parameter. brief asks for short notes. form is the answer form
+    (FULL or COMPACT): it only adds the compact form's note to the system block; the caller passes
+    the matching schema_model and parses the compact answer back itself.
 
     Where the schema has to travel in the prompt (Bedrock), it goes at the end of the SYSTEM block,
     which is cached, not after the page images, which are not. It is ~2,000 tokens, and until
     24 Sep 2026 every read on Bedrock paid for it in full.
     """
-    system_blocks, schema_system = _system_variants(system, schema_model, brief)
+    system_blocks, schema_system = _system_variants(system, schema_model, brief, form)
     messages = [{"role": "user", "content": content}]
     output_config: dict = {"format": _output_format(schema_model)}
     use_effort = bool(effort) and not _no_effort_model(model)
@@ -331,18 +368,30 @@ def _structured_call(client, model: str, system: str, content: list[dict], schem
 
 
 def read_document(client, doc: Document, model: str, effort: str | None = None,
-                  brief: bool = False) -> tuple[Extraction, Usage]:
+                  brief: bool = False, form: str | None = None) -> tuple[Extraction, Usage]:
     """`client` is whichever platform client provider.make_client() built - the Messages surface is
     identical across Anthropic, Bedrock (AnthropicBedrockMantle) and the OpenRouter proxy, so
-    nothing below this line needs to know which one it is."""
+    nothing below this line needs to know which one it is.
+
+    `form` is the answer form, FULL or COMPACT (INTAKE_READ_FORM when not given). Whichever the model
+    was asked for, what comes back is a full Extraction: a compact answer is parsed into one here
+    (schema.compact_to_extraction), and a number string the model did not write in the compact shape
+    is kept whole as a value and noted in `notes`, never dropped."""
     from .provider import model_id
 
     model = model_id(model)
+    form = form or read_form()
     content = _page_blocks(doc)
     if doc.text_layer:
         content.append({"type": "text", "text": f"The file also carries this typed text layer (likely an app stamp, not part of the printed form):\n{doc.text_layer}"})
     content.append({"type": "text", "text": f"File name: {doc.path.name}. {len(doc.pages)} page(s). Extract the document per the schema."})
-    return _structured_call(client, model, READER_SYSTEM, content, Extraction, effort=effort, brief=brief)
+    parsed, usage = _structured_call(client, model, READER_SYSTEM, content, schema_for(form), effort=effort, brief=brief, form=form)
+    if form == COMPACT:
+        parsed, unparsed = compact_to_extraction(parsed)
+        if unparsed:
+            parsed.notes = (parsed.notes + " | " if parsed.notes else "") + \
+                f"{len(unparsed)} number(s) not in the compact shape, kept whole: " + "; ".join(repr(u) for u in unparsed[:5])
+    return parsed, usage
 
 
 def merge_readings(parts: list[tuple[int, dict]]) -> dict:

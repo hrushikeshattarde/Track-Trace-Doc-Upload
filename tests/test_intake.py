@@ -5373,6 +5373,240 @@ def test_reader_is_brief_and_caches_the_schema() -> None:
           and abs(Usage("claude-haiku-5-5", 1_000_000, 1_000_000, 0, 0).cost_usd - 0.6) < 1e-6)
 
 
+def test_the_compact_answer_form() -> None:
+    """15 Oct 2026: three quarters of a read's cost is the answer, most of it the reference numbers at
+    five JSON fields each. The compact form asks for each number as one string and leaves out the
+    fields nothing downstream reads; what comes back is still a full Extraction, the default form's
+    bytes are untouched (the cache is keyed on them), and INTAKE_READ_FORM chooses."""
+    print("reader: the compact answer form")
+    import os as _os
+    import anthropic
+    import httpx2 as httpx
+    from intake import autofile
+    from pod_intake import reader as rd
+    from pod_intake.schema import CompactExtraction, Extraction, compact_to_extraction, parse_number, reader_json_schema
+
+    n = parse_number("Pickup Nbr|pickup|P2600001|0|0.95")
+    check("a compact number parses back into its five fields",
+          (n.label, n.kind, n.value, n.handwritten, n.confidence) == ("Pickup Nbr", "pickup", "P2600001", False, 0.95))
+    n = parse_number("(unlabeled handwriting)|other|27060|1|0.7")
+    check("handwritten 1 is true", n.handwritten is True and n.kind == "other" and n.value == "27060")
+    n = parse_number("B/L No.|bill|12345|yes|high")
+    check("an unknown kind is other, and odd flags take defaults", (n.kind, n.handwritten, n.confidence) == ("other", True, 0.5))
+    n = parse_number("PO 12345")
+    check("a string not in the shape is kept whole as a value, never dropped", n.label == "(unparsed)" and n.value == "PO 12345")
+    check("a label with a separator in it survives the split from the right",
+          parse_number("Ref|Order|order|AB-1|0|0.9").label == "Ref|Order")
+    check("confidence is clamped", parse_number("Trip|load_or_trip|2600001|0|1.7").confidence == 1.0)
+
+    sch = reader_json_schema(CompactExtraction)
+    check("the compact schema has no photo_stamp, carrier DOT/MC or driver fields",
+          not ({"photo_stamp", "carrier_dot", "carrier_mc", "driver_name", "driver_phone"} & set(sch["properties"])))
+    check("and still requires at_stop", "at_stop" in sch["$defs"]["Times"]["required"])
+    check("and its numbers are strings", sch["properties"]["numbers"]["items"]["type"] == "string")
+    check("and it is shorter than the full one", len(json.dumps(sch)) < len(json.dumps(reader_json_schema(Extraction))))
+
+    compact = CompactExtraction(
+        document_type="proof_of_delivery", document_type_confidence=0.93,
+        numbers=["BOL|bol|M1-90798|0|0.95", "PO 123456"], shipper={"name": "Kraft Heinz", "city": "El Paso"}, consignee={},
+        signatures={"shipper_signed": False, "driver_signed": True, "receiver_signed": True, "stamp_present": True,
+                    "receiver_name": "GV", "receiver_date": "SEP 29 2026"},
+        times={"source": "none", "at_stop": "consignee"}, pages=[{"page": 1, "role": "pod", "legibility": 0.9}], notes="ok")
+    ex, unparsed = compact_to_extraction(compact)
+    check("a compact answer becomes a full Extraction, the unasked fields at their defaults",
+          isinstance(ex, Extraction) and ex.document_type == "proof_of_delivery" and ex.signatures.receiver_signed
+          and ex.photo_stamp.present is False and ex.carrier_dot is None and ex.driver_phone is None)
+    check("with its numbers as NumberFields and the unparsed ones named",
+          [x.value for x in ex.numbers] == ["M1-90798", "PO 123456"] and unparsed == ["PO 123456"])
+    check("and the judge's matching reads it like any reading - an unparsed 'PO 123456' still matches the load's PO",
+          autofile.match_facts_detail(ex, {"id": 1, "reference": {"poNumber": "PO123456"}})[1] == ["PO # PO123456"])
+
+    check("INTAKE_READ_FORM defaults to full and names compact",
+          rd.read_form({}) == "full" and rd.read_form({"INTAKE_READ_FORM": " Compact "}) == "compact")
+    try:
+        rd.read_form({"INTAKE_READ_FORM": "short"})
+        check("a wrong value is refused", False)
+    except ValueError:
+        check("a wrong value is refused", True)
+    full = rd._system_variants(rd.READER_SYSTEM, Extraction, True)
+    check("the full form's system bytes are what they were before the compact form existed",
+          full == rd._system_variants(rd.READER_SYSTEM, Extraction, True, "full") and "compact form" not in full[1][0]["text"])
+    short = rd._system_variants(rd.READER_SYSTEM, CompactExtraction, True, "compact")
+    check("the compact form's carry its note and the shorter schema",
+          "compact form" in short[1][0]["text"] and len(short[1][0]["text"]) < len(full[1][0]["text"]))
+
+    answer = json.dumps({"document_type": "bill_of_lading", "document_type_confidence": 0.9,
+                         "numbers": ["PO #|po|18650|0|0.95", "Seal|seal|79063132|1|0.8"], "shipper": {}, "consignee": {},
+                         "signatures": {"shipper_signed": True, "driver_signed": True, "receiver_signed": False},
+                         "times": {"source": "none", "at_stop": "unknown"},
+                         "pages": [{"page": 1, "role": "bol", "legibility": 0.9}], "notes": "a BOL"})
+    calls: list[dict] = []
+
+    class _Msg:
+        def __init__(self, text):
+            self.content = [type("B", (), {"type": "text", "text": text})()]
+            self.stop_reason = "end_turn"
+            self.usage = type("U", (), {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 0,
+                                        "cache_creation_input_tokens": 0})()
+
+    class _Client:
+        def __init__(self):
+            self.messages = self
+
+        def create(self, **kw):
+            calls.append(kw)
+            if "format" in (kw.get("output_config") or {}):
+                req = httpx.Request("POST", "https://example")
+                raise anthropic.BadRequestError("output_config.format is not supported", response=httpx.Response(400, request=req), body=None)
+            if kw.get("max_tokens", 0) <= 1:
+                return _Msg("OK")
+            compact_asked = "compact form" in kw["system"][0]["text"]
+            return _Msg(answer if compact_asked else answer.replace('["PO #|po|18650|0|0.95", "Seal|seal|79063132|1|0.8"]', "[]"))
+
+    doc = type("D", (), {"pages": [], "text_layer": "", "path": Path("page.jpg")})()
+    rd._NO_STRUCTURED_OUTPUT.clear()
+    rd._NO_EFFORT.clear()
+    ex, usage = rd.read_document(_Client(), doc, "claude-opus-5-5", effort="low", brief=True, form="compact")
+    read_system = calls[-1]["system"]
+    check("read_document returns a full Extraction from a compact answer",
+          isinstance(ex, Extraction) and [x.kind for x in ex.numbers] == ["po", "seal"] and ex.numbers[1].handwritten
+          and ex.photo_stamp.present is False)
+    check("asked for with the compact note in the cached system block and the compact schema",
+          "compact form" in read_system[0]["text"] and read_system[0].get("cache_control")
+          and "photo_stamp" not in read_system[0]["text"].split("JSON schema")[-1])
+    calls.clear()
+    rd.warm_cache(_Client(), "claude-opus-5-5", effort="low", brief=True, form="compact")
+    check("the warm-up sends the very same system bytes as the compact read", calls[-1]["system"] == read_system)
+    calls.clear()
+    _os.environ["INTAKE_READ_FORM"] = "compact"
+    try:
+        rd.read_document(_Client(), doc, "claude-opus-5-5", effort="low", brief=True)
+    finally:
+        del _os.environ["INTAKE_READ_FORM"]
+    check("with nothing passed, INTAKE_READ_FORM decides", calls[-1]["system"] == read_system)
+    calls.clear()
+    rd.read_document(_Client(), doc, "claude-opus-5-5", effort="low", brief=True)
+    check("and without it the read is the full form, as before", calls[-1]["system"] == full[1])
+    rd._NO_STRUCTURED_OUTPUT.clear()
+
+
+def test_the_replay_compares_what_the_judge_uses() -> None:
+    """scripts/replay.py (15 Oct 2026) proves a change to the reader on archived pages before it ships:
+    the new reading against the stored one on the fields the judge uses, and a filing decision counted
+    as changed only where one of those would change it."""
+    print("replay: the comparison and the sample")
+    import importlib.util as _ilu
+    spec = _ilu.spec_from_file_location("replay", HERE / "scripts" / "replay.py")
+    rp = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(rp)
+
+    def reading(doc_type="bill_of_lading", conf=0.93, numbers=(), signed=False, stamp=False, pages=("bol",),
+                check_out=None, at_stop="unknown", **over):
+        d = _extraction(doc_type, document_type_confidence=conf,
+                        numbers=[{"label": l, "kind": k, "value": v, "handwritten": False, "confidence": 0.9} for l, k, v in numbers],
+                        pages=[{"page": i, "role": r, "legibility": 0.9} for i, r in enumerate(pages, 1)],
+                        times={"source": "handwritten" if check_out else "none", "check_out": check_out, "at_stop": at_stop})
+        d["signatures"].update({"receiver_signed": signed, "stamp_present": stamp})
+        d.update(over)
+        return d
+
+    load = {"id": 2600001, "reference": {"poNumber": "PO18650"}, "waypoints": [{"type": "CN", "location": {"city": "Aurora"}}]}
+    same = rp.compare_readings(reading(), reading())
+    check("two identical readings agree on every field and change nothing",
+          all(f["agree"] for f in same["fields"].values()) and not same["changes"] and not same["decision_changed"])
+    pod = reading("proof_of_delivery", signed=True, stamp=True, pages=("pod",))
+    lost = rp.compare_readings(pod, reading("proof_of_delivery", signed=False, stamp=False, pages=("pod",)), stage="delivered")
+    check("a POD read again without its signature or stamp has lost its receiver evidence",
+          any(c.startswith("lost receiver evidence") for c in lost["changes"]) and lost["pod_lost_evidence"])
+    gained = rp.compare_readings(reading(), reading("proof_of_delivery", signed=True, pages=("pod",)), stage="delivered")
+    check("a BOL read again as a signed POD is a type flip and gained evidence",
+          any(c.startswith("type flip: BOL -> POD") for c in gained["changes"])
+          and any(c.startswith("gained receiver evidence") for c in gained["changes"]) and not gained["pod_lost_evidence"])
+    check("a confidence that crosses the 85% bar is a bar flip; one that moves within a band is not",
+          any(c.startswith("bar flip") for c in rp.compare_readings(reading(conf=0.93), reading(conf=0.82))["changes"])
+          and not rp.compare_readings(reading(conf=0.93), reading(conf=0.86))["changes"]
+          and any(c.startswith("bar flip") for c in rp.compare_readings(reading(conf=0.75), reading(conf=0.65))["changes"]))
+    check("shipping paperwork read as other is the same to the judge: noted, not a decision change",
+          not rp.compare_readings(reading("shipping_document", pages=("other",)), reading("other", pages=("other",)))["decision_changed"]
+          and not rp.compare_readings(reading("shipping_document", pages=("other",)), reading("other", pages=("other",)))["fields"]["document_type"]["agree"])
+    old = reading(numbers=(("Cust PO", "po", "PO 18650"), ("Trailer", "trailer", "8711")))
+    check("a number written differently but normalised the same is the same reference",
+          not rp.compare_readings(old, reading(numbers=(("PO", "po", "PO-18650"), ("Trailer", "trailer", "8711"))), load)["changes"])
+    gone = rp.compare_readings(old, reading(numbers=(("Trailer", "trailer", "8711"),)), load)
+    check("a reference number that matched the load and is gone is a lost matching reference",
+          any(c.startswith("lost matching reference: PO # PO18650") for c in gone["changes"])
+          and gone["fields"]["matched_references"]["old"] == ["PO # PO18650"] and gone["fields"]["matched_references"]["new"] == [])
+    check("without the load's JSON the reference numbers are compared on their own",
+          any(c.startswith("lost reference number: PO18650") for c in rp.compare_readings(old, reading(numbers=(("Trailer", "trailer", "8711"),)))["changes"])
+          and not rp.compare_readings(old, reading(numbers=(("Cust PO", "po", "PO 18650"),)))["changes"])
+    more = rp.compare_readings(reading(numbers=(("Cust PO", "po", "PO 18650"),)),
+                               reading(numbers=(("Cust PO", "po", "PO 18650"),), consignee={"city": "Aurora"}), load)
+    check("a reading that now passes the facts check is a decision change the other way",
+          any(c.startswith("facts check now passes") for c in more["changes"]) and more["fields"]["facts_check"]["old"] is False)
+    two = reading(pages=("bol", "bol"))
+    check("a page role that changes which pages go up changes the decision; one that does not is a note",
+          any(c.startswith("pages that go up: [1, 2] -> [1]") for c in rp.compare_readings(two, reading(pages=("bol", "photo")))["changes"])
+          and not rp.compare_readings(two, reading(pages=("bol", "pod")))["decision_changed"]
+          and any("same pages go up" in n for n in rp.compare_readings(two, reading(pages=("bol", "pod")))["notes"]))
+    out_old = reading(check_out="14:10", at_stop="unknown")
+    flip = rp.compare_readings(out_old, reading(check_out="14:10", at_stop="shipper"), stage="delivered")
+    check("an out time moved from an unstated stop to the shipper is no longer delivery evidence: a type flip for the judge",
+          flip["fields"]["delivery_times"] == {"old": True, "new": False, "agree": False}
+          and any(c.startswith("type flip: POD -> BOL") for c in flip["changes"]))
+    check("a corroborated POD that stops being one is a decision change at the same band",
+          any(c.startswith("corroborated POD True -> False") for c in rp.compare_readings(
+              reading("proof_of_delivery", conf=0.78, signed=True, pages=("pod",), numbers=(("PO", "po", "18650"),),
+                      consignee={"city": "Aurora"}, signatures={"shipper_signed": False, "driver_signed": False,
+                                                                 "receiver_signed": True, "stamp_present": False, "receiver_date": "10/14/26"}),
+              reading("proof_of_delivery", conf=0.78, signed=True, pages=("pod",), numbers=(("PO", "po", "18650"),),
+                      consignee={"city": "Aurora"}),
+              {**load, "waypoints": [{"type": "CN", "location": {"city": "Aurora"}, "appointmentTime": {"open": "2026-10-14T12:00:00Z"}}]},
+              stage="delivered")["changes"]))
+
+    pool = ([{"sha256": f"p{i}", "stratum": "pod"} for i in range(40)] + [{"sha256": f"b{i}", "stratum": "bol"} for i in range(60)]
+            + [{"sha256": f"l{i}", "stratum": "lumper"} for i in range(1)] + [{"sha256": f"o{i}", "stratum": "other"} for i in range(30)])
+    shares = rp.shares_of("pod=35,bol=35,lumper=10,other=20")
+    one = rp.sample(pool, 20, 1, shares)
+    by = {s: sum(1 for p in one if p["stratum"] == s) for s in rp.STRATA}
+    check("the sample is stratified by the shares, a short stratum giving what it has and the rest filled",
+          len(one) == 20 and by["lumper"] == 1 and by["pod"] == 7 and by["other"] == 4 and by["bol"] == 8, str(by))
+    check("and seeded: the same seed picks the same pages, another seed others",
+          [p["sha256"] for p in rp.sample(pool, 20, 1, shares)] == [p["sha256"] for p in one]
+          and [p["sha256"] for p in rp.sample(pool, 20, 2, shares)] != [p["sha256"] for p in one])
+    check("every stored type lands in a stratum",
+          (rp.stratum_of("proof_of_delivery"), rp.stratum_of("bill_of_lading"), rp.stratum_of("lumper"),
+           rp.stratum_of("rate_confirmation"), rp.stratum_of(None)) == ("pod", "bol", "lumper", "other", "other"))
+    check("the judge's kind follows classify_type and the stage",
+          rp.judge_kind(_Ex(reading("proof_of_delivery", signed=True, pages=("pod",))), "loaded") == "POD"
+          and rp.judge_kind(_Ex(reading("lumper", pages=("lumper",))), "delivered") == "LUMPER"
+          and rp.judge_kind(_Ex(reading("other", pages=())), "delivered") == "not paperwork"
+          and rp.judge_kind(_Ex(reading()), "delivered") == "BOL")
+    b = rp.Budget(0.10)
+    b.charge(0.0)
+    steps = [b.can_start()]
+    b.start()
+    steps.append(b.can_start())
+    b.start()
+    steps.append(b.can_start())
+    b.finish(0.03)
+    steps.append(b.can_start())
+    b.finish(0.02)
+    steps.append(b.can_start())
+    b.finish(0.0)
+    check("the spend cap leaves room for every read in flight at the dearest read seen, and never starts one past it",
+          steps == [True, True, False, False, True] and abs(b.spent - 0.05) < 1e-9 and b.reserve == 0.05, str(steps))
+    b2 = rp.Budget(0.10)
+    b2.start()
+    b2.finish(0.08)
+    check("a dearer read raises the reserve", b2.reserve == 0.08 and not b2.can_start())
+    check("without a cap every read may start", rp.Budget(None).can_start() and rp.Budget(None).left() is None)
+
+
+def _Ex(d: dict):
+    from pod_intake.schema import Extraction
+    return Extraction.model_validate(d)
+
+
 def test_auto_upload_dry_run_and_off() -> None:
     print("auto-upload: dry run and off")
     import time as _time
@@ -5772,6 +6006,8 @@ if __name__ == "__main__":
     test_the_reader_warms_its_cache()
     test_the_quick_look_sets_aside_rate_confirmations()
     test_the_morning_report_shows_the_spend()
+    test_the_compact_answer_form()
+    test_the_replay_compares_what_the_judge_uses()
     test_auto_upload_dry_run_and_off()
     test_upload_log_sheet()
     test_every_load_state_is_classified()

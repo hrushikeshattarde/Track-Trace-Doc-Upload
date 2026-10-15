@@ -142,6 +142,11 @@ def _worker_env(env: dict) -> dict:
             # look, unread ("off" sends them to the full read again), and a sure BOL copy on a load that
             # has its BOL waits unread until the truck is at the consignee ("off" reads it at once).
             "INTAKE_CACHE_TTL": "1h", "INTAKE_QUICK_RATECON": "on", "INTAKE_AUTO_PARK_BOL": "on",
+            # The full read's answer form (15 Oct 2026): "compact" - each reference number one string, the
+            # unused fields left out - since the replay of that day (scripts/replay.py: 100 pages, the
+            # same decisions within the model's own run-to-run variation, 18% cheaper a read). "full" is
+            # the form as it always was. Taken from .env when set there.
+            "INTAKE_READ_FORM": (env.get("INTAKE_READ_FORM") or "compact").strip().lower(),
             "INTAKE_GMAIL_SECRET": GMAIL_SECRET, "INTAKE_UPLOAD_SHEET_ID": env["INTAKE_UPLOAD_SHEET_ID"],
             # The bot's own TransportPro login, once an admin has made one and somebody has put it in
             # Secrets Manager as JSON {username, password}. Until then uploads go in as the reading login.

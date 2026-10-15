@@ -626,22 +626,25 @@ def _load_is_satisfied(conn, load_id) -> bool:
 
 
 def make_reader(model: str, timeout: float | None = None, effort: str | None = None, brief: bool = False,
-                max_pages: int | None = None) -> Reader:
+                max_pages: int | None = None, form: str | None = None) -> Reader:
     """Adapter over pod_intake.reader. Bytes go to a temp file because normalize.load_document
     works on paths (PyMuPDF opens PDFs and images the same way), and the file is deleted straight
     after - the ledger keeps the hash and the extraction, never the document.
 
     `timeout` bounds one read, retries included. The SDK's own default is ten minutes, which is the
-    whole of a Lambda run: one stuck read there would stop the worker before it hands its ledger back."""
+    whole of a Lambda run: one stuck read there would stop the worker before it hands its ledger back.
+    `form` is the answer form (pod_intake.reader.FORMS); when not given, INTAKE_READ_FORM decides,
+    read once here so a bad value fails the build of the reader and not its hundredth read."""
     from pod_intake import provider, reader as claude_reader
     from pod_intake.localenv import load_local_env
     from pod_intake.normalize import load_document
 
     load_local_env()
+    form = form or claude_reader.read_form()
     client, which = provider.make_client()
     if timeout:
         client = client.with_options(timeout=timeout, max_retries=1)
-    print(f"  reader: {model} via {provider.describe()}")
+    print(f"  reader: {model} via {provider.describe()}" + (f", {form} form" if form != claude_reader.FULL else ""))
 
     def read(data: bytes, filename: str) -> tuple[dict, str, str, float]:
         suffix = Path(filename).suffix or (".pdf" if data[:5] == b"%PDF-" else ".png")
@@ -649,8 +652,11 @@ def make_reader(model: str, timeout: float | None = None, effort: str | None = N
         try:
             tmp.write_bytes(data)
             doc = load_document(tmp, max_pages=max_pages)
-            extraction, usage = claude_reader.read_document(client, doc, model, effort=effort, brief=brief)
-            return extraction.model_dump(), extraction.document_type, model, round(usage.cost_usd, 5)
+            extraction, usage = claude_reader.read_document(client, doc, model, effort=effort, brief=brief, form=form)
+            # The ledger's model column names the form too (15 Oct 2026), so a later replay can take the
+            # reads of one form as its baseline: "claude-opus-5-5 compact". Nothing parses the column back.
+            recorded = model if form == claude_reader.FULL else f"{model} {form}"
+            return extraction.model_dump(), extraction.document_type, recorded, round(usage.cost_usd, 5)
         finally:
             # Best-effort. On Windows PyMuPDF keeps a handle on the file it opened, so the unlink
             # can raise PermissionError (WinError 32) - and raising it from `finally` would throw
@@ -665,7 +671,7 @@ def make_reader(model: str, timeout: float | None = None, effort: str | None = N
         """Put the instruction sheet into the prompt cache before a burst of reads (reader.warm_cache,
         autofile._warm); returns what it cost. A short timeout of its own: a slow warm-up must not
         eat the reads' window, and the reads write the cache themselves if it never came."""
-        usage = claude_reader.warm_cache(client.with_options(timeout=20), model, effort=effort, brief=brief)
+        usage = claude_reader.warm_cache(client.with_options(timeout=20), model, effort=effort, brief=brief, form=form)
         return round(usage.cost_usd, 5)
 
     read.warm = warm

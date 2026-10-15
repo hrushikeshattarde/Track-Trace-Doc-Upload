@@ -321,7 +321,7 @@ Each document without a reading goes down this ladder:
 | 4 | **Quick look**: Claude Haiku 4.5, first 4 pages at 1,100 px (3 until 14 Oct 2026: the brokerage's rate confirmation is a four-page form), 8 in parallel, 60 s timeout. (Haiku 5.5 is ready in the code - it is asked for low effort with room to think - but on 8 Oct 2026 Bedrock's Messages endpoint in us-east-1 did not serve it yet.) Answers `pod`, `bol`, `other_paperwork`, `rate_confirmation` (since 14 Oct 2026: the brokerage's own contract, sent back signed), `photo` or `not_freight`, with a confidence. Stored in `quicklook`. | ~$0.002 |
 | 5 | **Skip the full read** only when the quick look says `photo`, `not_freight` or `rate_confirmation` at 80% or more (`SET_ASIDE`; `INTAKE_QUICK_RATECON=off` sends rate confirmations to the full read again - they cost 22 reads, $1.89, on 14 Oct 2026 as "bol"; a rate confirmation counts only when the quick look saw every page of the file, because a carrier's invoice packet opens with the contract and carries the signed POD behind it - 5 of 150 stored PODs, 6 to 12 pages each, were called a sure rate confirmation by a three-page look), or when the page is already on the load (a texted picture), the truck isn't at the consignee, and the quick look called it anything but `pod`. A texted POD pulls the other pictures from its text batch into the full read. Since 14 Oct 2026 also when the load already shows Documents Received, or the page is on a load outside the pilot, and the quick look is sure it is a `bol` or a `pod`: no full read could change what happens to it. **A BOL copy is parked** (`park_bol`, the evening of 14 Oct 2026): an emailed page the quick look is sure is a `bol`, on a pilot load that already has its BOL on file (`_has_bol`: type 12, or a Driver Supplied BOL that reads as a BOL or POD), is not read while the truck is not at the consignee and the delivery appointment has not passed. Read, such a page was recorded as not needed every time - 25 reads, about $1, that day - but one sure `bol` in six is a signed POD by the full read, and a load still waiting for its POD must have it. So the page waits (6.4), in the ledger only, and is looked at again every run: not needed once the load has a POD on file or shows Documents Received, read in full and judged like any other page once the truck is at the consignee or the appointment has passed with no POD on the load. A load that finishes while the bot is no longer looking at it (a finished load is looked at only for a lumper receipt, and only for 7 days after its mail) has its parked rows tidied from the ledger at the start of the next run (`withdraw_parked`). `INTAKE_AUTO_PARK_BOL=off` reads such pages at once, as before. | – |
 | 5b | **Warm the prompt cache** (14 Oct 2026). Every read sends the same 10,125-token instruction sheet (the reader's rules and, on Bedrock, the JSON schema). A read that finds it in the prompt cache pays 0.2 cents for it; one that has to write it pays 5 cents, more than the rest of the read - and a run's six parallel readers all started cold and all wrote it (114 of the day's 509 single-page reads cost 7-9 cents against 2-4 cents). Now, before two or more reads start, one one-token call with the reads' own system block warms the cache (`reader.warm_cache`, `autofile._warm`), and the cache is asked to live an hour instead of five minutes (`INTAKE_CACHE_TTL`: `1h`, or `5m`), so it also outlives the 15 minutes between runs. A warm-up that fails is a warning; the reads then write the cache themselves. | 8 cents when cold, under a cent when warm |
-| 6 | **Full read**: Claude Opus 5.5 on Bedrock (since 8 Oct 2026; Opus 5 before), effort `low`, brief notes, 1,568 px pages sent as JPEG, 6 reads in parallel (3 until 14 Oct 2026), 120 s timeout each. A file over 10 pages (`CHUNK_PAGES`) is read in pieces of up to 10 pages, one read per piece (`pieces_to_read`, `_read_input`). Each piece's reading is kept in `read_part` until every piece is in; then `merge_readings` ([`pod_intake/reader.py`](../pod_intake/reader.py)) combines them into one reading for the whole file. The file is a POD if any piece is, the receiver's name and delivery times come from the piece that has them, and pages are numbered as in the file. The result is the `Extraction` in [`pod_intake/schema.py`](../pod_intake/schema.py), stored in `attachment.extraction_json`. | ~$0.04 a read; a 27-page packet ~$0.40 |
+| 6 | **Full read**: Claude Opus 5.5 on Bedrock (since 8 Oct 2026; Opus 5 before), effort `low`, brief notes, 1,568 px pages sent as JPEG, 6 reads in parallel (3 until 14 Oct 2026), 120 s timeout each. A file over 10 pages (`CHUNK_PAGES`) is read in pieces of up to 10 pages, one read per piece (`pieces_to_read`, `_read_input`). Each piece's reading is kept in `read_part` until every piece is in; then `merge_readings` ([`pod_intake/reader.py`](../pod_intake/reader.py)) combines them into one reading for the whole file. The file is a POD if any piece is, the receiver's name and delivery times come from the piece that has them, and pages are numbered as in the file. The result is the `Extraction` in [`pod_intake/schema.py`](../pod_intake/schema.py), stored in `attachment.extraction_json`. **The answer form** (`INTAKE_READ_FORM`, 15 Oct 2026): `full`, the schema as it has always been, or `compact` - each reference number one string `label|kind|value|hw|conf` and the fields nothing downstream reads (photo stamp, carrier DOT/MC, driver name and phone) left out - which the reader parses back into the same `Extraction` (`schema.compact_to_extraction`), so the judge, the ledger and the sheet see no difference. The answer is three quarters of what a read costs, and a BOL's 25 reference numbers are five labelled fields each. The default is `full` until the offline replay (section 9) has proved the compact form on archived pages. First replay, 15 Oct 2026, 100 pages and 20 pairs: the compact answer was 33% shorter (582 against 873 output tokens) and a warm read 18% cheaper (2.7 against 3.3 cents); 17 of 100 filing decisions differed from the stored reading, against 3 of 20 for the unchanged full form read again - two low-effort reads of one page disagree about as often. **Production has read in the compact form since 15 Oct 2026** (`INTAKE_READ_FORM=compact` in the worker's environment; such reads carry `claude-opus-5-5 compact` in the ledger's `attachment.model`, the baseline for the next replay). | ~$0.04 a read; a 27-page packet ~$0.40 |
 
 The full read returns:
 
@@ -877,8 +877,32 @@ spend, and a day past `INTAKE_SPEND_WARN_USD` ($30) is flagged in its subject. T
 breakdown and the remaining proposals are in the 14 Oct 2026 write-up "Cutting the auto-upload
 bot's AI spend".
 
-**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 787 offline checks: no network, no
+**Tests.** `.venv\Scripts\python.exe tests\test_intake.py` runs 828 offline checks: no network, no
 model, no credentials. Run it before every deploy.
+
+**Proving a change to the reader before it ships** (`scripts/replay.py`, 15 Oct 2026). Anything that
+changes what the model is asked - a shorter answer form, another model or effort - is replayed first
+on pages the bot has already read, against a COPY of the ledger (`aws s3 cp s3://<bucket>/ledger/intake.sqlite3 out\ledger-copy\`;
+never uploaded back). The replay takes a seeded, stratified sample (PODs, BOLs, lumper receipts, other
+paperwork) of emailed pages whose stored reading came from the baseline model in one piece, fetches
+their bytes from S3 (`attachment.s3_key`, checked against the hash), reads them again with the
+candidate configuration, and compares each new reading with the stored one on what the judge uses:
+the document type and the judge's kind, the side of the 85% bar and the 70% floor, receiver signature
+and stamp, the reference numbers (normalised as `match_facts_detail` does) and, with `--fetch-loads`
+(a read-only GET per load into a JSON cache - the ledger holds no copy of TransportPro's load JSON),
+the facts they match on the load, the page roles and the pages that would go up, in/out times. A
+page's filing decision counts as changed on a type flip, a bar flip, a lost matching reference, lost or
+gained receiver evidence, a change in the pages that go up, or a corroborated POD that stops being
+one. `--pair N` re-reads N pages with the default form too: two reads of one page do not agree
+perfectly even with nothing changed, and the pairs measure that noise floor and calibrate the stored
+readings' output tokens. `--dry-run` prints the sample and the cost estimate and calls nothing. Each
+new reading is kept under `out/replay/readings/<candidate>/` as it comes back, so a rerun reads only
+what is missing. Adoption rule for a cheaper answer: ship only if at least 98 of 100 filing decisions
+are identical and no POD loses its receiver evidence.
+
+```
+.venv\Scripts\python.exe scripts\replay.py --ledger out\ledger-copy\intake.sqlite3 --sample 100 --seed 1 --form compact --pair 20 --fetch-loads --dry-run
+```
 
 **Changing the pilot's pods.** Change `AUTO_TERMINALS` in `scripts/deploy_lambda.py` and deploy. A pod that
 wants its own tab goes in `UPLOAD_TABS` there (terminal -> tab name); the worker creates the tab with its header
@@ -917,6 +941,7 @@ The sheet has a Pod column, so one sheet serves several pods.
 | `pod_intake/schema.py` | the `Extraction` schema |
 | `pod_intake/matcher.py` | `classify_type`, page comments |
 | `scripts/deploy_lambda.py` | build, deploy and operate |
+| `scripts/replay.py` | offline replay: re-read archived pages with a candidate reader configuration, compare with the stored readings on what the judge uses |
 
 **Local tools, not run in AWS:** the `intake` CLI (`python -m intake …`: `status`, `load`, `queue`,
 `backfill`, `reconsider`, `tpro-scan`, `file`, `review`, `export`…), `readiness.py`, `run.py`,

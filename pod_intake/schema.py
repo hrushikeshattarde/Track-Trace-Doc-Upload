@@ -117,6 +117,11 @@ class PageInfo(BaseModel):
     signed: Optional[bool] = Field(default=None, description="True when this page carries any handwritten signature, handwritten mark or stamp.")
 
 
+AMOUNT_DESCRIPTION = ("The total paid or charged as printed on a receipt or invoice - a lumper receipt's total, "
+                      "e.g. '250.00'. Null when the page shows none.")
+NOTES_DESCRIPTION = "Anything a reviewer should know: handwriting, glare, several documents in one file, unusual layout."
+
+
 class Extraction(BaseModel):
     document_type: DocType
     document_type_confidence: float = Field(ge=0, le=1)
@@ -134,10 +139,86 @@ class Extraction(BaseModel):
     times: Times
     pieces: Optional[str] = None
     weight_lbs: Optional[str] = None
-    amount: Optional[str] = Field(default=None, description="The total paid or charged as printed on a receipt or invoice - a lumper receipt's total, e.g. '250.00'. Null when the page shows none.")
+    amount: Optional[str] = Field(default=None, description=AMOUNT_DESCRIPTION)
     photo_stamp: PhotoStamp = Field(default_factory=PhotoStamp)
     pages: List[PageInfo]
-    notes: str = Field(description="Anything a reviewer should know: handwriting, glare, several documents in one file, unusual layout.")
+    notes: str = Field(description=NOTES_DESCRIPTION)
+
+
+# The compact answer form (15 Oct 2026). Three quarters of what a read costs is the model's written
+# answer, and most of that is the reference numbers: each one is five labelled JSON fields, about 40
+# tokens, and a BOL carries 7 of them at the median and up to 50. Here each number is ONE string,
+# 'label|kind|value|hw|conf', and the fields nothing in production reads - photo_stamp, carrier_dot,
+# carrier_mc, driver_name, driver_phone - are not asked for. What the model answers is parsed back
+# into a full Extraction (compact_to_extraction), so the judge, the ledger and the sheet see the
+# same shape as before. Chosen by INTAKE_READ_FORM=compact (pod_intake.reader.read_form); the
+# default stays the full form until an offline replay (scripts/replay.py) has proved this one.
+NUMBER_SEP = "|"
+NUMBER_KINDS: tuple[str, ...] = NumberKind.__args__          # the kinds a compact number may name
+COMPACT_NUMBER_DESCRIPTION = (
+    "One string per reference number, 'label|kind|value|hw|conf': the label printed next to it, exactly as on the "
+    "paper (e.g. 'Pickup Nbr', 'B/L No.', '(unlabeled handwriting)'); its kind, one of " + ", ".join(NUMBER_KINDS)
+    + "; the number or code exactly as printed, keeping letters, digits, '#', '-' and '/', no spaces; 1 if "
+    "handwritten else 0; your confidence 0-1. For example 'Pickup Nbr|pickup|P2600001|0|0.95'.")
+
+
+class CompactExtraction(BaseModel):
+    """What the model is asked for in the compact form: Extraction without its unused fields, and
+    numbers as strings. Never stored or judged as it is - compact_to_extraction turns it into an
+    Extraction first."""
+    document_type: DocType
+    document_type_confidence: float = Field(ge=0, le=1)
+    numbers: List[str] = Field(description=COMPACT_NUMBER_DESCRIPTION)
+    shipper: Party
+    consignee: Party
+    carrier_name: Optional[str] = None
+    ship_date: Optional[str] = None
+    delivery_date: Optional[str] = None
+    signatures: Signatures
+    times: Times
+    pieces: Optional[str] = None
+    weight_lbs: Optional[str] = None
+    amount: Optional[str] = Field(default=None, description=AMOUNT_DESCRIPTION)
+    pages: List[PageInfo]
+    notes: str = Field(description=NOTES_DESCRIPTION)
+
+
+_HANDWRITTEN = {"1", "true", "t", "y", "yes", "hw", "handwritten"}
+UNPARSED_LABEL = "(unparsed)"
+
+
+def parse_number(text: str) -> NumberField:
+    """A compact number string back into a NumberField.
+
+    Lenient on purpose: a page's numbers are matching evidence and a dropped one can hold a POD. A
+    kind the schema does not know becomes "other" (the value still matches by its digits); a missing
+    or odd hw or conf takes a default; and a string with fewer than three parts is kept whole as the
+    value, labelled UNPARSED_LABEL, so 'PO 12345' with no separators still matches the load's PO
+    through intake.autofile.match_facts_detail, which compares digits. The label may itself hold a
+    '|': the split is from the right, and a value never contains one (the schema says so)."""
+    parts = [p.strip() for p in str(text).rsplit(NUMBER_SEP, 4)]
+    if len(parts) < 3 or not parts[2]:
+        value = str(text).strip()
+        return NumberField(label=UNPARSED_LABEL, kind="other", value=value, handwritten=False, confidence=0.5)
+    parts += [""] * (5 - len(parts))
+    label, kind, value, hw, conf = parts[0], parts[1].lower().replace(" ", "_"), parts[2], parts[3], parts[4]
+    try:
+        confidence = min(1.0, max(0.0, float(conf)))
+    except ValueError:
+        confidence = 0.5
+    return NumberField(label=label or UNPARSED_LABEL, kind=kind if kind in NUMBER_KINDS else "other",
+                       value=value, handwritten=hw.lower() in _HANDWRITTEN, confidence=confidence)
+
+
+def compact_to_extraction(compact: CompactExtraction) -> tuple[Extraction, list[str]]:
+    """(the full Extraction a compact answer stands for, the number strings that were not in the
+    'label|kind|value|hw|conf' shape and were kept whole as values). The fields the compact form does
+    not ask for take their defaults: no photo stamp, no carrier DOT/MC, no driver."""
+    data = compact.model_dump()
+    numbers = [parse_number(s) for s in data.pop("numbers") or []]
+    unparsed = [n.value for n in numbers if n.label == UNPARSED_LABEL]
+    data["numbers"] = [n.model_dump() for n in numbers]
+    return Extraction.model_validate(data), unparsed
 
 
 class Adjudication(BaseModel):
