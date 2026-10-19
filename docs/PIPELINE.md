@@ -390,7 +390,7 @@ truck's stage.
 | Facts on the page that match the load | at least 2 (`INTAKE_AUTO_MIN_FACTS`), one of them a reference number |
 | The email thread | no reply may name a different load |
 | A page the AI called a POD | must show a receiver signature, stamp or delivery time |
-| A POD | needs a receiver signature or stamp. An in/out time alone isn't enough: on load 2562069 it was the truck's dashboard clock. |
+| A POD | needs a receiver signature or stamp. An in/out time alone isn't enough: on load 2562069 it was the truck's dashboard clock. A signature the reader could not place is the receiver's when it is dated on the delivery day, after the ship date, with the truck at the consignee or delivered (`dated_signature`, 19 Oct 2026, load 2613790: 'Dana Tucker 10/19/26' across the foot of a BOL shipped 10-16). |
 
 A POD the AI is 70% to 84% sure of is still accepted when the page corroborates the reading three
 ways (`corroborated_pod`, 28 Sep 2026): the receiver's signature or stamp is on it, the receiver's date is
@@ -460,6 +460,15 @@ Waiting decisions stay in the ledger only, as the pod asked on 24 Sep.
 - Strong facts (reference numbers): load #, pickup #, PO #, reference #, manifest #, EDI reference #,
   BOL #, seal #, container #, and the stops' reference numbers.
 - Weak facts: pieces, weight, and the shipper or consignee city.
+- The trailer and the truck on the load's dispatch are reference numbers too (`equipment_numbers`,
+  `equipment_match`, 19 Oct 2026), asked of TransportPro once a run per load. They count only beside a
+  matching stop city and a date that puts the page on this trip, because the driver's last load rode
+  the same trailer. Loads 2613788 and 2613790: CVS's handwritten BOL for its returns to CLS Lebanon
+  names no number of the load's but the trailer the driver writes in "Carrier's No.", and the customer
+  runs several such loads on the lane a day; the trailer (288469, 3222) is what tells them apart.
+- A reference number read one character off still matches when another fact on the page does
+  (`_one_off`, load 2613790: a handwritten LD003241409 read as LD00324409): eight characters or more,
+  the first two the same, never the page's only fact.
 - Exact matches are tried first. Then loose ones: one number contains the other (6 or more
   characters), or they share a core of 5 or more digits with only letters around it, so
   `PO18650` = `18650`. Leading zeros in that core are ignored: `TD049406` = `TD49406` (load 2609383,

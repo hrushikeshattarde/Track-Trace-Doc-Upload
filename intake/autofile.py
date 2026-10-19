@@ -412,6 +412,7 @@ def run(conn: sqlite3.Connection, tpro, store, read: Callable | None, log, s: Se
         return stats
     uploader = uploader or tpro
     _LANE_CACHE.clear()
+    _EQUIPMENT_CACHE.clear()
     day = dt.datetime.now(dt.timezone.utc).date().isoformat()
     stats.spent_today = float(db.get_state(conn, f"ai_spend:{day}") or 0)
     if reopen_too_long(conn):
@@ -796,7 +797,7 @@ def _batch_mates(conn, store, tpro, s: Settings, row, load: dict, filed: list[On
             continue
         d = file_doc(of, filed)
         dec = judge(conn, s, row, load, filed, d, json.loads(att["extraction_json"]),
-                    sig=lambda d=d: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load))
+                    sig=lambda d=d: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load), equipment=lambda: equipment_numbers(tpro, load))
         if dec is not None:
             out.append(dec)
     return out
@@ -817,7 +818,7 @@ def _sent_mates(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnF
             continue
         have.add(d.sha256)
         dec = judge(conn, s, row, load, filed, d, json.loads(att["extraction_json"]),
-                    sig=lambda d=d: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load))
+                    sig=lambda d=d: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load), equipment=lambda: equipment_numbers(tpro, load))
         if dec is not None:
             out.append(dec)
     return out
@@ -1482,7 +1483,7 @@ def _decide(conn, store, tpro, s: Settings, row, load: dict, filed: list[OnFile]
         # Parked, not needed, or None: not read yet, next run.
         return park_bol(conn, s, d, q, (row["stage"] or "").lower(), load, filed)
     return judge(conn, s, row, load, filed, d, json.loads(att["extraction_json"]),
-                 sig=lambda: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load))
+                 sig=lambda: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load), equipment=lambda: equipment_numbers(tpro, load))
 
 
 def on_file_by_picture(conn, store, tpro, filed: list[OnFile], d: Doc, q: tuple[str, float] | None) -> OnFile | None:
@@ -1778,6 +1779,54 @@ STREET_NOISE = frozenset("RD ROAD DR DRIVE ST STREET AVE AVENUE STE SUITE BLVD B
                          "PKWY PARKWAY WAY PL PLACE N S E W NORTH SOUTH EAST WEST NE NW SE SW UNIT BLDG FL RM ROOM".split())
 NAME_NOISE = frozenset("LLC INC CO CORP CORPORATION COMPANY LTD LP LLP THE OF AND DBA".split())
 _LANE_CACHE: dict[int, list | None] = {}     # load id -> lane_loads, for one run
+_EQUIPMENT_CACHE: dict[int, list[tuple[str, str]]] = {}   # load id -> equipment_numbers, for one run
+EQUIPMENT_KINDS = frozenset({"trailer", "tractor", "other", "shipper_ref", "bol", "order", "load_or_trip", "seal"})
+
+
+def equipment_numbers(tpro, load: dict) -> list[tuple[str, str]]:
+    """(label, number) for the trailer and the truck on the load's dispatch, asked once a run.
+
+    Loads 2613788 and 2613790 (19 Oct 2026): CVS's short-form BOL for its returns to CLS Lebanon carries
+    none of the load's numbers - the driver writes the trailer number in "Carrier's No." and little else -
+    and the customer runs several such loads on the lane the same day, so neither the numbers nor the
+    lane could tell the pages apart. TransportPro's dispatch holds the trailer (3222 on the one, 288469
+    on the other): a number the driver wrote that is this load's trailer ties the page to the load."""
+    load_id = int(load.get("id") or 0)
+    if load_id in _EQUIPMENT_CACHE:
+        return _EQUIPMENT_CACHE[load_id]
+    out: list[tuple[str, str]] = []
+    fetch = getattr(tpro, "dispatches", None)
+    if fetch is not None and load_id:
+        try:
+            for disp in fetch(load_id) or []:
+                who = disp.get("assignedTo") or {}
+                for label, key in (("trailer #", "trailerNumber"), ("truck #", "tractorNumber")):
+                    raw = str(who.get(key) or "").strip()
+                    v = _norm(raw)
+                    if len(v) >= 3 and any(c.isdigit() for c in v) and all(v != _norm(x[1]) for x in out):
+                        out.append((label, raw))
+        except Exception as e:  # noqa: BLE001 - the page is judged on the load's own numbers, as before
+            print(f"  ! dispatch check for load {load_id} failed: {type(e).__name__}: {str(e)[:120]}")
+            out = []
+    _EQUIPMENT_CACHE[load_id] = out
+    return out
+
+
+def equipment_match(ex, load: dict, numbers: list[tuple[str, str]], hits: list[str]) -> list[str]:
+    """The dispatch's trailer or truck number written on the page, as reference facts - or nothing.
+    Counted only when a stop's city already matches and the page's date puts it on this trip: the same
+    trailer carried the driver's last load too (load 2613788's texted Market Basket POD named trailer
+    288469 and nothing else of the load's), and a city and a date are what set the two apart."""
+    if not numbers or not any(h.startswith(("shipper city", "consignee city")) for h in hits):
+        return []
+    if page_on_trip(ex, load) is None:
+        return []
+    out: list[str] = []
+    for label, raw in numbers:
+        want = _norm(raw)
+        if any(_norm(n.value) == want and n.kind in EQUIPMENT_KINDS for n in ex.numbers):
+            out.append(f"{label} {raw} (on the dispatch)")
+    return out
 
 
 def _words(text: Any) -> list[str]:
@@ -1905,7 +1954,8 @@ def lane_match(ex, load: dict, s: Settings, others: Callable[[], list[dict] | No
 
 
 def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, reading: dict, *,
-          sig: Callable[[], list], others: Callable[[], list[dict] | None] | None = None) -> Decision | None:
+          sig: Callable[[], list], others: Callable[[], list[dict] | None] | None = None,
+          equipment: Callable[[], list[tuple[str, str]]] | None = None) -> Decision | None:
     """What should happen to this document on this load. Makes no TransportPro call and records
     nothing; `sig` may fetch the document from the archive once, to thumbnail it."""
     from pod_intake.matcher import classify_type
@@ -1918,7 +1968,7 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
         return Decision(d, NOT_PAPERWORK, f"read as {ex.document_type}", ex=ex)
 
     stage = (row["stage"] or "").lower()
-    later = later_copy_signature(conn, int(row["load_id"]), d, ex, filed, stage)
+    later = later_copy_signature(conn, int(row["load_id"]), d, ex, filed, stage) or dated_signature(ex, load, stage)
     type_name, _ = classify_type(ex, {"dispatch_status": stage.title()})
     receiver = ex.signatures.receiver_signed or ex.document_type == "proof_of_delivery"
     if type_name == "Proof of Delivery":
@@ -1944,6 +1994,10 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
     # request's PO is a reference number of the load's as much as TransportPro's are (14 Oct 2026).
     efs = db.efs_requests(conn, int(row["load_id"])) if kind == LUMPER else []
     dec.facts, dec.strong = match_facts_detail(ex, load, extra=efs_facts(efs))
+    if equipment is not None and kind != LUMPER:
+        gear = equipment_match(ex, load, equipment(), dec.facts)
+        dec.facts.extend(gear)
+        dec.strong.extend(gear)
     strong = len(dec.strong)
 
     # Already on the load? The same file, or the same picture under a type that counts. Only the pages
@@ -2045,6 +2099,38 @@ def judge(conn, s: Settings, row, load: dict, filed: list[OnFile], d: Doc, readi
                           f"{stage or 'at an unknown stage'}; uploads once it reaches the consignee" + waiting_note(ex, load))
             return dec
     return dec
+
+
+def dated_signature(ex, load: dict | None, stage: str) -> str | None:
+    """A signature the reader could not place, dated on the delivery day, is the receiver's - or None.
+
+    Load 2613790 (19 Oct 2026): CVS's short-form BOL came back from CLS Lebanon with 'Dana Tucker
+    10/19/26' written across its foot, three days after the 10-16 ship date, with the truck delivered.
+    The reader reported it as a signature it could not attribute (Signatures.other_signed) and typed
+    the page a BOL. A dated signature made on the delivery day, after the ship date, with TransportPro's
+    truck at the consignee or delivered, was written at delivery: it is the receiver's, and the page is
+    a POD signed by that name on that date. The same-day case, where the ship date gives nothing away,
+    is later_copy_signature's."""
+    sig = ex.signatures
+    if sig.receiver_signed or not getattr(sig, "other_signed", False) or not getattr(sig, "other_date", None):
+        return None
+    if (stage or "").lower() not in AT_CONSIGNEE:
+        return None
+    day = delivery_day(load)
+    if day is None:
+        return None
+    when = page_date(sig.other_date, year=day.year)
+    if when is None or not (0 <= (when - day).days <= DELIVERY_DAY_SLACK):
+        return None
+    shipped = page_date(ex.ship_date, year=day.year)
+    if shipped is not None and when <= shipped:
+        return None
+    who = " ".join(x for x in (sig.other_name, sig.other_date) if x) or "the signature"
+    sig.receiver_signed = True
+    sig.receiver_name = sig.receiver_name or sig.other_name
+    sig.receiver_date = sig.receiver_date or sig.other_date
+    ex.document_type = "proof_of_delivery"
+    return f"receiver's signature: '{who}' is dated on the delivery day, after the ship date, with the truck {stage}"
 
 
 def later_copy_signature(conn, load_id: int, d: Doc, ex, filed: list[OnFile], stage: str) -> str | None:
@@ -2323,6 +2409,20 @@ def _whole(v: Any) -> str:
     return m.group(1).replace(",", "") if m else ""
 
 
+def _one_off(a: str, b: str) -> bool:
+    """Whether two normalised references differ by one character: one dropped, one added, or one
+    swapped. Load 2613790 (19 Oct 2026): the driver's handwritten LD003241409 was read as LD00324409."""
+    if a == b or abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    long_, short = (a, b) if len(a) > len(b) else (b, a)
+    i = 0
+    while i < len(short) and long_[i] == short[i]:
+        i += 1
+    return long_[:i] + long_[i + 1:] == short
+
+
 def _core(v: str) -> str:
     """The digits a reference is built around, without the letters TransportPro or a shipper puts
     round them: "PO18650" -> "18650", "SO154611" -> "154611"."""
@@ -2443,6 +2543,21 @@ def match_facts_detail(ex, load: dict, extra: list[tuple[str, str, bool]] | tupl
                     and code in tokens):
                 hits.append(f"{side} facility {code}")
                 break
+    # A reference number read one character off still matches, when something else on the page does
+    # too (load 2613790, 19 Oct 2026: a handwritten LD003241409 read as LD00324409, the cities matching).
+    # Eight characters or more, the first two the same, never the page's only fact.
+    if hits:
+        for fi, (label, value, is_strong, shown) in enumerate(facts):
+            if fi in matched or not is_strong or len(value) < 8:
+                continue
+            for pi, (norm, whole) in enumerate(page):
+                if pi in used or len(norm) < 7 or norm[:2] != value[:2] or not _one_off(norm, value):
+                    continue
+                used.add(pi)
+                matched.add(fi)
+                hits.append(f"{label} {shown} (read as {norm}, one character off)")
+                strong.append(f"{label} {shown} (read as {norm}, one character off)")
+                break
     return hits, strong
 
 
@@ -2523,7 +2638,7 @@ def _upload(conn, tpro, uploader, store, s: Settings, row, filed: list[OnFile], 
             _record(conn, s, row, dec)
             continue
         again = judge(conn, s, row, load, filed, dec.doc, json.loads(db.get_attachment(conn, dec.doc.sha256)["extraction_json"]),
-                      sig=lambda d=dec.doc: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load))
+                      sig=lambda d=dec.doc: doc_sig(conn, store, tpro, d), others=lambda: lane_loads(tpro, load), equipment=lambda: equipment_numbers(tpro, load))
         rejudged.append((dec, again))
     # The set is judged again as a set: a lead that stood on pooled facts must stand on them still.
     pool_set_facts([a for _, a in rejudged if a is not None], row, s,

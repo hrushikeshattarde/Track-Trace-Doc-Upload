@@ -454,6 +454,83 @@ def test_an_undated_receiver_signature_counts_the_day_it_arrived() -> None:
     check("69% is under the floor: held", not ups and got[0] == autofile.HELD, str(got))
 
 
+def test_the_trailer_on_the_dispatch_tells_same_lane_loads_apart() -> None:
+    """Loads 2613788 and 2613790 (19 Oct 2026, Greenfield pod): CVS North Smithfield ships several
+    project loads of returns to CLS Lebanon on one day, on a handwritten short-form BOL that carries none
+    of the load's numbers. The driver writes the trailer number in "Carrier's No."; TransportPro's
+    dispatch holds that trailer (288469 on the one load, 3222 on the other). Every such page had been held:
+    one fact, or two cities and a rival load on the lane. Now the dispatch's trailer and truck are
+    reference numbers of the load's, counted beside a matching city when the page's date puts it on the
+    trip; a reference number read one character off (LD00324409 for LD003241409) matches when another fact
+    does; and a dated signature the reader could not place, made on the delivery day after the ship date
+    with the truck delivered, is the receiver's."""
+    print("the trailer on the dispatch tells same-lane loads apart")
+    import time as _time
+    from intake import autofile
+    from pod_intake.schema import Extraction
+
+    check("one character off: dropped, added, swapped; not two, not the same",
+          autofile._one_off("LD00324409", "LD003241409") and autofile._one_off("LD003241409", "LD00324409")
+          and autofile._one_off("LD003241408", "LD003241409") and not autofile._one_off("LD0032409", "LD003241409")
+          and not autofile._one_off("LD003241409", "LD003241409"))
+    s = autofile.Settings(terminals=frozenset({1076}), mode="on", pods={1076: "Isiah Greenfield"})
+
+    def world(load_id, numbers, trailer="288469", city="Atlanta", receiver=True, date="9/24/26", stage="at consignee",
+              conf=0.88, reference=None, other=None, ship=None, pickup=None):
+        conn, store, tpro, read, reads, load_row, mail, on_load = _auto_world()
+        log = _AutoLog()
+        load_row(load_id, "pod_expected", stage, terminal=1076)
+        tpro.add(load_id, delivery="2026-09-24")
+        if reference:
+            tpro.loads[load_id]["load"]["reference"]["referenceNumber"] = reference
+        if pickup:
+            tpro.loads[load_id]["load"]["waypoints"][0]["appointmentTime"] = {"open": f"{pickup}T12:00:00Z"}
+        tpro.dispatches_of[load_id] = [{"assignedTo": {"trailerNumber": trailer, "tractorNumber": "243"}}]
+        tpro.lane_loads = [_tp_auto(load_id + 1)]          # a rival on the lane: the lane rule is blocked
+        r = _reading(load_id, "proof_of_delivery" if receiver else "bill_of_lading", receiver=receiver, conf=conf,
+                     numbers=numbers, city=city)
+        r["signatures"]["receiver_date"] = date if receiver else None
+        if ship:
+            r["ship_date"] = ship
+        if other:
+            r["signatures"].update({"other_signed": True, "other_name": other[0], "other_date": other[1]})
+        r["pages"] = [{"page": 1, "role": "pod" if receiver else "bol", "legibility": 0.85}]
+        (sha,) = mail(load_id, f"m{load_id}", [(_picture(load_id % 1000), r)])
+        autofile.run(conn, tpro, store, read, log, s, deadline=_time.monotonic() + 600)
+        got = conn.execute("SELECT outcome, status FROM autofile WHERE load_id=? AND sha256=?", (load_id, sha)).fetchone()
+        row = log.rows.get(autofile.ref(load_id, sha))
+        return [u["type"] for u in tpro.uploads], tuple(got) if got else None, row
+
+    ups, got, row = world(2613788, [("Carrier's No.", "288469"), ("Seal #", "217855")])
+    check("the trailer on the dispatch, written on the page, with the city and the date: uploaded as Bill Of Lading",
+          ups == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str((got, ups)))
+    check("the sheet names the trailer among the facts", row is not None and "trailer # 288469 (on the dispatch)" in row[8], str(row and row[8]))
+    ups, got, _ = world(2613789, [("Carrier's No.", "3222"), ("Seal #", "217856")])
+    check("another load's trailer on the page: held on facts, as before", not ups and got[0] == autofile.HELD and "1 fact(s)" in got[1], str(got))
+    ups, got, _ = world(2613791, [("Carrier's No.", "288469")], city=None)
+    check("the trailer without a matching city proves nothing (the driver's last load rode the same trailer): held",
+          not ups and got[0] == autofile.HELD, str(got))
+    ups, got, _ = world(2613792, [("Carrier's No.", "288469")], date="9/10/26")
+    check("the trailer on a page dated off the trip: held", not ups and got[0] == autofile.HELD, str(got))
+    ups, got, row = world(2613790, [("(handwriting)", "LD00324409")], trailer="3222", reference="LD003241409")
+    check("a reference read one character off, with the city matching: uploaded",
+          ups == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str((got, ups)))
+    check("and the sheet says so", row is not None and "reference # LD003241409 (read as LD00324409, one character off)" in row[8], str(row and row[8]))
+    ups, got, _ = world(2613793, [("(handwriting)", "LD00324409")], trailer="3222")
+    check("one character off is never the only fact: held", not ups and got[0] == autofile.HELD, str(got))
+    ups, got, row = world(2613794, [("Carrier's No.", "3222")], trailer="3222", receiver=False, conf=0.80,
+                          stage="delivered", other=("Dana Tucker", "9/24/26"), ship="9/21/26")
+    check("a dated signature the reader could not place, on the delivery day after the ship date, truck delivered: the receiver's, uploaded as a POD",
+          ups == ["Bill Of Lading"] and got[0] == autofile.UPLOADED, str((got, ups)))
+    check("the sheet says why", row is not None and "receiver's signature: 'Dana Tucker 9/24/26' is dated on the delivery day" in row[9], str(row and row[9]))
+    ups, got, _ = world(2613795, [("Carrier's No.", "3222")], trailer="3222", receiver=False, conf=0.90,
+                        stage="delivered", other=("Dana Tucker", "9/21/26"), ship="9/21/26", pickup="2026-09-21")
+    check("a signature dated at loading stays the shipper's: the page is a BOL and goes up as one", ups == ["Driver Supplied BOL"], str((got, ups)))
+    ups, got, _ = world(2613796, [("Carrier's No.", "3222")], trailer="3222", receiver=False, conf=0.90,
+                        stage="loaded", other=("Dana Tucker", "9/24/26"), ship="9/21/26", pickup="2026-09-21")
+    check("with the truck still loaded a dated signature proves nothing: a BOL", ups == ["Driver Supplied BOL"], str((got, ups)))
+
+
 def test_a_dock_check_in_sheet_rides_with_the_pod() -> None:
     """Load 2580064 (28 Sep 2026): the POD, the Capstone dock check-in sheet and the Capstone lumper
     receipt came as one three-page file, and only the POD page went up. The manager wants the check-in
@@ -4463,6 +4540,7 @@ class _AutoTPro:
         self.calls = 0
         self.lane_loads: list[dict] | None = []     # what /load/search answers; None makes it fail
         self.searches: list[dict] = []
+        self.dispatches_of: dict[int, list[dict]] = {}   # what /dispatch/search answers, per load
 
     def add(self, load_id, doc="Waiting for Documents", files=(), delivery=None):
         self.loads[load_id] = {"load": _tp_auto(load_id, doc, delivery), "files": [], "bytes": {}}
@@ -4488,6 +4566,10 @@ class _AutoTPro:
             from intake.tpro import TProError
             raise TProError(500, "/load/search", "down")
         return [dict(x) for x in self.lane_loads]
+
+    def dispatches(self, load_id):
+        self.calls += 1
+        return [dict(x) for x in self.dispatches_of.get(load_id, [])]
 
     def download_file(self, file_id):
         self.calls += 1
@@ -6020,6 +6102,7 @@ if __name__ == "__main__":
     test_a_receiving_label_counts_the_facts_of_the_bol_sent_with_it()
     test_a_pod_short_of_the_confidence_bar_goes_up_when_the_page_corroborates_it()
     test_an_undated_receiver_signature_counts_the_day_it_arrived()
+    test_the_trailer_on_the_dispatch_tells_same_lane_loads_apart()
     test_a_dock_check_in_sheet_rides_with_the_pod()
     test_lumper_receipts()
     test_lumper_receipts_company_wide()
