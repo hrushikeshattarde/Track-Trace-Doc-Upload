@@ -466,6 +466,9 @@ Waiting decisions stay in the ledger only, as the pod asked on 24 Sep.
   the same trailer. Loads 2613788 and 2613790: CVS's handwritten BOL for its returns to CLS Lebanon
   names no number of the load's but the trailer the driver writes in "Carrier's No.", and the customer
   runs several such loads on the lane a day; the trailer (288469, 3222) is what tells them apart.
+- A number printed as two joined by a separator - Pinnacle Oil's `264419895#13280`, the PO without its
+  leading zero and a second PO (load 2629768, 26 Oct 2026) - is each of its parts as well, as the load's
+  compound references are. Hash, slash, comma, semicolon and spaces split; a hyphen does not.
 - A reference number read one character off still matches when another fact on the page does
   (`_one_off`, load 2613790: a handwritten LD003241409 read as LD00324409): eight characters or more,
   the first two the same, never the page's only fact.

@@ -2490,6 +2490,15 @@ def match_facts_detail(ex, load: dict, extra: list[tuple[str, str, bool]] | tupl
     """([every fact that matches], [the reference numbers among them]). `extra` adds facts the load
     has beyond TransportPro's (load_facts)."""
     page = [(_norm(n.value), _whole(n.value)) for n in ex.numbers]
+    # A number printed as two joined by a separator is each of its parts as well, as the load's own
+    # compound references are (load_facts). Load 2629768 (26 Oct 2026): Pinnacle Oil prints the customer
+    # PO as "264419895#13280" - the load's PO 0264419895 without its leading zero, a hash, and a second
+    # PO - and compared whole it matched nothing, with three sibling loads on the lane to block the lane
+    # rule. Hash, slash, comma, semicolon and spaces split; a hyphen does not, for dates and form numbers.
+    for n in ex.numbers:
+        parts = [p for p in re.split(r"[#/,;\s]+", str(n.value or "")) if p]
+        if len(parts) > 1:
+            page += [(_norm(p), _whole(p)) for p in parts if len(_norm(p)) >= 4]
     page += [("", _whole(x)) for x in (ex.pieces, ex.weight_lbs) if x]
     facts = load_facts(load, extra)
     hits: list[str] = []
@@ -2550,8 +2559,15 @@ def match_facts_detail(ex, load: dict, extra: list[tuple[str, str, bool]] | tupl
         for fi, (label, value, is_strong, shown) in enumerate(facts):
             if fi in matched or not is_strong or len(value) < 8:
                 continue
+            # Leading zeros aside too: load 2629768 (26 Oct 2026), PO 0264419895 printed 264419895 and read
+            # with a digit too many, 2644198954 - one character off the core, two off the whole.
+            core = _core(value).lstrip("0")
             for pi, (norm, whole) in enumerate(page):
-                if pi in used or len(norm) < 7 or norm[:2] != value[:2] or not _one_off(norm, value):
+                if pi in used or len(norm) < 7:
+                    continue
+                mine = _core(norm).lstrip("0")
+                if not ((norm[:2] == value[:2] and _one_off(norm, value))
+                        or (core.isdigit() and len(core) >= 7 and mine[:2] == core[:2] and _one_off(mine, core))):
                     continue
                 used.add(pi)
                 matched.add(fi)

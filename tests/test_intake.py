@@ -4674,6 +4674,21 @@ def test_auto_upload_facts_and_pictures() -> None:
           str(facts))
     ex = Extraction.model_validate(_reading(2600001, numbers=[("Year", "2026"), ("Ref", "26000")]))
     check("a year or a fragment is not a reference number", autofile.match_facts(ex, load)[1] == 0)
+    # Load 2629768 (26 Oct 2026): Pinnacle Oil prints "Customer PO Number 264419895#13280" - the load's
+    # PO 0264419895 without its leading zero, joined by a hash to a second PO. Each part is a number.
+    joined = _tp_auto(2600001)
+    joined["reference"]["poNumber"] = "0264419895"
+    ex = Extraction.model_validate(_reading(2600001, numbers=[("Customer PO Number", "264419895#13280")]))
+    facts, strong = autofile.match_facts(ex, joined)
+    check("a page number printed as two joined by a hash matches on its parts, leading zero and all",
+          strong == 1 and any(f.startswith("PO # 0264419895") for f in facts), str(facts))
+    ex = Extraction.model_validate(_reading(2600001, numbers=[("Shipper#", "2026-60297-00")]))
+    check("a hyphenated form number is not split into fragments", autofile.match_facts(ex, joined)[1] == 0,
+          str(autofile.match_facts(ex, joined)))
+    ex = Extraction.model_validate(_reading(2600001, numbers=[("Customer PO Number", "2644198954#13280")]))
+    facts, strong = autofile.match_facts(ex, joined)
+    check("and read with a digit too many it still matches one character off, leading zero aside (the city vouches)",
+          strong == 1 and any(f.startswith("PO # 0264419895 (read as 2644198954, one character off)") for f in facts), str(facts))
     # Load 2562069: the BOL says "Cust PO 18650", TransportPro says PO18650; its reference block also
     # carries reeferTemperatureMode "Continuous", which is a setting, not a number anybody prints.
     reefer = {**_tp_auto(2562069), "reference": {"poNumber": "PO18650", "reeferTemperatureMode": "Continuous"}}
