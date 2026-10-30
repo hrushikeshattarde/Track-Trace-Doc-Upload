@@ -497,6 +497,11 @@ def lifecycle_rules(prefix: str, keep_days: int, archive_after: int, pii_days: i
     are still instant, so nothing that later needs a document has to wait for a restore. Objects
     under 128 KB are not transitioned at all - they would be billed as 128 KB there.
 
+    Shortened 30 Oct 2026, at the owner's request, to 30 days in normal storage, 60 in GIR, then
+    deleted (90 days in all). The archive is a working copy: the bot's Gmail access is read-only, so
+    the original mail stays in Gmail, and what the bot uploaded stays in TransportPro. GIR bills at
+    least 90 days, so 60 days there are charged as 90 - still well under 60 days of normal storage.
+
     The personal-ID rule removes the separate page in doc/ only. The same attachment is inside its
     archived email, which the mail rule keeps for the full period - stripping it from there is part
     of the reading step, which is where a page is first known to be personal ID.
@@ -536,7 +541,7 @@ def cmd_lifecycle(args) -> int:
     foreign = [r.get("ID") for r in current if not str(r.get("ID", "")).startswith("intake-")]
     print(f"s3://{bucket}: {len(current)} lifecycle rule(s) now" + (f", not ours: {foreign}" if foreign else ""))
     print(f"\n  mail/ and doc/        normal storage for {args.archive_after} days, then Glacier Instant Retrieval;"
-          f" deleted after {args.keep_days} days ({args.keep_days / 365:.1f} years)")
+          f" deleted after {args.keep_days} days")
     print(f"  doc/ tagged pii=true  deleted after {args.pii_days} days")
     print(f"  ledger/snapshots/     deleted after {args.snapshot_days} days (the live ledger is never touched)")
     print(f"  unfinished uploads    cleaned up after 7 days")
@@ -637,9 +642,9 @@ def main() -> int:
     bmk.set_defaults(fn=cmd_bookmark)
     sub.add_parser("deploy", help="build, then create or update both functions").set_defaults(fn=cmd_deploy)
     lc = sub.add_parser("lifecycle", help="show, or with --apply set, how long the archive keeps things")
-    lc.add_argument("--keep-days", type=int, default=1095, help="delete mail and documents after this many days "
-                    "(default 3 years - the usual broker record period; confirm with compliance)")
-    lc.add_argument("--archive-after", type=int, default=90, help="move to cheaper storage after this many days")
+    lc.add_argument("--keep-days", type=int, default=90, help="delete mail and documents after this many days "
+                    "(90 since 30 Oct 2026; the originals stay in Gmail and the uploaded copies in TransportPro)")
+    lc.add_argument("--archive-after", type=int, default=30, help="move to cheaper storage after this many days")
     lc.add_argument("--pii-days", type=int, default=90, help="delete pages tagged as personal ID after this many days")
     lc.add_argument("--snapshot-days", type=int, default=30, help="delete daily ledger snapshots after this many days")
     lc.add_argument("--apply", action="store_true", help="put the rules on the bucket (default: only show them)")

@@ -85,7 +85,10 @@ Both functions run from the same zip (`deploy/collector.zip`). Each handler pick
 
 Lifecycle rules are applied; see `deploy_lambda.py lifecycle`:
 
-- `mail/` and `doc/` move to Glacier Instant Retrieval after 90 days and are deleted after 1,095 days.
+- `mail/` and `doc/` stay in normal storage for 30 days, move to Glacier Instant Retrieval, and are
+  deleted after 90 days (since 30 Oct 2026; 3 years before). The archive is a working copy: the bot's
+  Gmail access is read-only, so the original mail stays in Gmail, and uploaded documents stay in TPro.
+  Glacier Instant Retrieval bills at least 90 days, so the 60 days there are charged as 90.
 - `doc/` objects tagged `pii=true` are deleted after 90 days.
 - Snapshots are deleted after 30 days.
 
@@ -983,7 +986,8 @@ production path.
   `filters.py` would stop this.
 - **Personal-ID pages aren't retagged in S3.** The worker keeps readings in the ledger only, so
   `doc/` objects stay `pii=unchecked` and the 90-day personal-ID lifecycle rule never applies to
-  them. Only the local `intake archive` command retags. The worker's IAM policy has no
+  them. Since 30 Oct 2026 every `doc/` object is deleted after 90 days anyway, so this only matters
+  if that period grows again. Only the local `intake archive` command retags. The worker's IAM policy has no
   `PutObjectTagging` on `doc/`.
 - **The bot's own TransportPro login is pending.** Uploads go in as the reading login until an
   admin creates the "Doc Intake Bot" user and its secret is set as `INTAKE_TPRO_UPLOAD_SECRET`.
