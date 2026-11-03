@@ -213,7 +213,9 @@ FUNCS = {
         "name": "circle-doc-intake-worker", "schedule": "circle-doc-intake-worker-every-15-min",
         # 1.5 GB since 24 Sep 2026: the AI reads render page images, and a 27-page scan ran 1 GB out.
         # 3 GB since 14 Oct 2026, for six full reads in parallel (1.5 GB with three; a run peaked at 1.2 GB).
-        "handler": "intake.aws_worker.handler", "memory": 3008,
+        # 4 GB of /tmp since 3 Nov 2026: the ledger is downloaded there, and at 534 MB it outgrew the
+        # default 512 MB - every working-hours run failed saving it ("database or disk is full").
+        "handler": "intake.aws_worker.handler", "memory": 3008, "disk": 4096,
         "secrets": lambda env: [TPRO_SECRET, GMAIL_SECRET] + ([env["INTAKE_TPRO_UPLOAD_SECRET"]]
                                                            if env.get("INTAKE_TPRO_UPLOAD_SECRET") else []),
         "env": _worker_env, "policy": _worker_policy, "log_filter": '"worker"',
@@ -332,7 +334,8 @@ def ensure_function(sess, key: str, account: str, env: dict) -> str:
     lam = sess.client("lambda")
     # 10 minutes, not the 15 allowed: a run must end before the next one is due.
     config = dict(Role=role, Handler=spec["handler"], Runtime="python3.12", Timeout=600,
-                  MemorySize=spec["memory"], Environment={"Variables": spec["env"](env)},
+                  MemorySize=spec["memory"], EphemeralStorage={"Size": spec.get("disk", 512)},
+                  Environment={"Variables": spec["env"](env)},
                   Description=spec["description"])
     tags = {"project": "circle-doc-intake", "component": key}
     try:

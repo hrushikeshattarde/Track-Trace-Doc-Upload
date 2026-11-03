@@ -55,7 +55,7 @@ pilot terminals only (`AUTO_TERMINALS` in `scripts/deploy_lambda.py`).
 | Piece | Name | Settings |
 |---|---|---|
 | Collector Lambda | `circle-doc-intake-collector` | python3.12, 512 MB, 10 min timeout, handler `intake.aws_lambda.handler` |
-| Worker Lambda | `circle-doc-intake-worker` | python3.12, 3 GB (1.5 GB until 14 Oct 2026), 10 min timeout, handler `intake.aws_worker.handler` |
+| Worker Lambda | `circle-doc-intake-worker` | python3.12, 3 GB (1.5 GB until 14 Oct 2026), 4 GB of `/tmp` (512 MB until 3 Nov 2026), 10 min timeout, handler `intake.aws_worker.handler` |
 | Report Lambda | `circle-doc-intake-report` | python3.12, 512 MB, handler `intake.aws_report.handler`; 07:00 America/New_York daily; mails the loads the bot did not file, and the day's AI spend (a warning past `INTAKE_SPEND_WARN_USD`, $30), from `DocIntake@circle-analytics.com` (SES) to `INTAKE_REPORT_TO` in `.env` |
 | Schedules (EventBridge Scheduler) | `circle-doc-intake-every-15-min`, `circle-doc-intake-worker-every-15-min` | `rate(15 minutes)`, no retries |
 | Concurrency | both functions | Reserved concurrency 1. A trigger older than 60 s is dropped, so a run that fires while another is going is skipped. The next quarter-hour is the retry. |
@@ -869,7 +869,10 @@ Also in the worker's summary:
 
 **Warnings** are log lines starting with `  ! `, for example
 `! auto-upload: quick look on <file>: <error>`. Lambda's `REPORT` lines show the memory used
-against the memory size, and `Status: error` with `Error Type` on a crash.
+against the memory size, and `Status: error` with `Error Type` on a crash. `OperationalError: database
+or disk is full` while giving the ledger back means `/tmp` is too small for the ledger: on 3 Nov 2026
+the 534 MB ledger outgrew the default 512 MB and every working-hours run failed until it went to 4 GB.
+The ledger also sits in memory on download and upload, so its size shows in `Max Memory Used` too.
 
 **A health check:**
 
